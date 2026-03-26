@@ -1,0 +1,17 @@
+# Cross-compilation targets for OpenWrt devices
+
+# GL.iNet AXT1800 (Slate AX) - Qualcomm IPQ6000, ARMv8 Cortex-A53
+[target.aarch64-unknown-linux-musl]
+# linker = "aarch64-linux-musl-gcc"
+
+# GL.iNet SFT1200 (Opal) - Siflower SF19A28, MIPS32 LE
+[target.mipsel-unknown-linux-musl]
+# linker = "mipsel-openwrt-linux-musl-gcc"
+
+# Optimize for size on embedded targets
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

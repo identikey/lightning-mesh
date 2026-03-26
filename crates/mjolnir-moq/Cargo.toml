@@ -1,0 +1,15 @@
+[package]
+name = "mjolnir-moq"
+description = "Bridge layer: iroh endpoints to MoQ sessions via WebTransport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+iroh.workspace = true
+web-transport-iroh.workspace = true
+moq-lite.workspace = true
+n0-future.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

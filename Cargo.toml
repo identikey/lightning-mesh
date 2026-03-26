@@ -1,0 +1,40 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# iroh networking
+iroh = "0.97"
+iroh-gossip = "0.97"
+web-transport-iroh = "0.2"
+
+# MoQ protocol
+moq-lite = "0.15"
+
+# audio
+opus = "0.3"
+cpal = "0.17"
+
+# async runtime
+tokio = { version = "1", features = ["full"] }
+n0-future = "0.3"
+
+# serialization
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+
+# encoding
+data-encoding = "2"
+rand = "0.9"
+
+# utilities
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+bytes = "1"
