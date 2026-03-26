@@ -16,17 +16,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start a new mesh room and begin broadcasting audio
-    Host {
-        /// Room name (included in the join ticket)
-        #[arg(short, long, default_value = "default")]
+    /// Enter a mesh room. Creates a new room or joins an existing one via ticket.
+    /// Every peer is equal — any peer can share their ticket for others to join.
+    Room {
+        /// Room name
+        #[arg(default_value = "default")]
         name: String,
-    },
 
-    /// Join an existing mesh room by ticket
-    Join {
-        /// Ticket string from the host (name@base32addr)
-        ticket: String,
+        /// Join ticket from an existing peer (name@base32payload).
+        /// If omitted, creates a new room.
+        #[arg(short, long)]
+        ticket: Option<String>,
     },
 
     /// Print this node's iroh EndpointId
@@ -44,25 +44,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Host { name } => {
+        Command::Room { name, ticket } => {
             let node = mesh::MeshNode::spawn().await?;
             info!("endpoint id: {}", node.id());
 
-            let ticket = node.host_room(&name).await?;
-            println!("\n  Join ticket: {ticket}\n");
+            // Unified entry: with ticket = join, without = create
+            let our_ticket = node.enter_room(&name, ticket.as_deref()).await?;
+            println!("\n  Invite ticket: {our_ticket}\n");
 
-            // Block until ctrl-c
-            tokio::signal::ctrl_c().await?;
-            node.shutdown().await;
-        }
-
-        Command::Join { ticket } => {
-            let node = mesh::MeshNode::spawn().await?;
-            info!("endpoint id: {}", node.id());
-
-            node.join_room(&ticket).await?;
-
-            tokio::signal::ctrl_c().await?;
+            // Run room actor until ctrl-c
+            tokio::select! {
+                result = node.run_room() => {
+                    if let Err(e) = result {
+                        tracing::error!("room error: {e}");
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {}
+            }
             node.shutdown().await;
         }
 
