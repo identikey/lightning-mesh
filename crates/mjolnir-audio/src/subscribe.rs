@@ -1,30 +1,24 @@
 use anyhow::{Context, Result};
 use moq_lite::TrackConsumer;
-use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::codec::OpusDecoder;
-use crate::AudioConfig;
+use crate::mixer::PeerInput;
 
-/// Subscribes to a remote audio track, decodes Opus, sends PCM to playback.
-pub async fn run_subscribe(
-    config: &AudioConfig,
-    mut track: TrackConsumer,
-    playback_tx: mpsc::Sender<Vec<i16>>,
-) -> Result<()> {
-    let mut decoder = OpusDecoder::new(config)?;
+/// Subscribes to a remote audio track and pushes each Opus frame into the
+/// peer's jitter buffer with a monotonic local sequence number.
+///
+/// MoQ preserves frame order within a stream; the local counter is
+/// sufficient for the jitter buffer to detect gaps when frames are lost.
+pub async fn run_subscribe(mut track: TrackConsumer, peer_input: PeerInput) -> Result<()> {
+    let mut seq: u64 = 0;
 
     info!("audio subscribe pipeline started");
 
     while let Some(mut group) = track.next_group().await.context("track next_group failed")? {
         while let Some(frame) = group.read_frame().await.context("group read_frame failed")? {
-            let pcm = decoder.decode(&frame)?;
-            let pcm_vec = pcm.to_vec();
-            debug!(len = pcm_vec.len(), "decoded audio frame");
-            if playback_tx.send(pcm_vec).await.is_err() {
-                info!("playback channel closed, stopping subscribe");
-                return Ok(());
-            }
+            debug!(seq, len = frame.len(), "received audio frame");
+            peer_input.push_frame(seq, frame);
+            seq += 1;
         }
     }
 

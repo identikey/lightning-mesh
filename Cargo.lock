@@ -2049,11 +2049,16 @@ dependencies = [
  "anyhow",
  "bytes",
  "cpal",
+ "mjolnir-media",
  "moq-lite",
  "opus",
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "mjolnir-media"
+version = "0.1.0"
 
 [[package]]
 name = "mjolnir-moq"

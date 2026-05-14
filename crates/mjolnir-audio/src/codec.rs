@@ -87,6 +87,17 @@ impl OpusDecoder {
         Ok(&self.decode_buf[..n * self.config.channels as usize])
     }
 
+    /// Generate one frame of packet loss concealment samples. Used when a
+    /// jitter-buffer slot is empty at playout time.
+    pub fn decode_lost(&mut self) -> Result<&[i16]> {
+        let n = self
+            .decoder
+            .decode(&[], &mut self.decode_buf, false)
+            .context("opus PLC decode failed")?;
+
+        Ok(&self.decode_buf[..n * self.config.channels as usize])
+    }
+
     pub fn config(&self) -> &AudioConfig {
         &self.config
     }

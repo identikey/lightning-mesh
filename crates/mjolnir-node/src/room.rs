@@ -5,8 +5,7 @@ use bytes::Bytes;
 use futures_lite::StreamExt;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_gossip::api::{Event, GossipTopic};
-use mjolnir_audio::playback::AudioPlayback;
-use mjolnir_audio::AudioConfig;
+use mjolnir_audio::{AudioConfig, Mixer};
 use mjolnir_moq::MoqBridge;
 use moq_lite::{Broadcast, Track};
 use serde::{Deserialize, Serialize};
@@ -119,9 +118,8 @@ impl Room {
             }
         });
 
-        // Start audio playback
-        let playback = AudioPlayback::start(&audio_config)?;
-        let playback_tx = playback.sender();
+        // Start the audio mixer (one cpal output stream, per-peer jitter buffers)
+        let mixer = Mixer::start(audio_config.clone())?;
 
         // Announce ourselves via gossip
         let our_addr = endpoint.addr();
@@ -165,9 +163,8 @@ impl Room {
                             &endpoint,
                             &bridge,
                             &mut peers,
-                            &audio_config,
+                            &mixer,
                             &sender,
-                            &playback_tx,
                         )
                         .await;
                     }
@@ -181,6 +178,7 @@ impl Room {
                 Event::NeighborDown(peer_id) => {
                     if peers.remove(&peer_id).is_some() {
                         info!(%peer_id, "peer left, disconnecting");
+                        mixer.remove_peer(&peer_id.to_string());
                         bridge.disconnect(&peer_id).await;
                     }
                 }
@@ -191,7 +189,7 @@ impl Room {
         }
 
         info!(room = %name, "room gossip stream ended");
-        drop(playback);
+        drop(mixer);
         Ok(())
     }
 }
@@ -203,9 +201,8 @@ async fn handle_peer_discovered(
     endpoint: &Endpoint,
     bridge: &MoqBridge,
     peers: &mut HashMap<EndpointId, EndpointAddr>,
-    audio_config: &AudioConfig,
+    mixer: &Mixer,
     sender: &iroh_gossip::api::GossipSender,
-    playback_tx: &tokio::sync::mpsc::Sender<Vec<i16>>,
 ) {
     let peer_id = addr.id;
 
@@ -239,15 +236,21 @@ async fn handle_peer_discovered(
         let track = Track::new(mjolnir_audio::AUDIO_TRACK_NAME);
         match broadcast_consumer.subscribe_track(&track) {
             Ok(track_consumer) => {
-                let config = audio_config.clone();
-                let tx = playback_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        mjolnir_audio::subscribe::run_subscribe(&config, track_consumer, tx).await
-                    {
-                        warn!("audio subscribe error: {e}");
+                match mixer.add_peer(peer_id.to_string()) {
+                    Ok(peer_input) => {
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                mjolnir_audio::subscribe::run_subscribe(track_consumer, peer_input)
+                                    .await
+                            {
+                                warn!("audio subscribe error: {e}");
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        warn!(peer = %peer_id, "failed to register peer with mixer: {e}");
+                    }
+                }
             }
             Err(e) => {
                 warn!(peer = %peer_id, "failed to subscribe to audio track: {e}");
