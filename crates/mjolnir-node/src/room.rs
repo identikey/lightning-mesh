@@ -7,21 +7,14 @@ use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_gossip::api::{Event, GossipTopic};
 use mjolnir_audio::{AudioConfig, Mixer};
-use mjolnir_moq::MoqBridge;
-use moq_lite::{Broadcast, Track};
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 
+use crate::audio_proto::AudioHandler;
 use crate::ticket::MeshTicket;
 
 /// Structured gossip messages for the mesh.
-///
-/// **DHT/DNS opportunity:** With a distributed name system, Announce could
-/// be replaced by DHT put/get — peers publish their addr under the topic key,
-/// and discovery happens via DHT lookup instead of gossip flooding. Gossip
-/// would still be useful for real-time presence (NeighborUp/Down) but the
-/// heavy lifting of address resolution could move to DHT, reducing gossip
-/// bandwidth in large rooms.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GossipMessage {
     /// "I'm here" — sent on join and when new neighbors appear.
@@ -31,11 +24,6 @@ pub enum GossipMessage {
     /// Enables transitive discovery: if A knows B and C, a new peer D that
     /// connects to A immediately learns about B and C without waiting for
     /// their individual announcements.
-    ///
-    /// **DHCP analogy:** This is similar to a DHCP server handing out the
-    /// full network topology to a new client. In a future version, a
-    /// distributed DHCP-like service could maintain the authoritative peer
-    /// list, with gossip as the real-time update channel.
     PeerList(Vec<EndpointAddr>),
 }
 
@@ -53,12 +41,14 @@ impl GossipMessage {
 pub struct Room {
     pub name: String,
     topic: GossipTopic,
-    bridge: MoqBridge,
     endpoint: Endpoint,
     /// Address book wired into the iroh endpoint. We seed it whenever we
     /// learn an `EndpointAddr` from gossip (Announce / PeerList) so that
     /// subsequent dials by `EndpointId` don't hit pkarr/DNS.
     address_lookup: MemoryLookup,
+    /// Inbound audio protocol handler; rebound to this room's mixer
+    /// + capture broadcast when [`Room::run`] starts.
+    audio_handler: AudioHandler,
     /// Known peers: EndpointId → full EndpointAddr (for ticket minting).
     peers: HashMap<EndpointId, EndpointAddr>,
     audio_config: AudioConfig,
@@ -68,17 +58,17 @@ impl Room {
     pub fn new(
         name: String,
         topic: GossipTopic,
-        bridge: MoqBridge,
         endpoint: Endpoint,
         address_lookup: MemoryLookup,
+        audio_handler: AudioHandler,
     ) -> Self {
         info!(room = %name, "room created");
         Self {
             name,
             topic,
-            bridge,
             endpoint,
             address_lookup,
+            audio_handler,
             peers: HashMap::new(),
             audio_config: AudioConfig::default(),
         }
@@ -86,48 +76,46 @@ impl Room {
 
     /// Generate a join ticket for this room using this peer's address
     /// and all known peer addresses. Any peer can call this.
-    ///
-    /// **DHT opportunity:** With DHT, this could return a minimal ticket
-    /// (just the room name) since addresses would be discoverable via DHT
-    /// lookup on the topic_id.
     pub fn generate_ticket(&self) -> MeshTicket {
         let our_addr = self.endpoint.addr();
         let mut addrs = vec![our_addr];
-        // Include known peer addresses for multi-peer bootstrap resilience
         addrs.extend(self.peers.values().cloned());
         MeshTicket::with_peers(self.name.clone(), addrs)
     }
 
-    /// Run the room actor loop: publish audio, announce via gossip, handle peer events.
+    /// Run the room actor loop: capture audio, announce via gossip, handle peer events.
     pub async fn run(self) -> Result<()> {
         let Room {
             name,
             topic,
-            bridge,
             endpoint,
             address_lookup,
+            audio_handler,
             mut peers,
             audio_config,
         } = self;
 
-        // Publish our audio broadcast using our endpoint ID as the broadcast name
-        let our_id = endpoint.id();
-        let our_broadcast_name = our_id.to_string();
-        let origin = bridge.origin();
-        let mut broadcast = Broadcast::produce();
-        let broadcast_consumer = broadcast.consume();
-        origin.publish_broadcast(&our_broadcast_name, broadcast_consumer);
-
-        // Spawn audio capture -> encode -> publish task
-        let ac = audio_config.clone();
-        tokio::spawn(async move {
-            if let Err(e) = mjolnir_audio::publish::run_publish(&ac, &mut broadcast).await {
-                warn!("audio publish error: {e}");
-            }
-        });
-
         // Start the audio mixer (one cpal output stream, per-peer jitter buffers)
         let mixer = Mixer::start(audio_config.clone())?;
+
+        // Single cpal capture; fan-out via a tokio broadcast channel so every
+        // per-peer audio session (dialed or accepted) gets its own subscriber.
+        let (capture, mut capture_rx) =
+            mjolnir_audio::capture::AudioCapture::start(&audio_config)?;
+        let (pcm_tx, _) = broadcast::channel::<Vec<i16>>(64);
+        let pcm_tx_for_drain = pcm_tx.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = capture_rx.recv().await {
+                let _ = pcm_tx_for_drain.send(frame);
+            }
+        });
+        // Keep the cpal stream alive for the room's lifetime.
+        let _capture_keepalive = capture;
+
+        // Bind the inbound audio protocol handler to this room's mixer
+        // and capture broadcast. Inbound audio sessions will register
+        // peers with the mixer and pump frames through the same broadcast.
+        audio_handler.bind(mixer.handle(), pcm_tx.clone(), audio_config.clone());
 
         // Announce ourselves via gossip
         let our_addr = endpoint.addr();
@@ -169,11 +157,12 @@ impl Room {
                         handle_peer_discovered(
                             addr,
                             &endpoint,
-                            &bridge,
                             &mut peers,
                             &mixer,
                             &sender,
                             &address_lookup,
+                            &pcm_tx,
+                            &audio_config,
                         )
                         .await;
                     }
@@ -186,9 +175,8 @@ impl Room {
                 }
                 Event::NeighborDown(peer_id) => {
                     if peers.remove(&peer_id).is_some() {
-                        info!(%peer_id, "peer left, disconnecting");
+                        info!(%peer_id, "peer left");
                         mixer.remove_peer(&peer_id.to_string());
-                        bridge.disconnect(&peer_id).await;
                     }
                 }
                 Event::Lagged => {
@@ -204,15 +192,20 @@ impl Room {
 }
 
 /// Handle discovery of a peer address (from Announce or PeerList).
-/// Connects MoQ session, subscribes to audio, and shares our peer list.
+///
+/// Seeds iroh's address book and — if our endpoint id is lower than
+/// the peer's — opens an outbound audio session. The higher-id side
+/// just waits; its [`AudioHandler`] will accept the inbound stream.
+#[allow(clippy::too_many_arguments)]
 async fn handle_peer_discovered(
     addr: EndpointAddr,
     endpoint: &Endpoint,
-    bridge: &MoqBridge,
     peers: &mut HashMap<EndpointId, EndpointAddr>,
     mixer: &Mixer,
     sender: &iroh_gossip::api::GossipSender,
     address_lookup: &MemoryLookup,
+    pcm_tx: &broadcast::Sender<Vec<i16>>,
+    audio_config: &AudioConfig,
 ) {
     let peer_id = addr.id;
 
@@ -222,26 +215,9 @@ async fn handle_peer_discovered(
 
     info!(peer = %peer_id, "discovered new peer via gossip");
 
-    // Seed iroh's address book so MoQ (and any future dialer keyed by
-    // EndpointId) can reach the peer without pkarr/DNS discovery.
+    // Seed iroh's address book so the audio dial doesn't fall back to DNS.
     address_lookup.add_endpoint_info(addr.clone());
-
-    // Deterministic dial tiebreak: both peers see each other's gossip
-    // Announce simultaneously, so if both call bridge.connect we end up
-    // with two MoQ sessions per pair and the second clobbers the first.
-    // Only the side with the lower endpoint id dials; the higher-id side
-    // accepts the incoming connection on its iroh router. Either way the
-    // session lands in the shared bridge with the same origin.
-    let we_dial = endpoint.id() < peer_id;
-    if we_dial {
-        if let Err(e) = bridge.connect(endpoint, addr.clone()).await {
-            warn!(peer = %peer_id, "failed to connect MoQ session: {e}");
-            return;
-        }
-    } else {
-        info!(peer = %peer_id, "waiting for inbound MoQ connection (dial tiebreak)");
-    }
-    peers.insert(peer_id, addr);
+    peers.insert(peer_id, addr.clone());
 
     // Share our full peer list with the mesh so the new peer (and others)
     // can discover all existing peers transitively.
@@ -252,52 +228,23 @@ async fn handle_peer_discovered(
         }
     }
 
-    // Register the peer with the mixer up front; we'll start pushing frames
-    // once its broadcast is announced over the MoQ session.
-    let peer_input = match mixer.add_peer(peer_id.to_string()) {
-        Ok(pi) => pi,
-        Err(e) => {
-            warn!(peer = %peer_id, "failed to register peer with mixer: {e}");
-            return;
-        }
-    };
+    // Deterministic dial tiebreak. With a single bidi stream per pair we
+    // only need one initiator; the other side accepts via AudioHandler.
+    let we_dial = endpoint.id() < peer_id;
+    if !we_dial {
+        info!(peer = %peer_id, "waiting for inbound audio stream (dial tiebreak)");
+        return;
+    }
 
-    // Wait asynchronously for the peer's broadcast to be announced, then
-    // subscribe. moq-lite can announce, retract, and re-announce the same
-    // broadcast as the underlying session state churns (we've observed this
-    // at handshake time even with a single session), so the loop survives
-    // run_subscribe returning: each new announcement triggers a fresh
-    // subscribe attempt with the freshly-published BroadcastConsumer.
-    let mut origin_consumer = bridge.origin().consume();
-    let target_path = peer_id.to_string();
+    let endpoint = endpoint.clone();
+    let mixer_handle = mixer.handle();
+    let pcm_tx = pcm_tx.clone();
+    let cfg = audio_config.clone();
     tokio::spawn(async move {
-        loop {
-            // Wait until the next time our target broadcast is announced
-            // (with a real BroadcastConsumer, not an unannounce).
-            let broadcast_consumer = loop {
-                match origin_consumer.announced().await {
-                    Some((path, Some(c))) if path.as_str() == target_path => break c,
-                    Some(_) => continue,
-                    None => return,
-                }
-            };
-
-            let track = Track::new(mjolnir_audio::AUDIO_TRACK_NAME);
-            match broadcast_consumer.subscribe_track(&track) {
-                Ok(track_consumer) => {
-                    if let Err(e) = mjolnir_audio::subscribe::run_subscribe(
-                        track_consumer,
-                        peer_input.clone(),
-                    )
-                    .await
-                    {
-                        warn!(peer = %peer_id, "audio subscribe error: {e}; awaiting re-announce");
-                    }
-                }
-                Err(e) => {
-                    warn!(peer = %peer_id, "failed to subscribe to audio track: {e}");
-                }
-            }
+        if let Err(e) =
+            crate::audio_proto::dial_and_run(endpoint, addr, mixer_handle, pcm_tx, cfg).await
+        {
+            warn!(%peer_id, "audio dial failed: {e}");
         }
     });
 }

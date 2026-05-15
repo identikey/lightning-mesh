@@ -11,6 +11,5 @@ opus.workspace = true
 cpal.workspace = true
 bytes.workspace = true
 tokio.workspace = true
-moq-lite.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "mjolnir-node"
-description = "Mjolnir mesh node - P2P audio streaming over iroh + MoQ"
+description = "Mjolnir mesh node - P2P audio streaming over iroh QUIC"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,12 +10,10 @@ name = "mjolnir-mesh"
 path = "src/main.rs"
 
 [dependencies]
-mjolnir-moq = { path = "../mjolnir-moq" }
 mjolnir-audio = { path = "../mjolnir-audio" }
 
 iroh.workspace = true
 iroh-gossip.workspace = true
-moq-lite.workspace = true
 n0-future.workspace = true
 postcard.workspace = true
 serde.workspace = true

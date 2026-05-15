@@ -1,24 +1,21 @@
 //! mjolnir-audio: Opus audio pipeline for mesh streaming.
 //!
-//! Capture → encode → publish on one side; subscribe → jitter-buffer →
-//! decode → mix → playback on the other. Multi-peer aware: the [`Mixer`]
-//! holds a per-peer jitter buffer and sums all peer streams into the
-//! output device.
+//! Capture → encode on one side; receive → jitter-buffer → decode → mix
+//! → playback on the other. The transport layer (which moves encoded
+//! Opus frames between peers) lives outside this crate; consumers feed
+//! decoded payloads into the [`Mixer`] via [`PeerInput`].
 
 pub mod capture;
 pub mod codec;
 pub mod conceal;
 pub mod device;
 pub mod mixer;
-pub mod publish;
-pub mod subscribe;
 
 pub use conceal::{
     default_plc_factory, silence_plc_factory, OpusPlc, PlcBackend, PlcFactory, SilencePlc,
 };
-pub use mixer::{Mixer, PeerInput};
+pub use mixer::{Mixer, MixerHandle, PeerInput};
 pub use mjolnir_media::{BufferStats, Pulled};
-pub use publish::AUDIO_TRACK_NAME;
 
 /// Audio configuration for the mesh.
 #[derive(Debug, Clone)]

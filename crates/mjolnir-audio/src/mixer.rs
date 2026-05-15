@@ -83,13 +83,22 @@ impl PeerSlot {
 
 type PeerMap = Arc<Mutex<HashMap<String, Arc<Mutex<PeerSlot>>>>>;
 
-/// Multi-peer audio mixer. Holds the output cpal stream, a peer registry,
-/// and a PLC backend factory used to mint one backend per peer.
+/// Multi-peer audio mixer. Owns the output cpal stream; the shareable
+/// peer registry lives behind [`MixerHandle`] so other tasks (e.g. an
+/// audio-protocol ALPN handler) can register/deregister peers without
+/// holding the non-`Sync` `cpal::Stream`.
 pub struct Mixer {
+    handle: MixerHandle,
+    _stream: cpal::Stream,
+}
+
+/// Cloneable share of a [`Mixer`]'s peer registry. Lets other components
+/// add/remove peers without owning the cpal stream.
+#[derive(Clone)]
+pub struct MixerHandle {
     peers: PeerMap,
     config: AudioConfig,
     plc_factory: PlcFactory,
-    _stream: cpal::Stream,
 }
 
 /// Handle returned by [`Mixer::add_peer`] for pushing encoded frames into
@@ -155,13 +164,38 @@ impl Mixer {
         info!("audio mixer started");
 
         Ok(Self {
-            peers,
-            config,
-            plc_factory,
+            handle: MixerHandle {
+                peers,
+                config,
+                plc_factory,
+            },
             _stream: stream,
         })
     }
 
+    /// Return a cloneable handle for adding/removing peers from another task.
+    pub fn handle(&self) -> MixerHandle {
+        self.handle.clone()
+    }
+
+    pub fn add_peer(&self, key: impl Into<String>) -> Result<PeerInput> {
+        self.handle.add_peer(key)
+    }
+
+    pub fn peer_stats(&self, key: &str) -> Option<BufferStats> {
+        self.handle.peer_stats(key)
+    }
+
+    pub fn all_peer_stats(&self) -> HashMap<String, BufferStats> {
+        self.handle.all_peer_stats()
+    }
+
+    pub fn remove_peer(&self, key: &str) {
+        self.handle.remove_peer(key)
+    }
+}
+
+impl MixerHandle {
     /// Register a new peer; returns a handle for the network task to push
     /// frames with. A fresh PLC backend is minted from the mixer's factory.
     pub fn add_peer(&self, key: impl Into<String>) -> Result<PeerInput> {
