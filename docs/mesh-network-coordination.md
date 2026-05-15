@@ -264,16 +264,27 @@ dependencies align.
 
 ## Crate Architecture
 
-### Current (Audio MVP)
-- `mjolnir-node` — binary crate. CLI entry point + room logic. Currently hardcodes audio: room.rs imports mjolnir_audio directly, wiring gossip peer discovery to Opus encode/decode pipelines.
-- `mjolnir-moq` — MoQ-over-WebTransport bridge. Adapts iroh connections to moq-lite sessions. Application-agnostic.
-- `mjolnir-audio` — Opus capture/encode/decode/playback. Pure audio, no mesh awareness.
+Two transports live side by side, picked by workload topology:
+
+* **Direct iroh bidi streams** (`crates/mjolnir-node/src/audio_proto.rs`) for the
+  full-mesh real-time case — N peers each sending a small Opus frame every 20 ms
+  to every other peer. ~150 LOC, no protocol overhead.
+* **MoQ over WebTransport** (`crates/mjolnir-moq`) for the one-publisher /
+  many-subscriber broadcast case — video, screen-share, recorded streams. MoQ's
+  named broadcasts, group sequencing, and cache-aware stream layouts pay rent
+  in that topology; they don't in audio mesh.
+
+### Current
+- `mjolnir-node` — binary crate. CLI entry, room logic, gossip-driven peer discovery, and the audio bidi-stream protocol (`audio_proto.rs`).
+- `mjolnir-audio` — Opus capture/encode/decode/playback + jitter buffer + per-peer mixer with pluggable PLC. No mesh awareness.
+- `mjolnir-media` — codec-agnostic media primitives (sequence-keyed jitter ring, `Recover` trait, `SelfHealingBuffer`).
+- `mjolnir-moq` — MoQ-over-WebTransport bridge. Adapts iroh connections to moq-lite sessions. Reserved for broadcast-topology workloads (video, screen-share); currently not used by the audio path.
 
 ### Planned (Mesh Library Extraction)
-- `mjolnir-mesh` — new lib crate. Owns: iroh endpoint, gossip, MoQ pub/sub of generic byte streams, CRDT store, DHCP/DNS coordination, routing. Exposes: `publish_stream(name) -> BytesSink` and `on_peer_stream(peer_id) -> BytesStream`. Knows nothing about audio.
-- `mjolnir-node` — becomes a thin binary depending on mjolnir-mesh + mjolnir-audio. Wires mesh byte streams to audio pipelines.
-- `mjolnir-moq` — stays in networking layer (mjolnir-mesh depends on it).
-- `mjolnir-audio` — stays in application layer (mjolnir-node depends on it).
+- `mjolnir-mesh` — new lib crate. Owns: iroh endpoint, gossip, CRDT store, DHCP/DNS coordination, routing. Exposes a generic `publish_stream(name)` / `on_peer_stream(peer_id)` surface plus the MoQ pub/sub stack for broadcast workloads.
+- `mjolnir-node` — becomes a thin binary depending on mjolnir-mesh + mjolnir-audio.
+- `mjolnir-moq` — stays available for broadcast-topology consumers (e.g. video).
+- `mjolnir-audio` — stays in application layer; consumers wire the audio bidi protocol against `mjolnir-mesh`'s endpoint.
 
 The DHCP/DNS/CRDT coordination described in this doc suite lives in the mjolnir-mesh lib crate — it is networking infrastructure, not application logic.
 

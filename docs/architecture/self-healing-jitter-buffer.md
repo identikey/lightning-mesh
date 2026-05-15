@@ -205,27 +205,24 @@ per-frame kernel-launch model.
 
 ## Integration point in mjolnir-mesh today
 
-The buffer sits between `subscribe` and `playback` in `mjolnir-audio`:
+The buffer sits between the network recv pump and the cpal output stream:
 
 ```
-network ─► subscribe.rs ─► [JitterBuffer service] ─► playback.rs ─► cpal
-                              ▲                   │
-                              │                   │
-                              └──── PlcBackend ◄──┘
-                                  (Cpu | Aie)
+network ─► audio_proto recv pump ─► JitterBuffer (mjolnir-media)
+                                         │
+                                         ▼
+                                   PlcBackend ─► Mixer ─► cpal output
+                                  (Opus | Silence | …)
 ```
 
-Current code at `crates/mjolnir-audio/src/subscribe.rs:24` pushes decoded PCM directly
-into the playback `mpsc` channel. There's no reorder, no dejitter, no loss path — the
-Opus decoder is only ever called with `decode(&frame)`, not the `decode(None, fec)`
-form that triggers concealment. The first concrete change is to insert the buffer
-service between those two stages.
-
-A second change is on the *send* side: enable Opus in-band FEC (`set_inband_fec(true)`)
-in the encoder at `crates/mjolnir-audio/src/codec.rs` so that the receiver actually has
-redundant data to recover from. FEC + PLC compose: FEC handles isolated single-packet
-loss for free; PLC covers the cases FEC can't (burst loss, late arrival exceeding
-the buffer depth, FEC frame itself lost).
+The recv pump in `crates/mjolnir-node/src/audio_proto.rs` reads length-prefixed
+Opus frames off the peer's bidi stream and pushes them into the per-peer jitter
+buffer via `PeerInput`. The cpal output callback in
+`crates/mjolnir-audio/src/mixer.rs` drains each peer's buffer at the audio clock
+rate, decoding present frames with Opus's regular path and calling the
+`PlcBackend` for gaps. Opus in-band FEC is already enabled on the encoder side
+(`crates/mjolnir-audio/src/codec.rs`); the next concrete work is wiring the
+`decode_fec` lookahead path into the buffer's pull logic.
 
 ## Sequence of work
 
@@ -283,7 +280,8 @@ Steps 5–6 are downstream of parakeet-aie progress.
 
 - [parakeet-aie](https://github.com/duke/parakeet-aie) — the AIE runtime this design
   depends on for the NPU backend
-- `crates/mjolnir-audio/src/subscribe.rs` — current (PLC-less) receive path
-- `crates/mjolnir-audio/src/codec.rs` — current Opus encoder; FEC not yet enabled
+- `crates/mjolnir-node/src/audio_proto.rs` — bidi-stream recv pump that feeds the jitter buffer
+- `crates/mjolnir-audio/src/mixer.rs` — per-peer jitter pull + PLC dispatch + sum-mix
+- `crates/mjolnir-audio/src/codec.rs` — Opus encoder (in-band FEC enabled) and decoder (PLC + FEC decode paths)
 - Opus 1.5 neural PLC: LACE and NoLACE (Xiph publication, MIT/BSD license)
 - Interspeech PLC Challenge — public benchmark for neural concealment quality
