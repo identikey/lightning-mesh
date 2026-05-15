@@ -17,6 +17,7 @@ pub use conceal::{
     default_plc_factory, silence_plc_factory, OpusPlc, PlcBackend, PlcFactory, SilencePlc,
 };
 pub use mixer::{Mixer, PeerInput};
+pub use mjolnir_media::{BufferStats, Pulled};
 pub use publish::AUDIO_TRACK_NAME;
 
 /// Audio configuration for the mesh.

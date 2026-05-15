@@ -94,21 +94,26 @@ distraction of a 600M-param model port.
 
 ## The seam
 
-`mjolnir-audio` defines a backend trait at the decode-and-conceal boundary
-(`crates/mjolnir-audio/src/conceal.rs`):
+The seam lives in two crates: the *generic* decode-and-conceal trait is in
+`mjolnir-media` (so a future `mjolnir-video` can share the same shape); the
+*audio-specific* impls and ergonomic aliases live in `mjolnir-audio`.
+
+In `mjolnir-media/src/recover.rs`:
 
 ```rust
-pub trait PlcBackend: Send {
-    /// Decode a freshly-arrived packet into PCM i16 samples.
-    fn decode(&mut self, packet: &[u8]) -> Result<Vec<i16>>;
-
-    /// Synthesise PCM for one frame the network failed to deliver.
-    fn decode_lost(&mut self) -> Result<Vec<i16>>;
-
-    /// Whether this backend can predict cheaply enough that the buffer
-    /// can speculate every frame. Default: false.
+pub trait Recover: Send {
+    type Output;
+    fn decode(&mut self, packet: &[u8]) -> Result<Self::Output>;
+    /// `lookahead` is the next-in-sequence packet (if it has already
+    /// arrived); codecs supporting forward error correction can use it
+    /// to reconstruct the lost frame. The lookahead is non-destructive:
+    /// it remains in the buffer and is decoded normally at its own slot.
+    fn decode_lost(&mut self, lookahead: Option<&[u8]>) -> Result<Self::Output>;
     fn supports_speculation(&self) -> bool { false }
 }
+
+// blanket impl so Box<dyn Recover<...>> itself satisfies Recover
+impl<R: ?Sized + Recover> Recover for Box<R> { ... }
 ```
 
 The same trait carries both `decode` and `decode_lost` because codec-native PLC
@@ -118,12 +123,51 @@ expensive state mirroring. Backends that want explicit context (a neural PLC
 conditioned on recent PCM) maintain it internally — they observe each decoded
 frame inside their own `decode` impl.
 
-Three implementations on the roadmap:
+In `mjolnir-media/src/service.rs`:
+
+```rust
+pub enum Pulled<T> {
+    Empty,            // warming up
+    Decoded(T),       // from a real received packet
+    Concealed(T),     // synthesised by codec PLC or FEC lookahead
+}
+
+pub struct BufferStats {
+    pub decoded: u64,
+    pub concealed: u64,
+    pub fec_recovered: u64,  // concealments where a lookahead was available
+    pub errors: u64,
+}
+
+pub struct SelfHealingBuffer<R: Recover> { /* jitter + recover + stats */ }
+
+impl<R: Recover> SelfHealingBuffer<R> {
+    pub fn push(&mut self, seq: u64, packet: Bytes) -> PushOutcome { ... }
+    pub fn pull(&mut self) -> Result<Pulled<R::Output>> { ... }
+    pub fn stats(&self) -> BufferStats { ... }
+}
+```
+
+On `Pull::Gap` the buffer non-destructively peeks the next slot and
+hands it to `decode_lost` as a recovery hint. Provenance flows back to
+the consumer via the `Pulled` variants, enabling cross-fade and
+observability without leaking codec specifics. `BufferStats` is the
+"Redis INFO" surface — running counts the mixer or any other consumer
+can snapshot.
+
+In `mjolnir-audio/src/conceal.rs`:
+
+```rust
+pub type PlcBackend = dyn Recover<Output = Vec<i16>> + Send;
+pub type PlcFactory =
+    Arc<dyn Fn(&AudioConfig) -> Result<Box<PlcBackend>> + Send + Sync>;
+```
+
+Four implementations on the roadmap:
 
 - `OpusPlc` — wraps the Opus decoder; `decode_lost` calls into Opus's built-in
   concealment (LACE/NoLACE in Opus 1.5+). Ships today as the CPU default;
-  microsecond-class, zero new dependencies. Implemented at
-  `crates/mjolnir-audio/src/conceal.rs`.
+  microsecond-class, zero new dependencies.
 - `SilencePlc` — emits zeros on loss. Useful as a worst-case audibility reference
   and in tests. Also implemented today.
 - `CpuNeuralPlc` — a hosted small neural PLC model in pure Rust (candle / ort / a
@@ -135,9 +179,14 @@ Three implementations on the roadmap:
   `true`, enabling the mixer to drive the NPU every frame and discard predictions on
   successful packet arrival.
 
-A `PlcFactory` type alias (`Arc<dyn Fn(&AudioConfig) -> Result<Box<dyn PlcBackend>>>`)
-plus `default_plc_factory()` / `silence_plc_factory()` helpers thread the choice
-through `Mixer::start_with_plc`; each registered peer mints its own backend instance.
+`default_plc_factory()` / `silence_plc_factory()` helpers thread the choice
+through `Mixer::start_with_plc`; each registered peer mints its own backend
+instance, wrapped in a `SelfHealingBuffer<Box<PlcBackend>>` inside the mixer's
+per-peer slot.
+
+A future `mjolnir-video` will declare its own trait alias (e.g.
+`pub type VideoRecover = dyn Recover<Output = VideoFrame> + Send`) and reuse the
+same `SelfHealingBuffer` machinery with a video-shaped output type.
 
 The host↔NPU API parakeet-aie needs to expose for this to work is small and stays
 small:

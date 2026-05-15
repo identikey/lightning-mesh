@@ -57,6 +57,7 @@ impl MoqSession {
 /// `web_transport_iroh::iroh` (currently iroh 0.96) to ensure type compatibility
 /// with `web_transport_iroh::Session::raw()`. If your application uses iroh 0.97,
 /// use the re-exported types from `mjolnir_moq::iroh` for MoQ-related operations.
+#[derive(Clone)]
 pub struct MoqBridge {
     sessions: SharedSessionMap,
     origin: OriginProducer,

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use bytes::Bytes;
 use futures_lite::StreamExt;
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_gossip::api::{Event, GossipTopic};
 use mjolnir_audio::{AudioConfig, Mixer};
@@ -54,6 +55,10 @@ pub struct Room {
     topic: GossipTopic,
     bridge: MoqBridge,
     endpoint: Endpoint,
+    /// Address book wired into the iroh endpoint. We seed it whenever we
+    /// learn an `EndpointAddr` from gossip (Announce / PeerList) so that
+    /// subsequent dials by `EndpointId` don't hit pkarr/DNS.
+    address_lookup: MemoryLookup,
     /// Known peers: EndpointId → full EndpointAddr (for ticket minting).
     peers: HashMap<EndpointId, EndpointAddr>,
     audio_config: AudioConfig,
@@ -65,6 +70,7 @@ impl Room {
         topic: GossipTopic,
         bridge: MoqBridge,
         endpoint: Endpoint,
+        address_lookup: MemoryLookup,
     ) -> Self {
         info!(room = %name, "room created");
         Self {
@@ -72,6 +78,7 @@ impl Room {
             topic,
             bridge,
             endpoint,
+            address_lookup,
             peers: HashMap::new(),
             audio_config: AudioConfig::default(),
         }
@@ -98,6 +105,7 @@ impl Room {
             topic,
             bridge,
             endpoint,
+            address_lookup,
             mut peers,
             audio_config,
         } = self;
@@ -165,6 +173,7 @@ impl Room {
                             &mut peers,
                             &mixer,
                             &sender,
+                            &address_lookup,
                         )
                         .await;
                     }
@@ -203,6 +212,7 @@ async fn handle_peer_discovered(
     peers: &mut HashMap<EndpointId, EndpointAddr>,
     mixer: &Mixer,
     sender: &iroh_gossip::api::GossipSender,
+    address_lookup: &MemoryLookup,
 ) {
     let peer_id = addr.id;
 
@@ -212,10 +222,24 @@ async fn handle_peer_discovered(
 
     info!(peer = %peer_id, "discovered new peer via gossip");
 
-    // Connect MoQ session to the peer
-    if let Err(e) = bridge.connect(endpoint, addr.clone()).await {
-        warn!(peer = %peer_id, "failed to connect MoQ session: {e}");
-        return;
+    // Seed iroh's address book so MoQ (and any future dialer keyed by
+    // EndpointId) can reach the peer without pkarr/DNS discovery.
+    address_lookup.add_endpoint_info(addr.clone());
+
+    // Deterministic dial tiebreak: both peers see each other's gossip
+    // Announce simultaneously, so if both call bridge.connect we end up
+    // with two MoQ sessions per pair and the second clobbers the first.
+    // Only the side with the lower endpoint id dials; the higher-id side
+    // accepts the incoming connection on its iroh router. Either way the
+    // session lands in the shared bridge with the same origin.
+    let we_dial = endpoint.id() < peer_id;
+    if we_dial {
+        if let Err(e) = bridge.connect(endpoint, addr.clone()).await {
+            warn!(peer = %peer_id, "failed to connect MoQ session: {e}");
+            return;
+        }
+    } else {
+        info!(peer = %peer_id, "waiting for inbound MoQ connection (dial tiebreak)");
     }
     peers.insert(peer_id, addr);
 
@@ -228,35 +252,52 @@ async fn handle_peer_discovered(
         }
     }
 
-    // Subscribe to the peer's audio track
-    let origin = bridge.origin();
-    let peer_broadcast_name = peer_id.to_string();
-    let peer_broadcast = origin.consume_broadcast(&peer_broadcast_name);
-    if let Some(broadcast_consumer) = peer_broadcast {
-        let track = Track::new(mjolnir_audio::AUDIO_TRACK_NAME);
-        match broadcast_consumer.subscribe_track(&track) {
-            Ok(track_consumer) => {
-                match mixer.add_peer(peer_id.to_string()) {
-                    Ok(peer_input) => {
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                mjolnir_audio::subscribe::run_subscribe(track_consumer, peer_input)
-                                    .await
-                            {
-                                warn!("audio subscribe error: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        warn!(peer = %peer_id, "failed to register peer with mixer: {e}");
+    // Register the peer with the mixer up front; we'll start pushing frames
+    // once its broadcast is announced over the MoQ session.
+    let peer_input = match mixer.add_peer(peer_id.to_string()) {
+        Ok(pi) => pi,
+        Err(e) => {
+            warn!(peer = %peer_id, "failed to register peer with mixer: {e}");
+            return;
+        }
+    };
+
+    // Wait asynchronously for the peer's broadcast to be announced, then
+    // subscribe. moq-lite can announce, retract, and re-announce the same
+    // broadcast as the underlying session state churns (we've observed this
+    // at handshake time even with a single session), so the loop survives
+    // run_subscribe returning: each new announcement triggers a fresh
+    // subscribe attempt with the freshly-published BroadcastConsumer.
+    let mut origin_consumer = bridge.origin().consume();
+    let target_path = peer_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            // Wait until the next time our target broadcast is announced
+            // (with a real BroadcastConsumer, not an unannounce).
+            let broadcast_consumer = loop {
+                match origin_consumer.announced().await {
+                    Some((path, Some(c))) if path.as_str() == target_path => break c,
+                    Some(_) => continue,
+                    None => return,
+                }
+            };
+
+            let track = Track::new(mjolnir_audio::AUDIO_TRACK_NAME);
+            match broadcast_consumer.subscribe_track(&track) {
+                Ok(track_consumer) => {
+                    if let Err(e) = mjolnir_audio::subscribe::run_subscribe(
+                        track_consumer,
+                        peer_input.clone(),
+                    )
+                    .await
+                    {
+                        warn!(peer = %peer_id, "audio subscribe error: {e}; awaiting re-announce");
                     }
                 }
-            }
-            Err(e) => {
-                warn!(peer = %peer_id, "failed to subscribe to audio track: {e}");
+                Err(e) => {
+                    warn!(peer = %peer_id, "failed to subscribe to audio track: {e}");
+                }
             }
         }
-    } else {
-        info!(peer = %peer_id, "peer broadcast not yet available");
-    }
+    });
 }

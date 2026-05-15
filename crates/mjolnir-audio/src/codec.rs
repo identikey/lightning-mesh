@@ -25,6 +25,22 @@ impl OpusEncoder {
             .set_bitrate(opus::Bitrate::Bits(config.bitrate))
             .context("failed to set bitrate")?;
 
+        // Enable in-band FEC. The encoder reserves a small portion of each
+        // packet for FEC data covering the *previous* frame, which the
+        // receiver can use to reconstruct a lost frame from the next
+        // arrival (see `OpusDecoder::decode_fec`). Cost: small bitrate
+        // overhead and a slight encoding-quality hit at the configured
+        // bitrate. Standard for production voice.
+        encoder
+            .set_inband_fec(true)
+            .context("failed to enable inband FEC")?;
+        // Tell the encoder what loss rate to optimise FEC redundancy for.
+        // 5% is a reasonable default for mixed LAN/WAN voice; the encoder
+        // adapts redundancy energy to this hint.
+        encoder
+            .set_packet_loss_perc(5)
+            .context("failed to set packet loss perc")?;
+
         // Max opus frame is ~4000 bytes; 4096 is safe
         let encode_buf = vec![0u8; 4096];
 
@@ -87,13 +103,27 @@ impl OpusDecoder {
         Ok(&self.decode_buf[..n * self.config.channels as usize])
     }
 
-    /// Generate one frame of packet loss concealment samples. Used when a
-    /// jitter-buffer slot is empty at playout time.
+    /// Generate one frame of packet loss concealment samples using the
+    /// decoder's internal state alone (no FEC data). Used when no
+    /// lookahead packet is available at playout time.
     pub fn decode_lost(&mut self) -> Result<&[i16]> {
         let n = self
             .decoder
             .decode(&[], &mut self.decode_buf, false)
             .context("opus PLC decode failed")?;
+
+        Ok(&self.decode_buf[..n * self.config.channels as usize])
+    }
+
+    /// Reconstruct a lost frame from the FEC payload carried by the
+    /// *next* in-sequence packet (Opus in-band FEC). Does not advance
+    /// the decoder's primary state — the caller should still call
+    /// [`Self::decode`] on the same packet at its scheduled slot.
+    pub fn decode_fec(&mut self, next_packet: &[u8]) -> Result<&[i16]> {
+        let n = self
+            .decoder
+            .decode(next_packet, &mut self.decode_buf, true)
+            .context("opus FEC decode failed")?;
 
         Ok(&self.decode_buf[..n * self.config.channels as usize])
     }

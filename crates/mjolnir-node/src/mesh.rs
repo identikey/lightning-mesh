@@ -1,4 +1,5 @@
 use anyhow::Result;
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{endpoint::Connection, Endpoint, EndpointId, SecretKey};
 use iroh_gossip::net::Gossip;
@@ -23,10 +24,16 @@ impl ProtocolHandler for MoqProtocol {
 }
 
 /// Top-level mesh node. Owns the iroh Router (which owns the endpoint), Gossip, and MoQ bridge.
+///
+/// `address_lookup` is an in-memory address book wired into the iroh endpoint.
+/// We seed it from the ticket on join and from gossip Announce/PeerList messages,
+/// so iroh can dial peers directly without falling back to pkarr/DNS discovery
+/// (which fails for unpublished nodes — e.g. two peers on the same LAN).
 pub struct MeshNode {
     router: Router,
     gossip: Gossip,
     bridge: MoqBridge,
+    address_lookup: MemoryLookup,
     room: Mutex<Option<Room>>,
 }
 
@@ -39,7 +46,12 @@ impl MeshNode {
             Err(_) => SecretKey::generate(&mut rand::rng()),
         };
 
-        let endpoint = Endpoint::builder().secret_key(secret_key).bind().await?;
+        let address_lookup = MemoryLookup::new();
+        let endpoint = Endpoint::builder()
+            .secret_key(secret_key)
+            .address_lookup(address_lookup.clone())
+            .bind()
+            .await?;
 
         let bridge = MoqBridge::new();
         let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -56,6 +68,7 @@ impl MeshNode {
             router,
             gossip,
             bridge,
+            address_lookup,
             room: Mutex::new(None),
         })
     }
@@ -95,6 +108,14 @@ impl MeshNode {
                 );
             }
 
+            // Seed iroh's address book with the ticket's full EndpointAddrs.
+            // Without this, gossip would dial peers by EndpointId alone, which
+            // forces iroh to fall back to pkarr/DNS discovery — that fails for
+            // unpublished nodes (e.g. two peers on the same LAN).
+            for addr in &parsed_ticket.addrs {
+                self.address_lookup.add_endpoint_info(addr.clone());
+            }
+
             let bootstrap_ids = parsed_ticket.bootstrap_peer_ids();
             info!(
                 room = name,
@@ -117,11 +138,16 @@ impl MeshNode {
                 .map_err(|e| anyhow::anyhow!("gossip subscribe failed: {e}"))?
         };
 
+        // Share MeshNode's bridge so the Room publishes and subscribes via
+        // the same Origin that incoming MoQ sessions register against —
+        // otherwise the Router accepts sessions into one Origin while the
+        // Room watches a different (empty) one.
         let room = Room::new(
             name.to_string(),
             topic,
-            MoqBridge::new(),
+            self.bridge.clone(),
             self.endpoint().clone(),
+            self.address_lookup.clone(),
         );
 
         // Generate ticket before storing room (we need &room for generate_ticket)

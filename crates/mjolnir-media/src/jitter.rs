@@ -160,6 +160,26 @@ impl<T> JitterBuffer<T> {
         }
     }
 
+    /// Non-destructive peek at the slot at the current playout cursor.
+    ///
+    /// Returns `Some(&frame)` if the next-expected sequence is present,
+    /// `None` if it would be a [`Pull::Gap`] (the expected packet is
+    /// missing) or if the buffer is still warming up.
+    ///
+    /// Used by [`SelfHealingBuffer`](crate::SelfHealingBuffer) for
+    /// FEC lookahead: after a gap is detected, the buffer peeks the next
+    /// slot to pass to the backend's concealment path as a recovery hint
+    /// without removing it (it will still be returned by the subsequent
+    /// `pull`).
+    pub fn peek_next(&self) -> Option<&T> {
+        if !self.started {
+            return None;
+        }
+        let seq = self.next_seq?;
+        let idx = (seq % self.capacity as u64) as usize;
+        self.slots[idx].as_ref()
+    }
+
     /// Number of frames currently held.
     pub fn len(&self) -> usize {
         self.count

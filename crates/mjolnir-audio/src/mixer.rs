@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
-use mjolnir_media::{JitterBuffer, Pull};
+use mjolnir_media::{BufferStats, Pulled, SelfHealingBuffer};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
@@ -26,29 +26,29 @@ const JITTER_CAPACITY: usize = 16;
 
 /// State for a single peer's audio stream.
 ///
-/// `plc` is the pluggable decode-and-conceal backend (see
-/// [`crate::conceal::PlcBackend`]). The default is Opus's built-in PLC;
-/// a future NPU-resident backend would slot in here unchanged.
+/// Wraps a [`SelfHealingBuffer`] from `mjolnir-media`, which owns both
+/// the jitter ring and the [`PlcBackend`] decode-and-conceal backend.
+/// Swapping in a different backend (silence baseline, neural CPU,
+/// NPU-resident) requires no changes here — see
+/// [`Mixer::start_with_plc`].
 struct PeerSlot {
-    jitter: JitterBuffer<Bytes>,
-    plc: Box<dyn PlcBackend>,
+    buffer: SelfHealingBuffer<Box<PlcBackend>>,
     /// Decoded samples pending playback. Drained by the output callback at
     /// the device's sample-clock rate.
     pcm_tail: VecDeque<i16>,
 }
 
 impl PeerSlot {
-    fn new(config: &AudioConfig, plc: Box<dyn PlcBackend>) -> Result<Self> {
+    fn new(config: &AudioConfig, plc: Box<PlcBackend>) -> Result<Self> {
         let frame_size = config.frame_size() * config.channels as usize;
         Ok(Self {
-            jitter: JitterBuffer::new(JITTER_TARGET_FRAMES, JITTER_CAPACITY),
-            plc,
+            buffer: SelfHealingBuffer::new(JITTER_TARGET_FRAMES, JITTER_CAPACITY, plc),
             pcm_tail: VecDeque::with_capacity(frame_size * 4),
         })
     }
 
     fn push(&mut self, seq: u64, frame: Bytes) {
-        self.jitter.push(seq, frame);
+        self.buffer.push(seq, frame);
     }
 
     /// Accumulate this peer's PCM into `mix`. Contributes silence (no add)
@@ -64,18 +64,20 @@ impl PeerSlot {
         }
     }
 
-    /// Pull one frame from the jitter buffer (or invoke PLC on a gap) and
-    /// push its decoded samples into `pcm_tail`. No-op while warming up.
+    /// Pull one decoded frame (or a concealed one) from the buffer and
+    /// push its samples into `pcm_tail`. No-op while warming up.
     fn fill_tail(&mut self) {
-        let result = match self.jitter.pull() {
-            Pull::Frame(bytes) => self.plc.decode(&bytes),
-            Pull::Gap => self.plc.decode_lost(),
-            Pull::Empty => return,
-        };
-        match result {
-            Ok(samples) => self.pcm_tail.extend(samples.into_iter()),
+        match self.buffer.pull() {
+            Ok(Pulled::Decoded(samples)) | Ok(Pulled::Concealed(samples)) => {
+                self.pcm_tail.extend(samples);
+            }
+            Ok(Pulled::Empty) => {} // warming up
             Err(e) => debug!("decode error: {e}"),
         }
+    }
+
+    fn stats(&self) -> BufferStats {
+        self.buffer.stats()
     }
 }
 
@@ -172,6 +174,28 @@ impl Mixer {
             .insert(key.clone(), slot.clone());
         info!(peer = %key, "mixer registered peer");
         Ok(PeerInput { slot })
+    }
+
+    /// Snapshot the decode/conceal stats for one peer. Returns `None`
+    /// if no peer with that key is registered.
+    pub fn peer_stats(&self, key: &str) -> Option<BufferStats> {
+        let peers = self.peers.lock().ok()?;
+        let slot = peers.get(key)?.clone();
+        drop(peers);
+        let slot = slot.lock().ok()?;
+        Some(slot.stats())
+    }
+
+    /// Snapshot the stats for every registered peer.
+    pub fn all_peer_stats(&self) -> HashMap<String, BufferStats> {
+        let handles: Vec<(String, Arc<Mutex<PeerSlot>>)> = match self.peers.lock() {
+            Ok(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            Err(_) => return HashMap::new(),
+        };
+        handles
+            .into_iter()
+            .filter_map(|(k, slot)| slot.lock().ok().map(|s| (k, s.stats())))
+            .collect()
     }
 
     /// Deregister a peer. Any frames buffered in its jitter ring are dropped.
