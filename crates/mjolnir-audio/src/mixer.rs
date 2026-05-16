@@ -177,6 +177,16 @@ impl Mixer {
     /// strategies (silence baseline, tract-hosted neural model,
     /// NPU-resident).
     pub fn start_with_plc(config: AudioConfig, plc_factory: PlcFactory) -> Result<Self> {
+        // Log the linked libopus version once per mixer startup. Deep PLC
+        // (FARGAN) is only active on libopus >= 1.5 with decoder
+        // complexity >= 5 (which is the default in 1.5+); the build script
+        // enforces the version floor, this line just surfaces it at runtime.
+        info!(
+            linked_libopus = opus::version(),
+            build_libopus = env!("MJOLNIR_LIBOPUS_VERSION"),
+            "audio codec ready (deep neural PLC active on libopus >= 1.5)"
+        );
+
         let host = cpal::default_host();
         let device = host
             .default_output_device()
