@@ -266,16 +266,20 @@ dependencies align.
 
 Two transports live side by side, picked by workload topology:
 
-* **Direct iroh bidi streams** (`crates/mjolnir-node/src/audio_proto.rs`) for the
+* **Direct iroh QUIC datagrams** (`crates/mjolnir-node/src/audio_proto.rs`) for the
   full-mesh real-time case — N peers each sending a small Opus frame every 20 ms
-  to every other peer. ~150 LOC, no protocol overhead.
+  to every other peer, one frame per datagram with a `u64` LE sequence prefix.
+  Unreliable + unordered is exactly what real-time audio wants: a dropped or
+  reordered packet shows up at the receiver immediately, the jitter buffer
+  conceals (with FEC lookahead when the next packet is in hand), and playback
+  never stalls waiting for retransmits. ~150 LOC, no protocol overhead.
 * **MoQ over WebTransport** (`crates/mjolnir-moq`) for the one-publisher /
   many-subscriber broadcast case — video, screen-share, recorded streams. MoQ's
   named broadcasts, group sequencing, and cache-aware stream layouts pay rent
   in that topology; they don't in audio mesh.
 
 ### Current
-- `mjolnir-node` — binary crate. CLI entry, room logic, gossip-driven peer discovery, and the audio bidi-stream protocol (`audio_proto.rs`).
+- `mjolnir-node` — binary crate. CLI entry, room logic, gossip-driven peer discovery, and the audio QUIC-datagram protocol (`audio_proto.rs`).
 - `mjolnir-audio` — Opus capture/encode/decode/playback + jitter buffer + per-peer mixer with pluggable PLC. No mesh awareness.
 - `mjolnir-media` — codec-agnostic media primitives (sequence-keyed jitter ring, `Recover` trait, `SelfHealingBuffer`).
 - `mjolnir-moq` — MoQ-over-WebTransport bridge. Adapts iroh connections to moq-lite sessions. Reserved for broadcast-topology workloads (video, screen-share); currently not used by the audio path.
@@ -284,7 +288,7 @@ Two transports live side by side, picked by workload topology:
 - `mjolnir-mesh` — new lib crate. Owns: iroh endpoint, gossip, CRDT store, DHCP/DNS coordination, routing. Exposes a generic `publish_stream(name)` / `on_peer_stream(peer_id)` surface plus the MoQ pub/sub stack for broadcast workloads.
 - `mjolnir-node` — becomes a thin binary depending on mjolnir-mesh + mjolnir-audio.
 - `mjolnir-moq` — stays available for broadcast-topology consumers (e.g. video).
-- `mjolnir-audio` — stays in application layer; consumers wire the audio bidi protocol against `mjolnir-mesh`'s endpoint.
+- `mjolnir-audio` — stays in application layer; consumers wire the audio datagram protocol against `mjolnir-mesh`'s endpoint.
 
 The DHCP/DNS/CRDT coordination described in this doc suite lives in the mjolnir-mesh lib crate — it is networking infrastructure, not application logic.
 

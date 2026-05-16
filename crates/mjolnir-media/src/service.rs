@@ -53,6 +53,11 @@ impl<T> Pulled<T> {
 /// observability without piping events out of the audio thread.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BufferStats {
+    /// Datagrams (or packets) the buffer accepted via [`SelfHealingBuffer::push`].
+    /// Counts every push call regardless of [`PushOutcome`] — i.e. raw
+    /// arrival count from the wire. Useful as a liveness signal even
+    /// before any pulls have happened.
+    pub received: u64,
     /// Frames produced from a received packet.
     pub decoded: u64,
     /// Frames produced from concealment (codec PLC or FEC).
@@ -82,6 +87,7 @@ impl<R: Recover> SelfHealingBuffer<R> {
 
     /// Insert a freshly-arrived encoded packet at sequence `seq`.
     pub fn push(&mut self, seq: u64, packet: Bytes) -> PushOutcome {
+        self.stats.received += 1;
         self.jitter.push(seq, packet)
     }
 

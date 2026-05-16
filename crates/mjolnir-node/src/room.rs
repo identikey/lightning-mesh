@@ -117,6 +117,33 @@ impl Room {
         // peers with the mixer and pump frames through the same broadcast.
         audio_handler.bind(mixer.handle(), pcm_tx.clone(), audio_config.clone());
 
+        // Periodic stats heartbeat: every 5 seconds, log per-peer
+        // decode/conceal counts so PLC engagement is visible during
+        // demos and integration runs. Aborted when the room ends.
+        let stats_mixer = mixer.handle();
+        let stats_task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // first tick fires immediately; consume it
+            loop {
+                tick.tick().await;
+                let snapshot = stats_mixer.all_peer_stats();
+                if snapshot.is_empty() {
+                    continue;
+                }
+                for (peer, s) in snapshot {
+                    info!(
+                        peer = %peer,
+                        decoded = s.decoded,
+                        concealed = s.concealed,
+                        fec = s.fec_recovered,
+                        errors = s.errors,
+                        "peer audio stats"
+                    );
+                }
+            }
+        });
+
         // Announce ourselves via gossip
         let our_addr = endpoint.addr();
         let announce = GossipMessage::Announce(our_addr.clone());
@@ -186,6 +213,7 @@ impl Room {
         }
 
         info!(room = %name, "room gossip stream ended");
+        stats_task.abort();
         drop(mixer);
         Ok(())
     }
