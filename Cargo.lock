@@ -2448,12 +2448,14 @@ dependencies = [
  "blake3",
  "bytes",
  "ipnet",
+ "nix 0.31.2",
  "postcard",
  "rtnetlink",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "tun",
 ]
 
