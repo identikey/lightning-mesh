@@ -1,79 +1,133 @@
-# Collective Coordination: Address-Space Arbitration & Federation
+# Collective Coordination: Governing Address-Space Allocation
 
 **Status:** Draft / exploration (substrate-layer governance) | **Date:** 2026-06-10
 
-The DHCP/subnet CRDT (`/subnets/{cidr}`, see `dhcp-crdt.md` and `babel-routing.md`) makes IPv4
-address space a *shared commons* with no central authority. That works while claims are disjoint.
-This note is about the cases where it does not — **deadlock, over-allocation, and joining/merging
-independently-formed address spaces** — and how a non-authoritarian collective decides in those
-cases.
+The DHCP/subnet CRDT (`/subnets/{cidr}`, see `dhcp-crdt.md` and `babel-routing.md`) makes the mesh
+IPv4 space (`DEFAULT_MESH_SPACE = 10.42.0.0/16`, 65 534 usable; `alloc.rs`) a *shared commons* with
+no central authority. Allocation works cleanly while the space is mostly empty. This note is about
+the part that needs a defined collective behaviour: **what happens as the space fills up.**
 
-This is **substrate-layer** governance (IP plumbing). It is deliberately *not* where social groups
-or shared encryption live — that is the overlay, see `guilds-overlay-vision.md`.
+Today this is not urgent — four routers exist and utilisation is ~0%. But it must be sound before a
+production fleet, so this captures the governance model and, importantly, separates the **cheap
+things worth doing before production** from the **heavier governance that can wait**.
+
+This is **substrate-layer** governance (IP plumbing). Social groups / shared encryption are an
+application-layer concern and are deliberately *not* in this repo (see issue `mjolnir-mesh-6t7`,
+parked).
 
 ---
 
-## 1. The problem: a commons needs an arbitration story
+## 1. The gap: `pick_subnet` returns `None`, "the caller decides"
 
-In an authoritarian network the authority decides allocation and everyone complies. Our model has
-no authority — allocation is coordinated by CRDT claims with a cooldown (`network-architecture.md`
-§subnet claim). That is the right default, but a commons still needs a defined behaviour for when
-two participants' interests collide and there is no one to break the tie.
+`alloc::pick_subnet(node_id, claimed, base, target_prefix_len)` picks a deterministic preferred slot
+(blake3 of `node_id`) and walks candidates, rejecting any that overlap a claim of *any* size. On
+exhaustion it returns `None`, and its own doc comment defers the policy:
 
-## 2. Scenarios
+> "callers (typically a daemon UI) decide whether to **widen the search, shrink the request, or
+> fail loud**."
 
-**a. Over-allocation under variable prefixes.** Variable-prefix allocation (commit `f48cece`) lets
-a site claim a prefix sized to its needs. But a node that claims a generous block ("my LAN supports
-1024 clients") when it is in fact a single device is hoarding commons space — artificial scarcity.
-The collective may need a way to ask it to relinquish or renarrow.
+That deferred decision is the subject of this document. In a non-authoritarian commons there is no
+one to break ties, so the response to `None` must be either *deterministic* or *negotiated*.
 
-**b. Joining / merging address spaces.** Two meshes that formed independently each own a coherent
-space. When they meet — or a node wants to join another's space — their claims may overlap or
-fragment. Merging is a *negotiation*, not a unilateral claim.
+## 2. "Full" is fragmentation, not a count
 
-## 3. Client orientation (opt-in)
+Because CIDR blocks nest, a request fails when **no contiguous, aligned slot of the requested size is
+free** — which can happen with plenty of total free addresses. Example: a `/16` peppered with
+scattered `/30` claims can have >90% of addresses free yet be unable to satisfy a `/22` (which needs
+four aligned, contiguous `/24`s clear). So the commons has two distinct pressure signals:
 
-Joining someone else's address space should be **consensual and configurable**:
+- **Utilisation** — `Σ total_addresses(claim) / total_addresses(base)`.
+- **Largest free slot** — the biggest prefix `pick_subnet` could satisfy *right now*. This is the
+  fragmentation signal, and it fails first.
 
-- A client-level **orientation** — e.g. `join_shared_space: open | ask | never` — expressing
-  default openness to joining a shared space.
-- Later, an interface to **opt in to specific networks** explicitly (per-network consent) rather
-  than a blanket policy.
+Both should be derivable from the `/subnets/` CRDT and gossiped so every node shares the picture.
 
-This mirrors the web-of-trust stance from `membership-enrollment.md`: participation is a local
-decision, not something imposed.
+### Scale reference (`/16` base)
 
-## 4. Arbitration approaches (sketch — undecided)
+| Per-site claim | Usable hosts | Max such sites in /16 |
+|---|---|---|
+| `/22` | 1 022 | 64 |
+| `/24` | 254 | 256 |
+| `/30` | 2 | 16 384 |
 
-No authority means tie-breaks must be either *deterministic* or *negotiated*:
+Four routers today → effectively empty. The `/24`-per-site ceiling (256 sites) is the figure to
+watch for a growing fleet; widening the pool (§3, response B) raises it dramatically.
 
-- **Deterministic tie-break** — already used for /31 link addressing (blake3 of the sorted peer
-  pair, `tun/link.rs`). Cheap, no round-trip, but cannot weigh need.
-- **Cooldown + late-join yield** — already used for subnet claims; could extend to "newer or
-  over-broad claim yields to established narrow need."
-- **Negotiated renarrowing / backpressure** — a node observing over-allocation gossips a request to
-  renarrow; the holder responds. Needs an etiquette/incentive, not just a mechanism.
-- **Countersigned merge proposals** — joining/merging two spaces is proposed and countersigned by
-  members of both, reusing the endorsement primitive from `membership-enrollment.md`.
+## 3. Responses to exhaustion
 
-## 5. Relationship to existing work
+Formalising the allocator's "widen / shrink / fail loud," ordered cheapest-first:
 
-- Builds on: variable-prefix subnet allocation (`f48cece`), subnet-claim cooldown, the
-  `/subnets/{cidr}` CRDT ledger, Babel redistribution.
-- Reuses identity/attestation: merge proposals and consent can be signed/countersigned with the
-  same Ed25519-identity + endorsement model as enrollment.
+- **A. Shrink the request (auto-downgrade).** On `None`, retry with `bump_smaller_subnet` until a
+  slot is found or the `/30` floor is hit. Fully deterministic, no coordination, no authority. This
+  is the first-line response and should be **automatic** — a node should rarely hard-fail just
+  because its *preferred* size was unavailable.
+- **B. Widen the pool.** `base` is configurable (`DEFAULT_MESH_SPACE` is only the default). A
+  production deployment can run `10.0.0.0/8` (≈16 M addresses) or add a second space. This is the
+  real scalability lever and is a pure config decision — no protocol needed.
+- **C. Reclaim (negotiated).** Recover stale or over-broad claims (§4). Needs coordination, so it is
+  the heaviest response and the one to defer until fleet size makes it load-bearing.
+- **D. Fail loud / escalate.** Surface to the operator TUI (and/or a human-decision flag) when A–C
+  cannot satisfy a genuine need. Never silently mis-allocate.
 
-## 6. Open questions
+## 4. Reclamation without an authority (deferred)
 
-1. Is over-allocation a real problem in practice, or does variable-prefix + abundant RFC1918 space
-   make it moot until federation? (Likely defer aggressive reclamation.)
-2. What is the unit of "joining a space" — a node, a site, or a whole mesh?
-3. Does merge negotiation need a quorum, or is pairwise countersignature enough?
+Two recoverable conditions, both resolvable without a central decider:
+
+- **Stale claims.** A claim whose owner is no longer live. Liveness is already tracked (Iroh
+  connection state + Babel hello/IHU, `network-architecture.md`). Reclaim after a grace period +
+  cooldown to tolerate churn.
+- **Over-broad claims.** A `/22` serving three devices is hoarding commons space (the original
+  "1024 clients but it's just me" case). The collective gossips a *renarrow request*; the holder
+  yields or justifies. This needs an etiquette/incentive, not just a mechanism.
+
+Both can be made non-authoritarian by reusing the **endorsement primitive** from
+`membership-enrollment.md`: a reclamation/renarrow proposal is countersigned by other members, with
+deterministic tie-breaks (the same blake3 preference already in `pick_subnet`) and a cooldown so no
+single node acts unilaterally.
+
+## 5. Joining & merging address spaces (federation)
+
+A related path to pressure: two meshes that formed independently each own a coherent space; when
+they meet, claims may overlap or fragment. Merging should be **consensual and configurable**:
+
+- A client-level **orientation** — e.g. `join_shared_space: open | ask | never`.
+- Later, explicit **per-network opt-in** rather than a blanket policy.
+- A merge is a *negotiation* proposed and countersigned by members of both spaces (endorsement
+  primitive again), not a unilateral claim.
+
+## 6. Recommendation: cheap now, heavy later
+
+Matching effort to the fact that the space is empty but production is near:
+
+**Do before production (cheap, prevents fatal allocation failures):**
+1. **Auto-downgrade on `None`** (response A) — so allocation degrades gracefully instead of hard-failing.
+2. **Pool config knob** (response B) — let a deployment widen to `/8`; document the choice.
+3. **Pressure observability** — expose utilisation + largest-free-slot (in the TUI / metrics).
+
+**Defer until the fleet is large (dozens+ of sites):**
+4. Stale-claim reclamation (response C / §4).
+5. Over-broad renarrowing and countersigned reclamation/merge proposals (§4–5).
+
+## 7. Relationship to existing work
+
+- Builds on: variable-prefix allocation (`f48cece`, `alloc.rs`), the `/subnets/{cidr}` CRDT ledger,
+  subnet-claim cooldown, Babel redistribution (`ge {prefix} le {prefix}`).
+- Reuses identity/attestation: reclamation, renarrow, and merge proposals are signed/countersigned
+  with the same Ed25519-identity + endorsement model as enrollment (`membership-enrollment.md`).
+
+## 8. Open questions
+
+1. What is the unit of "joining a space" — a node, a site, or a whole mesh?
+2. Does reclamation/merge need a quorum, or is pairwise countersignature enough?
+3. What grace period + cooldown makes stale-claim reclamation safe against transient churn?
+4. Should the production default just be `/8` from day one, sidestepping `/16` exhaustion entirely?
 
 ---
 
 ## References
 
+- Allocator & pool: `crates/mjolnir-mesh/src/alloc.rs`
 - Subnet / DHCP CRDT: `dhcp-crdt.md`, `babel-routing.md`
+- Liveness & claim cooldown: `network-architecture.md`
 - Identity & endorsement primitive: `membership-enrollment.md`
-- Overlay groups (explicitly out of scope here): `guilds-overlay-vision.md`
+- Application-layer groups (out of scope here, parked): issue `mjolnir-mesh-6t7`
