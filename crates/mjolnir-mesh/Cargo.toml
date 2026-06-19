@@ -40,6 +40,8 @@ tempfile = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.21"
-tun = "0.8"
+# `async` feature gives create_as_async + AsyncDevice (AsyncRead/AsyncWrite),
+# used by the tunnel data plane (spawn_tunnel).
+tun = { version = "0.8", features = ["async"] }
 # TryStreamExt for rtnetlink's link/address streams (used in tun/iface.rs).
 futures-util = "0.3"

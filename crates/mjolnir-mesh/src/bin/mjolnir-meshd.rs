@@ -11,7 +11,7 @@
 //!   listen             accept inbound connections, echo ping datagrams
 //!   connect <addr>     dial a peer by address blob, measure a datagram round-trip
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -21,11 +21,18 @@ use clap::{Parser, Subcommand};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+use mjolnir_mesh::tun::{spawn_tunnel, DatagramConn, EncapError};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// ALPN for the P0 mesh connectivity probe. Bumped per protocol revision.
 const MESH_ALPN: &[u8] = b"mjolnir/mesh/v0";
+
+/// ALPN for the P1 L3 tunnel (TUN packets over iroh datagrams).
+const TUN_ALPN: &[u8] = b"mjolnir/mesh/tun/v0";
+
+/// UDP port the tunnel reachability probe echoes on (bound to the TUN /31 addr).
+const TUN_PROBE_PORT: u16 = 9999;
 
 /// Datagram payload used to prove an end-to-end round-trip.
 const PING: &[u8] = b"mjolnir-ping";
@@ -71,6 +78,15 @@ enum Command {
     /// inside a RouterOS container). Creates a throwaway /31 link and tears it
     /// down. This is the gating check for the L3 data plane (P1).
     TunTest,
+    /// P1: listen for a peer and bring up a per-peer /31 TUN tunnel over iroh.
+    /// Runs until Ctrl-C; echoes UDP probes on its tunnel address.
+    TunListen,
+    /// P1: dial a peer (address blob), bring up the /31 TUN tunnel, and probe
+    /// reachability across it (UDP round-trip to the peer's link address).
+    TunConnect {
+        /// Address blob printed by the peer's `tun-listen`.
+        addr: String,
+    },
 }
 
 #[tokio::main]
@@ -97,9 +113,192 @@ async fn main() -> Result<()> {
         }
         Command::Listen => run_listen(endpoint, cli.no_relay).await?,
         Command::Connect { addr } => run_connect(endpoint, &addr).await?,
+        Command::TunListen => run_tun_listen(endpoint, cli.no_relay).await?,
+        Command::TunConnect { addr } => run_tun_connect(endpoint, &addr).await?,
         Command::TunTest => unreachable!("handled above"),
     }
     Ok(())
+}
+
+/// A production [`DatagramConn`] over an iroh connection — the glue that lets the
+/// substrate's TUN encap loops shuttle IP packets over iroh QUIC datagrams.
+#[derive(Clone)]
+struct IrohDatagramConn {
+    conn: Connection,
+}
+
+#[async_trait::async_trait]
+impl DatagramConn for IrohDatagramConn {
+    async fn send_datagram(&self, packet: Bytes) -> Result<(), EncapError> {
+        self.conn.send_datagram(packet).map_err(|e| {
+            EncapError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })
+    }
+
+    async fn recv_datagram(&self) -> Result<Bytes, EncapError> {
+        // Any read error means the connection is no longer usable; surface it as
+        // ConnectionClosed so the encap loop exits cleanly.
+        self.conn
+            .read_datagram()
+            .await
+            .map_err(|_| EncapError::ConnectionClosed)
+    }
+}
+
+/// Short peer id for the interface name (8 hex chars is unique enough).
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+/// P1 listener: accept tunnel connections, bring up a /31 TUN per peer.
+async fn run_tun_listen(endpoint: Endpoint, no_relay: bool) -> Result<()> {
+    wait_until_addressable(&endpoint, no_relay).await;
+    print_identity(&endpoint)?;
+    info!("tun-listen: hand the address above to a peer's `tun-connect`");
+
+    let self_id = endpoint.id().to_string();
+    let router = Router::builder(endpoint)
+        .accept(TUN_ALPN, TunnelHandler { self_id })
+        .spawn();
+
+    tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
+    router.shutdown().await.context("router shutdown")?;
+    Ok(())
+}
+
+/// P1 connector: dial a peer, bring up the tunnel, probe reachability across it.
+async fn run_tun_connect(endpoint: Endpoint, addr_blob: &str) -> Result<()> {
+    let addr = decode_addr(addr_blob).context("decoding peer address blob")?;
+    let peer = addr.id;
+    let self_id = endpoint.id().to_string();
+
+    info!(%peer, "tun-connect: dialing");
+    let conn = endpoint
+        .connect(addr, TUN_ALPN)
+        .await
+        .context("connect failed")?;
+
+    let (self_addr, peer_addr) = mjolnir_mesh::tun::pick_link_31(&self_id, &peer.to_string());
+    let tunnel = spawn_tunnel(
+        short_id(&peer.to_string()),
+        self_addr,
+        peer_addr,
+        IrohDatagramConn { conn: conn.clone() },
+    )
+    .await
+    .context("bringing up tunnel")?;
+
+    info!(
+        iface = %tunnel.iface_name, %self_addr, %peer_addr,
+        "tunnel up — probing reachability across it"
+    );
+    // Echo server on our own link addr (so the peer can probe us too).
+    spawn_udp_echo(self_addr);
+    // Give the peer a moment to bring up its side, then probe.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    probe_peer(peer_addr).await;
+
+    info!("tunnel established; holding open (Ctrl-C to exit)");
+    tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
+    drop(tunnel);
+    Ok(())
+}
+
+/// iroh protocol handler that brings up a per-peer TUN tunnel on accept.
+#[derive(Clone, Debug)]
+struct TunnelHandler {
+    self_id: String,
+}
+
+impl ProtocolHandler for TunnelHandler {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        let peer = conn.remote_id();
+        let peer_str = peer.to_string();
+        let (self_addr, peer_addr) = mjolnir_mesh::tun::pick_link_31(&self.self_id, &peer_str);
+
+        match spawn_tunnel(
+            short_id(&peer_str),
+            self_addr,
+            peer_addr,
+            IrohDatagramConn { conn: conn.clone() },
+        )
+        .await
+        {
+            Ok(tunnel) => {
+                info!(iface = %tunnel.iface_name, %self_addr, %peer_addr, %peer, "tunnel up (accepted)");
+                spawn_udp_echo(self_addr);
+                // Hold the tunnel open until the connection closes.
+                let reason = conn.closed().await;
+                info!(%peer, ?reason, "tunnel connection closed");
+                drop(tunnel);
+            }
+            Err(e) => {
+                warn!(%peer, "failed to bring up tunnel: {e}");
+                conn.close(1u32.into(), b"tunnel setup failed");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Echo any UDP datagram back to its sender, bound to `bind_ip:TUN_PROBE_PORT`
+/// (the TUN /31 address). Lets a peer prove the tunnel carries real IP traffic.
+fn spawn_udp_echo(bind_ip: Ipv4Addr) {
+    tokio::spawn(async move {
+        let sock = match tokio::net::UdpSocket::bind((bind_ip, TUN_PROBE_PORT)).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(%bind_ip, "udp echo bind failed: {e}");
+                return;
+            }
+        };
+        info!(%bind_ip, port = TUN_PROBE_PORT, "udp echo up on tunnel address");
+        let mut buf = [0u8; 1500];
+        loop {
+            match sock.recv_from(&mut buf).await {
+                Ok((n, from)) => {
+                    let _ = sock.send_to(&buf[..n], from).await;
+                }
+                Err(e) => {
+                    warn!("udp echo recv error: {e}");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Send a few UDP probes to `peer_ip:TUN_PROBE_PORT` over the tunnel and report
+/// round-trip results. Success proves real IP traffic flows across the mesh.
+async fn probe_peer(peer_ip: Ipv4Addr) {
+    let sock = match tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("probe socket bind failed: {e}");
+            return;
+        }
+    };
+    let mut ok = 0u32;
+    for i in 1..=5u32 {
+        let payload = format!("mjolnir-tun-ping-{i}");
+        let start = Instant::now();
+        if let Err(e) = sock.send_to(payload.as_bytes(), (peer_ip, TUN_PROBE_PORT)).await {
+            warn!("probe {i} send failed: {e}");
+            continue;
+        }
+        let mut buf = [0u8; 256];
+        match tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) if &buf[..n] == payload.as_bytes() => {
+                ok += 1;
+                println!("tunnel ping {i}: reply from {peer_ip} in {:?}", start.elapsed());
+            }
+            Ok(Ok((n, _))) => println!("tunnel ping {i}: unexpected {n}-byte reply"),
+            Ok(Err(e)) => warn!("probe {i} recv error: {e}"),
+            Err(_) => println!("tunnel ping {i}: TIMEOUT (no reply across tunnel)"),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    println!("tunnel reachability: {ok}/5 replies — {} ", if ok > 0 { "DATA PLANE WORKS" } else { "no traffic crossed" });
 }
 
 /// Probe TUN-device creation — the gating check for running the L3 data plane
