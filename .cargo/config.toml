@@ -8,6 +8,14 @@
 [target.mipsel-unknown-linux-musl]
 # linker = "mipsel-openwrt-linux-musl-gcc"
 
+# MikroTik L23UGSR-5HaxD2HaxD (NetMetal ax / L-series) - Qualcomm IPQ-5010,
+# ARMv7 32-bit (RouterOS runs this chip in 32-bit mode). Deployed via RouterOS
+# container as a static musl binary (linux/arm/v7). See docs/deploy/.
+# The deploy/mikrotik Dockerfile cross-builds via messense/rust-musl-cross,
+# which bundles the toolchain; uncomment below only for a host-local build.
+[target.armv7-unknown-linux-musleabihf]
+# linker = "armv7l-linux-musleabihf-gcc"
+
 # Optimize for size on embedded targets
 [profile.release]
 opt-level = "s"

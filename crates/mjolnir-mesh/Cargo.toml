@@ -17,6 +17,24 @@ tokio.workspace = true
 tracing.workspace = true
 nix = { version = "0.31", features = ["signal", "process"] }
 
+# Daemon-only deps. Kept optional so the substrate library and its tests stay
+# iroh-free (the DatagramConn seam is what decouples them); enabled by the
+# `daemon` feature for the mjolnir-meshd binary. See beads mjolnir-mesh-tr6/02g.
+iroh = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+data-encoding = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+daemon = ["dep:iroh", "dep:clap", "dep:anyhow", "dep:data-encoding", "dep:rand", "dep:tracing-subscriber"]
+
+# The headless iroh-transport daemon. Requires --features daemon to build.
+[[bin]]
+name = "mjolnir-meshd"
+required-features = ["daemon"]
+
 [dev-dependencies]
 tempfile = "3"
 
