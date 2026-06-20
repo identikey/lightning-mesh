@@ -38,7 +38,37 @@ deploy/mikrotik/build.sh mjolnir-meshd
 This cross-builds a static-musl `linux/arm/v7` binary on a `scratch` base via
 `messense/rust-musl-cross`. See `deploy/mikrotik/Dockerfile`.
 
+## Step 1.5 — Pin all routers to one RouterOS version (do this FIRST for a fleet)
+
+The `container` package has a hard dependency on the **exact** `system` version
+(`container-7.23.1` requires `system-7.23.1`). Routers shipped at different
+times run different versions (we saw 7.23.1 and 7.18.2 on identical boards), so
+a swarm MUST be brought to a single version before the container step — or the
+package refuses to install with `system-X is not installed, but is required`.
+
+Pin every router to the **same** version (we use **7.23.1**):
+
+1. Check each router: `/system/resource/print` → note `version`.
+2. Download for that version + **arm**: the main package `routeros-<ver>-arm.npk`
+   and the extra-packages zip `all_packages-arm-<ver>.zip` (extract
+   `wifi-qcom-<ver>.npk` and `container-<ver>.npk`).
+3. Upload `routeros-`, `wifi-qcom-`, and `container-` npks to the **root** of
+   Files (all three at once), then `/system/reboot`. RouterOS installs them
+   together on boot — the system upgrade satisfies the container dependency in
+   the same reboot.
+4. Verify: `/system/package/print` shows `routeros`, `wifi-qcom`, **and**
+   `container`, all at the same version.
+5. (Recommended) update the bootloader to match: `/system/routerboard print`;
+   if `upgrade-firmware` > `current-firmware`, run `/system/routerboard upgrade`
+   and reboot once more.
+
+If the container package doesn't appear after the combined reboot, reboot once
+more (some versions install the system package first, container second).
+
 ## Step 2 — Install the container package on the router
+
+> If you did Step 1.5 above, the `container` package is already installed —
+> skip to Step 3. This step is for routers already on the target version.
 
 RouterOS containers need the extra `container` package matching your **RouterOS
 version and the `arm` architecture**.
