@@ -1,0 +1,25 @@
+# meshctl inventory — the mjolnir mesh router swarm.
+#
+# `meshctl` reads this (default path: deploy/mikrotik/routers.toml; override
+# with `--inventory`). No secrets live here:
+#   - SSH auth uses your ssh-agent / default key (run `meshctl bootstrap` once
+#     per router to install the key + enable the REST API).
+#   - `peer_blob` is a *public* shareable address blob, safe to commit.
+#
+# `address` is the router's LAN/management IP (for SSH), NOT its mesh address.
+# Roles: `listener` runs tun-listen; `connector` dials a listener via tun-connect.
+
+default_user = "admin"
+default_subnet = "172.20.0.0/24"           # matches container-net.rsc
+default_tar = "deploy/mikrotik/mjolnir-meshd-ros.tar"
+
+[[router]]
+name = "router-1"
+address = "192.168.88.181"                 # has the default RouterOS firewall
+role = "listener"
+
+[[router]]
+name = "router-2"
+address = "192.168.88.113"                 # blank firewall
+role = "connector"
+peer = "router-1"                          # dials router-1's live blob at deploy time

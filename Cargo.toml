@@ -51,3 +51,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 bytes = "1"
+
+# meshctl operator tool (host-native; not built into the container image)
+toml = "0.8"
