@@ -22,6 +22,7 @@
 #![allow(dead_code)]
 
 mod inventory;
+mod plan;
 mod routeros;
 mod ssh;
 
@@ -144,7 +145,7 @@ async fn run() -> Result<()> {
         Command::Bootstrap { name, all, pubkey } => {
             cmd_bootstrap(&inv, name.as_deref(), all, pubkey.as_deref()).await
         }
-        Command::Plan { .. } => not_yet("plan", "M2 (mjolnir-mesh-cax)"),
+        Command::Plan { name, all } => cmd_plan(&inv, name.as_deref(), all).await,
         Command::Apply { .. } => not_yet("apply", "M3 (mjolnir-mesh-65e)"),
         Command::Deploy { .. } => not_yet("deploy", "M4 (mjolnir-mesh-2p1)"),
     }
@@ -278,6 +279,53 @@ async fn cmd_query(
             .join("  ");
         println!("  [{i}] {line}");
     }
+    Ok(())
+}
+
+async fn cmd_plan(inv: &Inventory, name: Option<&str>, all: bool) -> Result<()> {
+    use plan::Status;
+    let targets = select(inv, name, all)?;
+    for r in targets {
+        let ssh = Ssh::new(r.ssh_target(inv));
+        let (entries, prunes) = plan::plan_router(&ssh, inv, r).await?;
+
+        println!("\n{} plan ({} resources):", r.name, entries.len());
+        let (mut conv, mut miss, mut drift, mut conf) = (0u32, 0u32, 0u32, 0u32);
+        for e in &entries {
+            let label = match &e.status {
+                Status::Missing => {
+                    miss += 1;
+                    "MISSING".to_string()
+                }
+                Status::Converged => {
+                    conv += 1;
+                    "CONVERGED".to_string()
+                }
+                Status::Drifted(diffs) => {
+                    drift += 1;
+                    let detail = diffs
+                        .iter()
+                        .map(|d| format!("{}: want {:?} got {:?}", d.field, d.want, d.got))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("DRIFTED ({detail})")
+                }
+                Status::Conflict(n) => {
+                    conf += 1;
+                    format!("CONFLICT ({n} live matches)")
+                }
+            };
+            println!("  {:<11} {:<26} {label}", e.kind, e.id);
+        }
+        for p in &prunes {
+            println!("  {:<11} {:<26} PRUNE (leftover)", p.kind, p.comment);
+        }
+        println!(
+            "summary: {conv} converged, {miss} missing, {drift} drifted, {conf} conflict, {} prune",
+            prunes.len()
+        );
+    }
+    // `plan` is observe-only; it always exits 0 regardless of drift.
     Ok(())
 }
 
