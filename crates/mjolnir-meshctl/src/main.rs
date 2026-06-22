@@ -39,9 +39,11 @@ use ssh::Ssh;
 #[derive(Parser)]
 #[command(name = "meshctl", about = "Operator-side RouterOS reconciler for the mjolnir mesh swarm")]
 struct Cli {
-    /// Path to the router inventory.
-    #[arg(long, global = true, default_value = inventory::DEFAULT_PATH)]
-    inventory: PathBuf,
+    /// Path to the router inventory. When omitted, `deploy/mikrotik/routers.toml`
+    /// is searched for upward from the current directory, so meshctl works from
+    /// anywhere in the repo (not just the root).
+    #[arg(long, global = true)]
+    inventory: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -111,7 +113,8 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let inv = Inventory::load(&cli.inventory)?;
+    let inv_path = resolve_inventory(cli.inventory)?;
+    let inv = Inventory::load(&inv_path)?;
 
     match cli.command {
         Command::List => cmd_list(&inv),
@@ -127,6 +130,40 @@ async fn run() -> Result<()> {
 
 fn not_yet(cmd: &str, milestone: &str) -> Result<()> {
     bail!("`{cmd}` is not implemented yet — landing in {milestone}");
+}
+
+/// Resolve the inventory path. An explicit `--inventory` is used verbatim (and
+/// must exist); otherwise `deploy/mikrotik/routers.toml` is searched for upward
+/// from the current directory so meshctl works anywhere in the repo.
+fn resolve_inventory(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        if !p.exists() {
+            bail!("--inventory {} does not exist", p.display());
+        }
+        return Ok(p);
+    }
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    find_upward(&cwd, Path::new(inventory::DEFAULT_PATH)).with_context(|| {
+        format!(
+            "no {} found in {} or any parent directory (pass --inventory to point elsewhere)",
+            inventory::DEFAULT_PATH,
+            cwd.display()
+        )
+    })
+}
+
+/// Walk up from `start`, returning the first existing `dir/suffix`.
+fn find_upward(start: &Path, suffix: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        let candidate = dir.join(suffix);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
 }
 
 fn cmd_list(inv: &Inventory) -> Result<()> {
@@ -288,4 +325,31 @@ async fn bootstrap_one(
         warn!("could not remove uploaded {remote_name} from router: {e:#}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_upward_locates_from_subdir() {
+        let root = tempfile::tempdir().unwrap();
+        let suffix = Path::new("deploy/mikrotik/routers.toml");
+        let target = root.path().join(suffix);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "default_user = \"admin\"\n").unwrap();
+
+        // Search from a nested dir well below the inventory.
+        let deep = root.path().join("crates/mjolnir-meshctl/src");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let found = find_upward(&deep, suffix).unwrap();
+        assert_eq!(found.canonicalize().unwrap(), target.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn find_upward_none_when_absent() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(find_upward(root.path(), Path::new("deploy/mikrotik/routers.toml")).is_none());
+    }
 }
