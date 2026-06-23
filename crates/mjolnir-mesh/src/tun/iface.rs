@@ -74,6 +74,31 @@ where
         .execute()
         .await?;
 
+    // 2b. Assign an IPv6 link-local so babeld can run its protocol over the
+    //     tunnel — Babel transports over fe80:: (carrying both v4 and v6 routes),
+    //     so a v4-only /31 gives babeld no neighbour and it installs no routes
+    //     (mjolnir-mesh-op4). Distinct per side (derived from the /31 host octet)
+    //     so the two ends are addressable to each other. Containers often
+    //     default-disable IPv6, so enable it on the iface first. Best-effort: the
+    //     v4 data plane works regardless, so failures here only degrade routing.
+    let _ = std::fs::write(
+        format!("/proc/sys/net/ipv6/conf/{iface_name}/disable_ipv6"),
+        "0",
+    );
+    let link_local =
+        std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, self_addr.octets()[3] as u16);
+    if let Err(e) = handle
+        .address()
+        .add(index, std::net::IpAddr::V6(link_local), 64)
+        .execute()
+        .await
+    {
+        tracing::warn!(
+            iface = %iface_name, %link_local,
+            "could not assign IPv6 link-local (babeld adjacency may not form): {e}"
+        );
+    }
+
     // 3. Split the device and wire each half to the iroh connection.
     //    split() returns (writer, reader); encap wants (read, write).
     let (writer, reader) = device.split().map_err(IfaceError::Io)?;

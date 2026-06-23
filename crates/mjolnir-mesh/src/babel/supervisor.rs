@@ -49,9 +49,14 @@ impl BabelSupervisor {
         let child = Command::new(&self.babeld_path)
             .arg("-c")
             .arg(&self.config_path)
-            // Foreground mode: don't fork
-            .arg("-D")
-            // Inherit stdio so babeld's own logs (neighbor/route exchange) flow
+            // -d 1: log neighbour/route activity (babeld is silent by default).
+            // Do NOT pass -D — that DAEMONISES babeld (double-fork), detaching it
+            // from us: our stored PID goes stale (so SIGHUP can't reach it) and
+            // its stdio detaches (so its logs vanish). Foreground keeps it our
+            // direct child with a valid PID and inherited stdio.
+            .arg("-d")
+            .arg("1")
+            // Inherit stdio so babeld's own logs (neighbour/route exchange) flow
             // to our stdout — captured by the RouterOS container log. Piping
             // without draining deadlocks babeld once the pipe buffer fills.
             .stdout(Stdio::inherit())
