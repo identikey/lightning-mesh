@@ -1,0 +1,64 @@
+{
+  "question": "Open-source-friendly hardware for a TRUE wireless mesh (802.11s/IBSS) OpenWrt deployment: confirmed mainline support, strong mt76 or ath9k/ath10k drivers, >=2 radios, compact, external antenna connectors, bare-board form factor.",
+  "mode": "research",
+  "status": "complete",
+  "confidence": "high",
+  "executive_summary": "The prior failure was the driver, not the board: mt76 (mt7915/mt7916/mt7986) and ath9k genuinely support 802.11s/IBSS/SAE mesh in current OpenWrt, ath10k works with non-CT firmware, and ath11k/ath12k/wifi-qcom remain unreliable for mesh into 2026 (confirming the MikroTik/Qualcomm pain). No board is simultaneously fully-open, current-silicon, and multi-independent-radio, so one axis is traded. Recommended default is the Banana Pi BPI-R3 (mt76, bare board, U.FL, onboard 2.4+5 plus mPCIe/M.2 for a third radio); OpenWrt One ($89) is the lowest-risk board to validate the mesh stack first; BPI-R4 + 2x AsiaRF AW7916 cards gives true dedicated radios; Compex WPJ563/WLE200NX (ath9k/ath10k) is the max-reliability WiFi4/5 path; LibreRouter LR1 is the open-hardware purist option but hard to buy.",
+  "key_findings": [
+    {
+      "finding": "mt76 (mt7915/mt7916/mt7986 Filogic) and ath9k both support 802.11s mesh point, IBSS, and SAE-encrypted mesh in current OpenWrt; historical mt7915 5GHz mesh bugs were fixed 2022-2024.",
+      "confidence": "high",
+      "sources": ["hypotheses/h4-driver-mesh-reality/findings.md", "https://openwrt.org/docs/guide-user/network/wifi/mesh/802-11s", "https://github.com/openwrt/mt76/issues/675"]
+    },
+    {
+      "finding": "ath11k/ath12k/wifi-qcom advertise mesh capability but are unreliable in mainline (STA/peer code paths crash, 2025-2026 issues); avoid for mesh. This corroborates the user's prior MikroTik/Qualcomm failure.",
+      "confidence": "high",
+      "sources": ["hypotheses/h4-driver-mesh-reality/findings.md", "https://github.com/openwrt/openwrt/issues/20702"]
+    },
+    {
+      "finding": "ath10k mesh works only with non-CT driver/firmware; avoid ath10k-ct. ath9k is the gold-standard mesh radio (AREDN standard) with no binary blob.",
+      "confidence": "high",
+      "sources": ["hypotheses/h2-ath9k-ath10k-boards/findings.md", "https://forum.openwrt.org/t/ath10k-ct-wifi-driver-does-not-support-802-11s/125423"]
+    },
+    {
+      "finding": "A single dual-band chip (MT7976) presents as two independent OpenWrt radios (2.4 + 5 GHz on separate phys), satisfying the dual-radio minimum; a dedicated 5GHz backhaul + 5GHz client (tri-radio ideal) needs an added mPCIe/M.2 card or a two-chip board.",
+      "confidence": "high",
+      "sources": ["hypotheses/h1-mt76-bare-boards/findings.md", "hypotheses/h4-driver-mesh-reality/findings.md"]
+    },
+    {
+      "finding": "Recommended modern bare boards: Banana Pi BPI-R3 (~$120, U.FL, mPCIe+M.2), OpenWrt One ($89, 3x MMCX, published schematics, first-class support), BPI-R4 + 2x AsiaRF AW7916 mPCIe cards for two independent radios. BPI-R3 Mini (65x65mm) is the most compact.",
+      "confidence": "high",
+      "sources": ["hypotheses/h1-mt76-bare-boards/findings.md", "https://openwrt.org/toh/openwrt/one", "https://docs.banana-pi.org/en/BPI-R4/BananaPi_BPI-R4"]
+    },
+    {
+      "finding": "Max-reliability Atheros path: Compex WPJ563 board + WLE600VX (ath9k 2.4 + ath10k 5GHz, in production) or any mPCIe SBC + Compex WLE200NX (ath9k, no blob). PC Engines APU is EOL/NOS; Noah4C is the successor.",
+      "confidence": "medium",
+      "sources": ["hypotheses/h2-ath9k-ath10k-boards/findings.md", "hypotheses/h3-sbc-mpcie-cards/findings.md"]
+    },
+    {
+      "finding": "Operational rules: install wpad-mesh-mbedtls for SAE; target 802.11s not IBSS; keep backhaul on a fixed non-DFS 5GHz channel (avoid 160MHz/6GHz/DFS); use a dedicated backhaul radio (mesh+AP on one radio is fragile); L3/babeld rides over 802.11s as an L2 switch.",
+      "confidence": "high",
+      "sources": ["hypotheses/h4-driver-mesh-reality/findings.md"]
+    },
+    {
+      "finding": "Packaging: route fragile U.FL (~30 cycles) to RP-SMA/SMA bulkheads (~500 cycles); directional/sector antenna on backhaul, omni on clients; PoE 802.3at or 12-24V DC; IP66-68 polycarbonate enclosure with Gore vent, conductive thermal path, conformal coating, Ethernet surge protection.",
+      "confidence": "high",
+      "sources": ["hypotheses/h5-openhw-antenna-rf/findings.md"]
+    }
+  ],
+  "open_questions": [
+    "Per-board 5GHz 802.11s mesh-point reliability at the specific OpenWrt snapshot to be flashed (mt76 #912 5GHz AP regression open, updated Feb 2026) - requires bench testing.",
+    "BPI-R4 dual-mPCIe-card simultaneous enumeration + power/thermal stability for two mt7916 cards - unverified.",
+    "Per-mPCIe-slot 3.3V current budget (4T4R mt76 cards want 2.5-3A) on BPI-R4/NanoPi - undocumented.",
+    "Whether ath10k Wave-1 (QCA9882) still needs the CT->non-CT swap on current OpenWrt 24.x.",
+    "OpenWrt One open-hardware completeness (Gerbers/CAD + license) and whether its M.2 slot is PCIe-capable for a WiFi NIC (second independent radio).",
+    "LibreRouter LR1 2026 purchasability and price."
+  ],
+  "contradictions": [
+    "H1 framed single-chip dual-band boards as not meeting '>=2 radios'; reconciled in synthesis section 3 - a dual-band chip presents as two radios on separate bands and does meet the dual-radio minimum; the tri-radio ideal needs an added card."
+  ],
+  "hypotheses_explored": 5,
+  "hypotheses_total": 5,
+  "verification_status": "PASS_WITH_WARNINGS",
+  "output_dir": "docs/research/openwrt-mesh-hardware"
+}
