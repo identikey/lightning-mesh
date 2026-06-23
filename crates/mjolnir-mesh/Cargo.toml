@@ -24,6 +24,11 @@ iroh = { workspace = true, optional = true }
 # LAN peer discovery (mDNS) for `--lan` mode — no relay or internet needed.
 # iroh 1.0 moved mDNS out of iroh's feature flags into this standalone crate.
 iroh-mdns-address-lookup = { version = "0.4", optional = true }
+# CRDT gossip overlay (the concrete `GossipTransport` impl for crdt::sync).
+iroh-gossip = { workspace = true, optional = true }
+# `StreamExt::next` on the gossip event stream — cross-platform (unlike the
+# linux-only `futures-util` used by rtnetlink below).
+futures-lite = { version = "2", optional = true }
 clap = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 data-encoding = { workspace = true, optional = true }
@@ -31,7 +36,7 @@ rand = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
 [features]
-daemon = ["dep:iroh", "dep:iroh-mdns-address-lookup", "dep:clap", "dep:anyhow", "dep:data-encoding", "dep:rand", "dep:tracing-subscriber"]
+daemon = ["dep:iroh", "dep:iroh-mdns-address-lookup", "dep:iroh-gossip", "dep:futures-lite", "dep:clap", "dep:anyhow", "dep:data-encoding", "dep:rand", "dep:tracing-subscriber"]
 
 # The headless iroh-transport daemon. Requires --features daemon to build.
 [[bin]]

@@ -25,8 +25,10 @@ use iroh::endpoint::Connection;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
+use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
+use iroh_gossip::{Gossip, TopicId};
 use mjolnir_mesh::tun::{spawn_tunnel, DatagramConn, EncapError, Tunnel};
-use mjolnir_mesh::PeerRoster;
+use mjolnir_mesh::{GossipError, GossipSync, GossipTransport, PeerRoster};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -195,6 +197,47 @@ impl DatagramConn for IrohDatagramConn {
     }
 }
 
+/// A production [`GossipTransport`] over iroh-gossip — the daemon-side concrete
+/// impl of the substrate's iroh-free gossip seam (the gossip analogue of
+/// [`IrohDatagramConn`]). Wraps a topic's sender/receiver halves; the receiver
+/// needs `&mut` to poll, so it lives behind an async mutex (only the single
+/// dispatch loop ever reads it).
+struct IrohGossipTransport {
+    sender: GossipSender,
+    receiver: tokio::sync::Mutex<GossipReceiver>,
+}
+
+#[async_trait::async_trait]
+impl GossipTransport for IrohGossipTransport {
+    async fn broadcast(&self, payload: Bytes) -> Result<(), GossipError> {
+        self.sender
+            .broadcast(payload)
+            .await
+            .map_err(|e| GossipError::Transport(e.to_string()))
+    }
+
+    async fn recv(&self) -> Result<Bytes, GossipError> {
+        use futures_lite::StreamExt;
+        let mut rx = self.receiver.lock().await;
+        loop {
+            match rx.next().await {
+                // Only `Received` carries an application payload; neighbor
+                // up/down and lag notifications are control events we skip.
+                Some(Ok(Event::Received(msg))) => return Ok(msg.content),
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(GossipError::Transport(e.to_string())),
+                None => return Err(GossipError::Closed),
+            }
+        }
+    }
+}
+
+/// The fixed gossip topic for a mesh's CRDT overlay. Every node in the mesh
+/// joins the same topic; the id is a constant hash so no coordination is needed.
+fn mesh_topic_id() -> TopicId {
+    TopicId::from_bytes(*blake3::hash(b"mjolnir/mesh/crdt/v0").as_bytes())
+}
+
 /// Short peer id for the interface name (8 hex chars is unique enough).
 fn short_id(id: &str) -> &str {
     &id[..id.len().min(8)]
@@ -278,7 +321,12 @@ async fn run_mesh(endpoint: Endpoint, no_relay: bool, roster_path: &Path) -> Res
 
     let registry: TunnelRegistry = Arc::new(Mutex::new(HashMap::new()));
 
-    // Accept inbound tunnels — peers with a higher node id dial in to us.
+    // CRDT gossip overlay (mjolnir-mesh-k8c): all mesh nodes join one fixed
+    // topic and exchange CRDT updates best-effort, as a second protocol on the
+    // same endpoint alongside the TUN data plane.
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+
+    // Accept inbound tunnels (peers with a higher node id dial in) and gossip.
     let router = Router::builder(endpoint.clone())
         .accept(
             TUN_ALPN,
@@ -287,7 +335,43 @@ async fn run_mesh(endpoint: Endpoint, no_relay: bool, roster_path: &Path) -> Res
                 registry: registry.clone(),
             },
         )
+        .accept(iroh_gossip::ALPN, gossip.clone())
         .spawn();
+
+    // Subscribe to the mesh CRDT topic, bootstrapping the gossip swarm with the
+    // roster peers, then spawn the dispatch loop. Decoded CRDT messages are
+    // logged for now — wiring them into the per-type merge is the subnet-claim
+    // work (mjolnir-mesh-chn), which plugs into this same handler. A subscribe
+    // failure is non-fatal: the data plane still runs without the overlay.
+    let bootstrap: Vec<EndpointId> = roster
+        .peers()
+        .iter()
+        .filter_map(|e| parse_peer(&e.token).ok())
+        .map(|a| a.id)
+        .filter(|id| *id != self_id)
+        .collect();
+    let gossip_task = match gossip.subscribe(mesh_topic_id(), bootstrap).await {
+        Ok(topic) => {
+            let (sender, receiver) = topic.split();
+            let sync = GossipSync::new(IrohGossipTransport {
+                sender,
+                receiver: tokio::sync::Mutex::new(receiver),
+            });
+            info!("gossip overlay joined (mesh CRDT topic)");
+            Some(tokio::spawn(async move {
+                if let Err(e) = sync
+                    .run(|msg| info!(?msg, "gossip: received CRDT update"))
+                    .await
+                {
+                    warn!("gossip dispatch loop ended: {e}");
+                }
+            }))
+        }
+        Err(e) => {
+            warn!("gossip subscribe failed: {e}; continuing without CRDT overlay");
+            None
+        }
+    };
 
     // Spawn one dialer task per peer we initiate to. Tie-break by node id so
     // exactly one side of each pair dials (the lexicographically-lower id) and
@@ -324,6 +408,9 @@ async fn run_mesh(endpoint: Endpoint, no_relay: bool, roster_path: &Path) -> Res
     info!("shutting down mesh");
     for d in &dialers {
         d.abort();
+    }
+    if let Some(t) = &gossip_task {
+        t.abort();
     }
     router.shutdown().await.context("router shutdown")?;
     Ok(())
