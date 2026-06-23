@@ -71,9 +71,13 @@ pub fn render_babeld_conf(inputs: &BabelConfigInputs<'_>) -> String {
             subnet, prefix, prefix
         ));
     }
-    out.push_str("redistribute local deny\n");
-    out.push_str("redistribute proto static deny\n");
-    out.push_str("redistribute proto kernel deny\n\n");
+    // Catch-all: deny redistributing everything not explicitly allowed above.
+    // babeld's `proto` filter takes a NUMERIC protocol, not a name, so the old
+    // `redistribute proto static/kernel deny` lines made real babeld (1.13)
+    // reject the whole config with a parse error (found on hardware, apo). A
+    // bare `redistribute deny` is the idiomatic, valid way to redistribute only
+    // our claimed /24.
+    out.push_str("redistribute deny\n\n");
 
     out.push_str("in ip 10.255.0.0/16 deny\n");
     out.push_str("out ip 10.255.0.0/16 deny\n\n");
@@ -123,9 +127,7 @@ interface mj-peer-aabbccdd type tunnel
 interface mj-peer-eeff0011 type tunnel
 
 redistribute ip 10.42.1.0/24 ge 24 le 24 allow
-redistribute local deny
-redistribute proto static deny
-redistribute proto kernel deny
+redistribute deny
 
 in ip 10.255.0.0/16 deny
 out ip 10.255.0.0/16 deny
@@ -141,9 +143,7 @@ default rxcost 96
         let inputs = BabelConfigInputs::new(None, &peers);
         let got = render_babeld_conf(&inputs);
         assert!(!got.contains("redistribute ip"), "should have no redistribute ip line");
-        assert!(got.contains("redistribute local deny"));
-        assert!(got.contains("redistribute proto static deny"));
-        assert!(got.contains("redistribute proto kernel deny"));
+        assert!(got.contains("redistribute deny"));
     }
 
     #[test]

@@ -136,6 +136,12 @@ enum Command {
         /// babeld binary to supervise (PATH name or absolute path).
         #[arg(long, default_value = "babeld")]
         babeld: PathBuf,
+        /// The container's gateway to the router (veth peer). When this node
+        /// claims a /24, meshd installs a kernel route for it via this gateway,
+        /// so babeld can redistribute the /24 and inbound mesh traffic reaches
+        /// the router for local-client delivery. Matches container-net.rsc.
+        #[arg(long, default_value = "172.20.0.1")]
+        client_gateway: Ipv4Addr,
     },
 }
 
@@ -179,7 +185,19 @@ async fn main() -> Result<()> {
             peer,
             babel_config,
             babeld,
-        } => run_mesh(endpoint, no_relay, roster, peer, babel_config, babeld).await?,
+            client_gateway,
+        } => {
+            run_mesh(
+                endpoint,
+                no_relay,
+                roster,
+                peer,
+                babel_config,
+                babeld,
+                client_gateway,
+            )
+            .await?
+        }
         Command::TunTest => unreachable!("handled above"),
     }
     Ok(())
@@ -341,6 +359,7 @@ async fn run_mesh(
     peer_args: Vec<String>,
     babel_config: PathBuf,
     babeld: PathBuf,
+    client_gateway: Ipv4Addr,
 ) -> Result<()> {
     wait_until_addressable(&endpoint, no_relay).await;
     print_identity(&endpoint)?;
@@ -447,7 +466,9 @@ async fn run_mesh(
                 let sync = sync.clone();
                 let store = claims.clone();
                 let me = self_id_str.clone();
-                tokio::spawn(async move { claim_manager(sync, store, me, reclaim_rx).await })
+                tokio::spawn(async move {
+                    claim_manager(sync, store, me, client_gateway, reclaim_rx).await
+                })
             };
 
             (Some(dispatch), Some(claim))
@@ -627,23 +648,26 @@ async fn claim_manager<T: GossipTransport>(
     sync: Arc<GossipSync<T>>,
     store: ClaimStore,
     self_id: String,
+    client_gateway: Ipv4Addr,
     mut reclaim_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
 ) {
     tokio::time::sleep(CLAIM_WARMUP).await;
-    claim_and_publish(&sync, &store, &self_id).await;
+    claim_and_publish(&sync, &store, &self_id, client_gateway).await;
     while reclaim_rx.recv().await.is_some() {
         // Brief pause so a conflict storm settles before we re-pick.
         tokio::time::sleep(Duration::from_secs(1)).await;
         info!("lost our subnet claim in a conflict — re-claiming");
-        claim_and_publish(&sync, &store, &self_id).await;
+        claim_and_publish(&sync, &store, &self_id, client_gateway).await;
     }
 }
 
-/// Pick a free /24 (avoiding known claims), record it, and gossip the claim.
+/// Pick a free /24 (avoiding known claims), record it, install its local route
+/// (so babeld can redistribute it), and gossip the claim.
 async fn claim_and_publish<T: GossipTransport>(
     sync: &GossipSync<T>,
     store: &ClaimStore,
     self_id: &str,
+    client_gateway: Ipv4Addr,
 ) {
     let claimed: HashSet<Ipv4Net> = {
         let s = store.lock().expect("claim store poisoned");
@@ -687,7 +711,40 @@ async fn claim_and_publish<T: GossipTransport>(
         Ok(()) => info!(subnet = %net, "claimed client subnet and published it"),
         Err(e) => warn!(subnet = %net, "claimed subnet but gossip publish failed: {e}"),
     }
+
+    // Install the kernel route for our /24 toward the router, so babeld has a
+    // concrete route to redistribute and inbound mesh traffic for it reaches
+    // the local LAN (mjolnir-mesh-df4).
+    install_client_route(net, client_gateway).await;
 }
+
+/// Install a kernel route `subnet via gateway` in this (container) netns. Gives
+/// babeld a concrete route to redistribute for our claimed /24 and routes
+/// inbound mesh traffic for it back to the router for local-client delivery.
+/// Idempotent in effect: an already-present route (EEXIST) is fine.
+#[cfg(target_os = "linux")]
+async fn install_client_route(subnet: Ipv4Net, gateway: Ipv4Addr) {
+    use rtnetlink::{new_connection, RouteMessageBuilder};
+    let (connection, handle, _) = match new_connection() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(%subnet, "netlink connect for client route failed: {e}");
+            return;
+        }
+    };
+    tokio::spawn(connection);
+    let route = RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(subnet.network(), subnet.prefix_len())
+        .gateway(gateway)
+        .build();
+    match handle.route().add(route).execute().await {
+        Ok(()) => info!(%subnet, %gateway, "installed client subnet route"),
+        Err(e) => warn!(%subnet, %gateway, "could not install client route (may already exist): {e}"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn install_client_route(_subnet: Ipv4Net, _gateway: Ipv4Addr) {}
 
 /// Enable IPv4 forwarding in this (container) network namespace so the kernel
 /// routes client traffic between the TUN tunnels and the veth/bridge. Required

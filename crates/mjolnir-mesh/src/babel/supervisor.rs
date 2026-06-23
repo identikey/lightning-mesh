@@ -51,8 +51,11 @@ impl BabelSupervisor {
             .arg(&self.config_path)
             // Foreground mode: don't fork
             .arg("-D")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // Inherit stdio so babeld's own logs (neighbor/route exchange) flow
+            // to our stdout — captured by the RouterOS container log. Piping
+            // without draining deadlocks babeld once the pipe buffer fills.
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()?;
         info!(pid = child.id(), "spawned babeld");
         *guard = Some(child);
