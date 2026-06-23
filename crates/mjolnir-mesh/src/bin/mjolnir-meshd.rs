@@ -33,8 +33,8 @@ use mjolnir_mesh::babel::{
     render_babeld_conf, write_atomic_if_changed, BabelConfigInputs, BabelSupervisor,
 };
 use mjolnir_mesh::{
-    alloc, merge_subnet_claim, GossipError, GossipSync, GossipTransport, MergeResult, PeerRoster,
-    SubnetClaim, HLC,
+    alloc, merge_subnet_claim, GossipError, GossipSync, GossipTransport, MergeResult, PeerEntry,
+    PeerRoster, SubnetClaim, HLC,
 };
 use mjolnir_mesh::GossipMessage;
 use tracing::{error, info, warn};
@@ -121,8 +121,14 @@ enum Command {
     Mesh {
         /// Path to the peer roster file: one peer address blob or 64-hex node id
         /// per line; `#` comments and blank lines ignored. See `PeerRoster`.
+        /// Optional — peers may instead (or also) be given via `--peer`.
         #[arg(long)]
-        roster: PathBuf,
+        roster: Option<PathBuf>,
+        /// A peer address blob or 64-hex node id to mesh with (repeatable).
+        /// Merged with any `--roster` entries; avoids needing a file in a
+        /// scratch container. e.g. `--peer <id> --peer <id>`.
+        #[arg(long)]
+        peer: Vec<String>,
         /// Where to write the generated babeld config. Its parent dir is created
         /// if missing. babeld is started once there's a live tunnel to route over.
         #[arg(long, default_value = "/etc/mjolnir/babeld.conf")]
@@ -170,9 +176,10 @@ async fn main() -> Result<()> {
         Command::TunConnect { addr } => run_tun_connect(endpoint, &addr).await?,
         Command::Mesh {
             roster,
+            peer,
             babel_config,
             babeld,
-        } => run_mesh(endpoint, no_relay, &roster, babel_config, babeld).await?,
+        } => run_mesh(endpoint, no_relay, roster, peer, babel_config, babeld).await?,
         Command::TunTest => unreachable!("handled above"),
     }
     Ok(())
@@ -330,7 +337,8 @@ async fn run_tun_connect(endpoint: Endpoint, addr_blob: &str) -> Result<()> {
 async fn run_mesh(
     endpoint: Endpoint,
     no_relay: bool,
-    roster_path: &Path,
+    roster_path: Option<PathBuf>,
+    peer_args: Vec<String>,
     babel_config: PathBuf,
     babeld: PathBuf,
 ) -> Result<()> {
@@ -340,9 +348,24 @@ async fn run_mesh(
     let self_id = endpoint.id();
     let self_id_str = self_id.to_string();
 
-    let roster = PeerRoster::load(roster_path)
-        .with_context(|| format!("loading roster {}", roster_path.display()))?;
-    info!(peers = roster.len(), path = %roster_path.display(), "roster loaded");
+    // Peer set = roster file (if any) merged with --peer args, deduped by token.
+    let mut peer_entries: Vec<PeerEntry> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if let Some(path) = roster_path.as_deref() {
+        let roster = PeerRoster::load(path)
+            .with_context(|| format!("loading roster {}", path.display()))?;
+        for e in roster.peers() {
+            if seen.insert(e.token.clone()) {
+                peer_entries.push(e.clone());
+            }
+        }
+    }
+    for token in peer_args {
+        if seen.insert(token.clone()) {
+            peer_entries.push(PeerEntry { token, label: None });
+        }
+    }
+    info!(peers = peer_entries.len(), "peer set resolved");
 
     // Forward client traffic between the TUN tunnels and the veth/bridge.
     enable_ip_forwarding();
@@ -375,8 +398,7 @@ async fn run_mesh(
     // inbound subnet claims to the store (merge/conflict), and a claim manager
     // that claims a /24 after a warmup and re-claims on conflict. A subscribe
     // failure is non-fatal: the TUN data plane still runs without the overlay.
-    let bootstrap: Vec<EndpointId> = roster
-        .peers()
+    let bootstrap: Vec<EndpointId> = peer_entries
         .iter()
         .filter_map(|e| parse_peer(&e.token).ok())
         .map(|a| a.id)
@@ -401,6 +423,13 @@ async fn run_mesh(
                 tokio::spawn(async move {
                     let result = sync
                         .run(move |msg| {
+                            // Log peer claims received over gossip — proves CRDT
+                            // convergence (a node seeing another's claim cross the mesh).
+                            if let GossipMessage::SubnetClaimUpdate { cidr, entry } = &msg
+                                && entry.owner_node_id != me
+                            {
+                                info!(%cidr, owner = %entry.owner_node_id, "gossip: received peer subnet claim");
+                            }
                             let mut s = store.lock().expect("claim store poisoned");
                             if apply_subnet_message(&mut s, &msg, &me) {
                                 drop(s);
@@ -448,7 +477,7 @@ async fn run_mesh(
     // the other accepts — otherwise both ends would race to create the same
     // deterministic /31 interface. This mirrors `pick_link_31`'s ordering.
     let mut dialers = Vec::new();
-    for entry in roster.peers() {
+    for entry in &peer_entries {
         let addr = match parse_peer(&entry.token) {
             Ok(a) => a,
             Err(e) => {

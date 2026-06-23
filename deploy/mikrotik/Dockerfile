@@ -33,8 +33,13 @@ RUN cargo build --release --locked --target "${RUST_TARGET}" \
       --bin "${BIN}" --features "${FEATURES}" \
  && cp "target/${RUST_TARGET}/release/${BIN}" /out-bin
 
-# --- runtime stage: scratch, just the static binary + CA roots ---
-FROM scratch
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+# --- runtime stage: Alpine (armv7) + babeld for cross-site routing ---
+# Switched from `scratch` to Alpine so the babel supervisor has a real `babeld`
+# to spawn (apk provides /usr/sbin/babeld on PATH). meshd is a static musl
+# binary so it needs no libc; babeld (musl-linked) gets Alpine's. ca-certificates
+# gives meshd CA roots for relay/pkarr TLS. Grows the image ~10MB -> ~15MB, well
+# within the board's ~86MB free NAND.
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates babeld
 COPY --from=build /out-bin /mjolnir-meshd
 ENTRYPOINT ["/mjolnir-meshd"]
