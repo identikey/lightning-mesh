@@ -51,7 +51,9 @@ Pin every router to the **same** version (we use **7.23.1**):
 1. Check each router: `/system/resource/print` → note `version`.
 2. Download for that version + **arm**: the main package `routeros-<ver>-arm.npk`
    and the extra-packages zip `all_packages-arm-<ver>.zip` (extract
-   `wifi-qcom-<ver>.npk` and `container-<ver>.npk`).
+   `wifi-qcom-<ver>-arm.npk` and `container-<ver>-arm.npk`). These `.npk` files
+   are gitignored (large MikroTik binaries); fetch them with
+   `deploy/mikrotik/fetch-firmware.sh [version] [arch]` (defaults: `7.23.1 arm`).
 3. Upload `routeros-`, `wifi-qcom-`, and `container-` npks to the **root** of
    Files (all three at once), then `/system/reboot`. RouterOS installs them
    together on boot — the system upgrade satisfies the container dependency in

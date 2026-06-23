@@ -52,5 +52,9 @@ package-lock.json
 # MikroTik container build artifacts
 deploy/mikrotik/*.tar
 
+# Official MikroTik RouterOS packages (large binaries, MikroTik's to distribute).
+# Re-download with deploy/mikrotik/fetch-firmware.sh.
+deploy/mikrotik/*.npk
+
 # meshctl per-router node secrets (IROH_SECRET) — never commit
 deploy/mikrotik/secrets/
