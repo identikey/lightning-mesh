@@ -181,14 +181,17 @@ async fn main() -> Result<()> {
     let lan = cli.lan || (mesh_mode && !internet);
     // --lan (and LAN-by-default) imply no relay (LAN discovery only).
     let no_relay = cli.no_relay || lan;
-    let endpoint = build_endpoint(
-        cli.secret_file.as_deref(),
-        no_relay,
-        cli.bind,
-        lan,
-        &cli.relay,
-    )
-    .await?;
+
+    // Load the node secret once so we know our id before binding. For `mesh`, we
+    // self-assign the derived IPv4 backhaul address to the shared-segment iface
+    // BEFORE building the endpoint, so iroh enumerates it at bind time and mDNS
+    // announces it to peers (mjolnir-mesh-4pk). Assigning after bind misses the
+    // initial address scan — and with no DHCP the iface has no other address.
+    let secret = load_or_create_secret(cli.secret_file.as_deref())?;
+    if let Command::Mesh { backhaul_iface, .. } = &cli.command {
+        assign_backhaul_addr(backhaul_iface, &secret.public().to_string()).await;
+    }
+    let endpoint = build_endpoint(secret, no_relay, cli.bind, lan, &cli.relay).await?;
 
     match cli.command {
         Command::Id => {
@@ -205,7 +208,8 @@ async fn main() -> Result<()> {
             babel_config,
             babeld,
             client_gateway,
-            backhaul_iface,
+            // backhaul_iface was used before bind in `main`.
+            backhaul_iface: _,
         } => {
             run_mesh(
                 endpoint,
@@ -215,7 +219,6 @@ async fn main() -> Result<()> {
                 babel_config,
                 babeld,
                 client_gateway,
-                backhaul_iface,
             )
             .await?
         }
@@ -381,16 +384,12 @@ async fn run_mesh(
     babel_config: PathBuf,
     babeld: PathBuf,
     client_gateway: Ipv4Addr,
-    backhaul_iface: String,
 ) -> Result<()> {
     let self_id = endpoint.id();
     let self_id_str = self_id.to_string();
-
-    // Self-assign this node's derived IPv4 backhaul address to the shared-segment
-    // interface BEFORE we wait for addressability, so iroh enumerates it and mDNS
-    // announces it to peers (mjolnir-mesh-4pk). Zero-config, collision-free,
-    // DHCP-free — the underlay that lets all same-site nodes connect directly.
-    assign_backhaul_addr(&backhaul_iface, &self_id_str).await;
+    // NB: the derived IPv4 backhaul address was already assigned to the
+    // shared-segment iface in `main`, before the endpoint was built, so iroh
+    // picks it up at bind time and mDNS announces it (mjolnir-mesh-4pk).
 
     wait_until_addressable(&endpoint, no_relay).await;
     print_identity(&endpoint)?;
@@ -1198,14 +1197,12 @@ async fn run_tun_test() -> Result<()> {
 /// on by default (they provide NAT traversal off-LAN); `--no-relay` forces
 /// direct/LAN-only, and `--bind` pins the socket address.
 async fn build_endpoint(
-    secret_file: Option<&Path>,
+    secret: SecretKey,
     no_relay: bool,
     bind: Option<SocketAddr>,
     lan: bool,
     relays: &[String],
 ) -> Result<Endpoint> {
-    let secret = load_or_create_secret(secret_file)?;
-
     if lan {
         // LAN-direct: start from the Minimal preset (crypto provider only, no
         // pkarr/n0-DNS publishing, so no internet dependency and no DNS spam),
