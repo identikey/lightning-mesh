@@ -12,8 +12,8 @@
 #   container-net-lan.rsc  (this file) bridges the container directly onto the
 #                          shared L2 segment that the other mesh nodes are on, so
 #                          every node's container is mutually reachable. meshd then
-#                          self-assigns each node a stable IPv6 backhaul ULA
-#                          (fd6d:6a00::/64, host derived from node id) and the
+#                          self-assigns each node a stable IPv4 backhaul address
+#                          (10.254.0.0/16, host derived from node id) and the
 #                          nodes discover + connect DIRECTLY over the LAN via mDNS
 #                          — no relay, no DHCP, no internet (mjolnir-mesh-4pk).
 #
@@ -24,7 +24,7 @@
 # REQUIRED: set $meshLink to the interface on the shared segment that reaches the
 # OTHER mesh nodes — i.e. the port into the common switch (bench) or the WiFi
 # backhaul interface (deployment). This is the ONE value you must get right; the
-# container is bridged onto this L2 so peers can see its IPv6 ULA. There is no safe
+# container is bridged onto this L2 so peers can see its backhaul address. There is no safe
 # default (bridging the wrong port can disrupt the node's own connectivity), so
 # the script refuses to run until you set it.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -36,10 +36,10 @@
 }
 
 # veth — the container's virtual NIC. The container side comes up as eth0; meshd
-# adds the IPv6 backhaul ULA to it itself. The IPv4 here is only a placeholder so
-# the interface is valid/up; offline backhaul rides on IPv6, so it needn't match
-# the LAN. (If you also want the container reachable over IPv4/managed on the LAN,
-# give it a real LAN address + gateway instead.)
+# adds the derived 10.254.0.0/16 backhaul address to it itself. The address here
+# is only a placeholder so the interface is valid/up; the backhaul rides on the
+# 10.254 address meshd assigns, so this needn't match the LAN. (If you also want
+# the container reachable/managed on the LAN, give it a real LAN address + gateway.)
 :if ([:len [/interface/veth/find where name="veth-mesh"]] = 0) do={
     /interface/veth/add name=veth-mesh address=172.20.0.2/24 gateway=172.20.0.1
 }
@@ -63,10 +63,10 @@
     /interface/bridge/port/add bridge=br-mesh interface=$meshLink
 }
 
-# NOTE: no NAT/masquerade and no /ipv6 config is needed for the offline backhaul —
-# the nodes talk IPv6-ULA peer-to-peer over the bridged L2, and the `mesh` daemon
-# runs in --lan mode (no relay, no pkarr, no internet). If you later need internet
-# egress for relay/pkarr mode, use container-net.rsc instead (or add masquerade +
-# a real LAN address to the veth here).
+# NOTE: no NAT/masquerade is needed for the offline backhaul — the nodes talk
+# peer-to-peer over the bridged L2 on their 10.254.0.0/16 backhaul addresses, and
+# the `mesh` daemon runs in --lan mode (no relay, no pkarr, no internet). If you
+# later need internet egress for relay/pkarr mode, use container-net.rsc instead
+# (or add masquerade + a real LAN address to the veth here).
 
-:put ("mjolnir container-net-lan: done. veth-mesh + " . $meshLink . " bridged on br-mesh. meshd will self-assign the IPv6 backhaul ULA on eth0.")
+:put ("mjolnir container-net-lan: done. veth-mesh + " . $meshLink . " bridged on br-mesh. meshd will self-assign the 10.254.0.0/16 backhaul address on eth0.")

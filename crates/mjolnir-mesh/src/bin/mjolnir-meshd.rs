@@ -150,8 +150,8 @@ enum Command {
         #[arg(long, default_value = "172.20.0.1")]
         client_gateway: Ipv4Addr,
         /// The container interface on the shared L2 segment (the veth facing the
-        /// other mesh nodes). meshd self-assigns this node's derived IPv6 backhaul
-        /// ULA here so peers discover + connect directly over the LAN with no DHCP.
+        /// other mesh nodes). meshd self-assigns this node's derived IPv4 backhaul
+        /// address here so peers discover + connect directly over the LAN, no DHCP.
         #[arg(long, default_value = "eth0")]
         backhaul_iface: String,
     },
@@ -386,7 +386,7 @@ async fn run_mesh(
     let self_id = endpoint.id();
     let self_id_str = self_id.to_string();
 
-    // Self-assign this node's derived IPv6 backhaul ULA to the shared-segment
+    // Self-assign this node's derived IPv4 backhaul address to the shared-segment
     // interface BEFORE we wait for addressability, so iroh enumerates it and mDNS
     // announces it to peers (mjolnir-mesh-4pk). Zero-config, collision-free,
     // DHCP-free — the underlay that lets all same-site nodes connect directly.
@@ -774,13 +774,14 @@ async fn install_client_route(subnet: Ipv4Net, gateway: Ipv4Addr) {
 #[cfg(not(target_os = "linux"))]
 async fn install_client_route(_subnet: Ipv4Net, _gateway: Ipv4Addr) {}
 
-/// Self-assign this node's derived IPv6 backhaul ULA (`fd6d:6a00::/64`, host from
-/// the node id) to the shared-segment interface, so every node has a stable,
-/// collision-free, DHCP-free underlay address in one shared /64. Peers are then
+/// Self-assign this node's derived IPv4 backhaul address (`10.254.0.0/16`, host
+/// from the node id) to the shared-segment interface, so every node has a stable,
+/// collision-free, DHCP-free underlay address in one shared /16. Peers are then
 /// on-link to each other and iroh/mDNS discover + connect directly over the LAN
-/// (mjolnir-mesh-4pk). Containers commonly default-disable IPv6, so we enable it
-/// on the interface first. Best-effort: an unreachable interface or an
-/// already-present address is logged, not fatal — the node still runs.
+/// (mjolnir-mesh-4pk). IPv4 (not an IPv6 ULA) because iroh surfaces private IPv4
+/// as a connection candidate and announces it over mDNS, but not IPv6 ULAs — see
+/// the `iroh-lan-backhaul-findings` memory. Best-effort: an unreachable interface
+/// or an already-present address is logged, not fatal — the node still runs.
 #[cfg(target_os = "linux")]
 async fn assign_backhaul_addr(iface: &str, self_id: &str) {
     use futures_util::stream::TryStreamExt;
@@ -788,9 +789,6 @@ async fn assign_backhaul_addr(iface: &str, self_id: &str) {
 
     let addr = mjolnir_mesh::tun::backhaul_addr(self_id);
     let prefix = mjolnir_mesh::tun::BACKHAUL_PREFIX_LEN;
-
-    // Containers often ship with IPv6 disabled on the iface — enable it first.
-    let _ = std::fs::write(format!("/proc/sys/net/ipv6/conf/{iface}/disable_ipv6"), "0");
 
     let (connection, handle, _) = match new_connection() {
         Ok(c) => c,
@@ -820,13 +818,13 @@ async fn assign_backhaul_addr(iface: &str, self_id: &str) {
 
     match handle
         .address()
-        .add(index, std::net::IpAddr::V6(addr), prefix)
+        .add(index, std::net::IpAddr::V4(addr), prefix)
         .execute()
         .await
     {
         Ok(()) => info!(
             %addr, iface, prefix,
-            "assigned IPv6 backhaul address — peers discover this node here via mDNS"
+            "assigned IPv4 backhaul address — peers discover this node here via mDNS"
         ),
         Err(e) => warn!(%addr, iface, "could not assign backhaul address (may already exist): {e}"),
     }

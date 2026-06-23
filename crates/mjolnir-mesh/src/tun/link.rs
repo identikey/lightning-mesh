@@ -1,42 +1,52 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 
 /// The reserved link-addressing block for per-peer TUN /31s.
 /// Devices on the mesh never see these addresses.
 pub const LINK_BLOCK: (Ipv4Addr, u8) = (Ipv4Addr::new(10, 255, 0, 0), 16);
 
-/// Prefix length of the shared mesh **backhaul** ULA (`fd6d:6a00::/64`).
+/// Prefix length of the shared mesh **backhaul** block (`10.254.0.0/16`).
 ///
-/// Every node self-assigns one address in this prefix to its shared-segment
+/// Every node self-assigns one address in this block to its shared-segment
 /// (container) interface; the host part is derived from the node id, so each
 /// node's underlay address is stable and collision-free with zero coordination —
 /// no DHCP, no server, works fully offline.
 ///
 /// This is the node-to-node *underlay* that iroh/QUIC and mDNS run over (distinct
-/// from the per-peer TUN /31s in [`LINK_BLOCK`] and from the CRDT-assigned client
-/// /24s). Because every node shares this one `/64`, all peers are on-link to each
-/// other on the shared L2 segment — direct neighbours, no routing, and no
-/// scope-ids (unlike raw `fe80::` link-local). `fd` marks it a ULA (RFC 4193);
-/// `6d6a` = "mj".
-pub const BACKHAUL_PREFIX_LEN: u8 = 64;
-
-/// Upper 64 bits of the backhaul prefix `fd6d:6a00::/64`.
-const BACKHAUL_PREFIX_HI: u64 = 0xfd6d_6a00_0000_0000;
-
-/// Derive this node's stable IPv6 backhaul address from its node id.
+/// from the per-peer TUN /31s in [`LINK_BLOCK`], from the CRDT-assigned client
+/// /24s, and from babeld's IPv6 link-local *overlay* adjacency on the TUNs).
+/// Because every node shares this one `/16`, all peers are on-link to each other
+/// on the shared L2 segment — direct neighbours, no routing.
 ///
-/// Address = the `fd6d:6a00::/64` prefix in the high 64 bits, host part = the
-/// first 64 bits of `blake3(node_id)`. Deterministic (same node id → same address
-/// every boot) and collision-resistant over the 64-bit host space — negligible for
-/// any realistic mesh. Mirrors [`pick_link_31`]'s hash-into-a-block approach. The
-/// host part is forced non-zero so we never land on the subnet-router anycast
-/// address (`fd6d:6a00::`).
-pub fn backhaul_addr(node_id: &str) -> Ipv6Addr {
+/// IPv4 (not an IPv6 ULA) on purpose: iroh 1.0 surfaces private IPv4 addresses as
+/// connection candidates and announces them over mDNS, but does *not* surface
+/// IPv6 ULA addresses, and binding one directly trips IPv6 DAD. See the
+/// `iroh-lan-backhaul-findings` memory for the empirical detail.
+pub const BACKHAUL_PREFIX_LEN: u8 = 16;
+
+/// First two octets of the backhaul block `10.254.0.0/16`. Chosen to avoid the
+/// TUN-link block (`10.255.0.0/16`, [`LINK_BLOCK`]) and the client mesh space
+/// (`10.42.0.0/16`).
+const BACKHAUL_BLOCK: [u8; 2] = [10, 254];
+
+/// Derive this node's stable IPv4 backhaul address from its node id.
+///
+/// Address = `10.254.<h>.<l>`, where `<h>.<l>` is the first 16 bits of
+/// `blake3(node_id)`. Deterministic (same node id → same address every boot) and
+/// collision-resistant over the 16-bit host space — negligible for any realistic
+/// same-site mesh, and the same trade-off [`pick_link_31`] already makes for the
+/// TUN /31s. The host part is clamped off the `/16` network (`.0.0`) and
+/// broadcast (`.255.255`) addresses.
+pub fn backhaul_addr(node_id: &str) -> Ipv4Addr {
     let hash = blake3::hash(node_id.as_bytes());
-    let mut host = u64::from_be_bytes(hash.as_bytes()[..8].try_into().expect("8 bytes"));
+    let bytes = hash.as_bytes();
+    let mut host = u16::from_be_bytes([bytes[0], bytes[1]]);
     if host == 0 {
-        host = 1; // avoid the subnet-router anycast address fd6d:6a00::
+        host = 1; // avoid the network address 10.254.0.0
+    } else if host == u16::MAX {
+        host = u16::MAX - 1; // avoid the broadcast address 10.254.255.255
     }
-    Ipv6Addr::from(((BACKHAUL_PREFIX_HI as u128) << 64) | host as u128)
+    let [h, l] = host.to_be_bytes();
+    Ipv4Addr::new(BACKHAUL_BLOCK[0], BACKHAUL_BLOCK[1], h, l)
 }
 
 /// Derive a /31 for a peer-pair, symmetrically.
@@ -137,19 +147,17 @@ mod tests {
     }
 
     #[test]
-    fn backhaul_addr_in_shared_prefix() {
-        // Every node lands in the same fd6d:6a00::/64, so all peers are on-link.
+    fn backhaul_addr_in_shared_block() {
+        // Every node lands in the same 10.254.0.0/16, so all peers are on-link.
         let a = backhaul_addr("alpha");
         let b = backhaul_addr("beta");
-        let seg = a.segments();
-        assert_eq!([seg[0], seg[1], seg[2], seg[3]], [0xfd6d, 0x6a00, 0, 0]);
-        // Distinct node ids → distinct host parts (different addresses).
+        assert_eq!(&a.octets()[..2], &[10, 254]);
+        assert_eq!(&b.octets()[..2], &[10, 254]);
+        // Distinct node ids → distinct addresses.
         assert_ne!(a, b);
-        // Shared /64 prefix across nodes.
-        assert_eq!(&a.segments()[..4], &b.segments()[..4]);
-        // ULA range (fc00::/7) and never the anycast address.
-        assert!((a.segments()[0] & 0xfe00) == 0xfc00);
-        assert_ne!(a.segments()[4..], [0, 0, 0, 0]);
+        // Never the /16 network or broadcast address.
+        assert_ne!(a, Ipv4Addr::new(10, 254, 0, 0));
+        assert_ne!(a, Ipv4Addr::new(10, 254, 255, 255));
     }
 
     #[test]
@@ -159,6 +167,7 @@ mod tests {
         for i in 0u32..100 {
             seen.insert(backhaul_addr(&format!("node-{i:08x}")));
         }
+        // 100 nodes in a 16-bit host space: collisions are statistically negligible.
         assert_eq!(seen.len(), 100, "all 100 node backhaul addrs must be unique");
     }
 
