@@ -11,8 +11,10 @@
 //!   listen             accept inbound connections, echo ping datagrams
 //!   connect <addr>     dial a peer by address blob, measure a datagram round-trip
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -23,7 +25,8 @@ use iroh::endpoint::Connection;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
-use mjolnir_mesh::tun::{spawn_tunnel, DatagramConn, EncapError};
+use mjolnir_mesh::tun::{spawn_tunnel, DatagramConn, EncapError, Tunnel};
+use mjolnir_mesh::PeerRoster;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -101,6 +104,16 @@ enum Command {
         /// Address blob printed by the peer's `tun-listen`.
         addr: String,
     },
+    /// P2: run the full multi-peer mesh. Reads a roster of peers, accepts inbound
+    /// tunnels, and dials every peer for which this node is the initiator (lower
+    /// id), maintaining one /31 TUN per peer with redial-on-drop. Runs until
+    /// Ctrl-C. This is the daemon mode router deploys use.
+    Mesh {
+        /// Path to the peer roster file: one peer address blob or 64-hex node id
+        /// per line; `#` comments and blank lines ignored. See `PeerRoster`.
+        #[arg(long)]
+        roster: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -138,6 +151,7 @@ async fn main() -> Result<()> {
         Command::Connect { addr } => run_connect(endpoint, &addr).await?,
         Command::TunListen => run_tun_listen(endpoint, no_relay).await?,
         Command::TunConnect { addr } => run_tun_connect(endpoint, &addr).await?,
+        Command::Mesh { roster } => run_mesh(endpoint, no_relay, &roster).await?,
         Command::TunTest => unreachable!("handled above"),
     }
     Ok(())
@@ -166,10 +180,7 @@ impl DatagramConn for IrohDatagramConn {
             use iroh::endpoint::SendDatagramError;
             match e {
                 SendDatagramError::TooLarge => EncapError::DatagramTooLarge(len),
-                other => EncapError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    other.to_string(),
-                )),
+                other => EncapError::Io(std::io::Error::other(other.to_string())),
             }
         })
     }
@@ -196,8 +207,9 @@ async fn run_tun_listen(endpoint: Endpoint, no_relay: bool) -> Result<()> {
     info!("tun-listen: hand the address above to a peer's `tun-connect`");
 
     let self_id = endpoint.id().to_string();
+    let registry: TunnelRegistry = Arc::new(Mutex::new(HashMap::new()));
     let router = Router::builder(endpoint)
-        .accept(TUN_ALPN, TunnelHandler { self_id })
+        .accept(TUN_ALPN, TunnelHandler { self_id, registry })
         .spawn();
 
     tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
@@ -250,38 +262,187 @@ async fn run_tun_connect(endpoint: Endpoint, addr_blob: &str) -> Result<()> {
     Ok(())
 }
 
-/// iroh protocol handler that brings up a per-peer TUN tunnel on accept.
+/// P2 multi-peer mesh: accept inbound tunnels and dial every roster peer for
+/// which this node is the initiator, maintaining one /31 TUN per peer with
+/// redial-on-drop. Holds until Ctrl-C.
+async fn run_mesh(endpoint: Endpoint, no_relay: bool, roster_path: &Path) -> Result<()> {
+    wait_until_addressable(&endpoint, no_relay).await;
+    print_identity(&endpoint)?;
+
+    let self_id = endpoint.id();
+    let self_id_str = self_id.to_string();
+
+    let roster = PeerRoster::load(roster_path)
+        .with_context(|| format!("loading roster {}", roster_path.display()))?;
+    info!(peers = roster.len(), path = %roster_path.display(), "roster loaded");
+
+    let registry: TunnelRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Accept inbound tunnels — peers with a higher node id dial in to us.
+    let router = Router::builder(endpoint.clone())
+        .accept(
+            TUN_ALPN,
+            TunnelHandler {
+                self_id: self_id_str.clone(),
+                registry: registry.clone(),
+            },
+        )
+        .spawn();
+
+    // Spawn one dialer task per peer we initiate to. Tie-break by node id so
+    // exactly one side of each pair dials (the lexicographically-lower id) and
+    // the other accepts — otherwise both ends would race to create the same
+    // deterministic /31 interface. This mirrors `pick_link_31`'s ordering.
+    let mut dialers = Vec::new();
+    for entry in roster.peers() {
+        let addr = match parse_peer(&entry.token) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(token = %entry.token, "skipping unparseable roster entry: {e}");
+                continue;
+            }
+        };
+        let peer = addr.id;
+        if peer == self_id {
+            continue; // our own id appears in the roster — skip
+        }
+        if self_id_str < peer.to_string() {
+            let ep = endpoint.clone();
+            let reg = registry.clone();
+            let sid = self_id_str.clone();
+            let label = entry.label.clone();
+            dialers.push(tokio::spawn(async move {
+                connector_loop(ep, addr, sid, reg, label).await;
+            }));
+        } else {
+            info!(%peer, label = ?entry.label, "peer has the higher id — waiting for it to dial us");
+        }
+    }
+    info!(dialing = dialers.len(), "mesh up — holding (Ctrl-C to exit)");
+
+    tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
+    info!("shutting down mesh");
+    for d in &dialers {
+        d.abort();
+    }
+    router.shutdown().await.context("router shutdown")?;
+    Ok(())
+}
+
+/// Maintain a tunnel to one peer: dial, serve until it drops, then redial with
+/// capped exponential backoff. Runs until the task is aborted (mesh shutdown).
+async fn connector_loop(
+    endpoint: Endpoint,
+    addr: EndpointAddr,
+    self_id: String,
+    registry: TunnelRegistry,
+    label: Option<String>,
+) {
+    let peer = addr.id;
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(30);
+    loop {
+        info!(%peer, label = ?label, "dialing peer");
+        match endpoint.connect(addr.clone(), TUN_ALPN).await {
+            Ok(conn) => {
+                backoff = Duration::from_secs(1); // reset after a successful dial
+                if let Err(e) = serve_tunnel(conn, &self_id, &registry).await {
+                    warn!(%peer, "tunnel ended with error: {e}");
+                }
+                // Connection closed; brief pause before redialing.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => {
+                warn!(%peer, ?backoff, "dial failed: {e}; retrying after backoff");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
+/// Live per-peer tunnel registry: maps each connected peer to its TUN interface
+/// name. Shared between the accept handler and the per-peer dialer tasks. The
+/// babeld layer (mjolnir-mesh-83k) reads this to learn the live tunnel set; for
+/// now it also enforces the one-tunnel-per-peer invariant (the per-pair /31 and
+/// `mj-peer-<id>` name are deterministic, so a second tunnel for the same peer
+/// would collide on the interface name).
+type TunnelRegistry = Arc<Mutex<HashMap<EndpointId, String>>>;
+
+/// Bring up a per-peer /31 TUN over `conn`, register it, and hold it open until
+/// the connection closes. Shared by the inbound (accept) and outbound (dial)
+/// paths so both enforce the same one-tunnel-per-peer invariant and feed the
+/// same registry. Returns when the tunnel tears down.
+async fn serve_tunnel(conn: Connection, self_id: &str, registry: &TunnelRegistry) -> Result<()> {
+    let peer = conn.remote_id();
+    let peer_str = peer.to_string();
+    let (self_addr, peer_addr) = mjolnir_mesh::tun::pick_link_31(self_id, &peer_str);
+
+    // Atomically reserve this peer's slot. If one already exists, refuse the new
+    // connection rather than collide on the deterministic interface name. The
+    // empty-string sentinel is replaced with the real iface name once it's up.
+    {
+        let mut reg = registry.lock().expect("registry poisoned");
+        if reg.contains_key(&peer) {
+            drop(reg);
+            warn!(%peer, "already have a tunnel for this peer — refusing duplicate");
+            conn.close(2u32.into(), b"duplicate tunnel");
+            return Ok(());
+        }
+        reg.insert(peer, String::new());
+    }
+
+    let tunnel = match spawn_tunnel(
+        short_id(&peer_str),
+        self_addr,
+        peer_addr,
+        IrohDatagramConn { conn: conn.clone() },
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            registry.lock().expect("registry poisoned").remove(&peer);
+            conn.close(1u32.into(), b"tunnel setup failed");
+            return Err(anyhow::anyhow!("bringing up tunnel for {peer}: {e}"));
+        }
+    };
+
+    let iface = tunnel.iface_name.clone();
+    registry
+        .lock()
+        .expect("registry poisoned")
+        .insert(peer, iface.clone());
+    info!(%iface, %self_addr, %peer_addr, %peer, "tunnel up");
+    spawn_udp_echo(self_addr);
+
+    // Hold the tunnel open until the connection closes, then deregister.
+    let reason = conn.closed().await;
+    info!(%peer, %iface, ?reason, "tunnel closed");
+    registry.lock().expect("registry poisoned").remove(&peer);
+    drop_tunnel(tunnel);
+    Ok(())
+}
+
+/// Explicit drop helper — makes the teardown point obvious at call sites and
+/// documents that dropping a [`Tunnel`] aborts its encap tasks and releases the
+/// TUN fd (so the kernel removes the interface).
+fn drop_tunnel(tunnel: Tunnel) {
+    drop(tunnel);
+}
+
+/// iroh protocol handler that brings up a per-peer TUN tunnel on each accepted
+/// connection, registering it in the shared [`TunnelRegistry`].
 #[derive(Clone, Debug)]
 struct TunnelHandler {
     self_id: String,
+    registry: TunnelRegistry,
 }
 
 impl ProtocolHandler for TunnelHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        let peer = conn.remote_id();
-        let peer_str = peer.to_string();
-        let (self_addr, peer_addr) = mjolnir_mesh::tun::pick_link_31(&self.self_id, &peer_str);
-
-        match spawn_tunnel(
-            short_id(&peer_str),
-            self_addr,
-            peer_addr,
-            IrohDatagramConn { conn: conn.clone() },
-        )
-        .await
-        {
-            Ok(tunnel) => {
-                info!(iface = %tunnel.iface_name, %self_addr, %peer_addr, %peer, "tunnel up (accepted)");
-                spawn_udp_echo(self_addr);
-                // Hold the tunnel open until the connection closes.
-                let reason = conn.closed().await;
-                info!(%peer, ?reason, "tunnel connection closed");
-                drop(tunnel);
-            }
-            Err(e) => {
-                warn!(%peer, "failed to bring up tunnel: {e}");
-                conn.close(1u32.into(), b"tunnel setup failed");
-            }
+        if let Err(e) = serve_tunnel(conn, &self.self_id, &self.registry).await {
+            warn!("accepted tunnel ended with error: {e}");
         }
         Ok(())
     }
