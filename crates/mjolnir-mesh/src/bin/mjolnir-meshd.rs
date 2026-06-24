@@ -921,7 +921,17 @@ async fn babel_reconciler(
 
         match write_atomic_if_changed(&config_path, &conf) {
             Ok(changed) => {
-                if !spawned && !babeld_unavailable && !ifaces.is_empty() {
+                if ifaces.is_empty() {
+                    // babeld refuses to run with zero interfaces ("Eek... asked to
+                    // run on no interfaces!") and exits. When no tunnel is up, keep
+                    // babeld stopped rather than restart-looping it into an empty
+                    // config; it starts again once a tunnel reappears.
+                    if spawned {
+                        warn!("no live tunnels — stopping babeld until one returns");
+                        let _ = sup.shutdown().await;
+                        spawned = false;
+                    }
+                } else if !spawned && !babeld_unavailable {
                     // Start babeld once there's at least one tunnel to route over.
                     match sup.spawn().await {
                         Ok(()) => {
@@ -933,9 +943,21 @@ async fn babel_reconciler(
                             warn!("could not start babeld (cross-site routing disabled): {e}");
                         }
                     }
-                } else if spawned && changed {
-                    let _ = sup.sighup().await;
-                    info!("babeld config changed — reloaded via SIGHUP");
+                } else if spawned {
+                    // babeld 1.13 exits on a SIGHUP reload in this container, so
+                    // RESTART on config change rather than signal — and respawn it
+                    // if it has died (the reconciler is also the keep-alive).
+                    if sup.has_exited().await {
+                        warn!("babeld exited — restarting");
+                        if let Err(e) = sup.restart().await {
+                            warn!("babeld restart failed: {e}");
+                        }
+                    } else if changed {
+                        info!("babeld config changed — restarting babeld");
+                        if let Err(e) = sup.restart().await {
+                            warn!("babeld restart failed: {e}");
+                        }
+                    }
                 }
             }
             Err(e) => warn!("failed to write babeld config {}: {e}", config_path.display()),

@@ -46,6 +46,11 @@ impl BabelSupervisor {
         if guard.is_some() {
             return Err(SupervisorError::AlreadyRunning);
         }
+        // babeld leaves a stale pidfile when it's SIGKILLed (it doesn't catch
+        // SIGTERM), then refuses to start cleanly ("creat(...pid): File exists").
+        // Clear it so a restart is always clean.
+        let _ = std::fs::remove_file("/run/babeld.pid");
+        let _ = std::fs::remove_file("/var/run/babeld.pid");
         let child = Command::new(&self.babeld_path)
             .arg("-c")
             .arg(&self.config_path)
@@ -65,6 +70,23 @@ impl BabelSupervisor {
         info!(pid = child.id(), "spawned babeld");
         *guard = Some(child);
         Ok(())
+    }
+
+    /// True if a child was spawned and has since exited (so it needs respawning).
+    pub async fn has_exited(&self) -> bool {
+        let mut guard = self.child.lock().await;
+        match guard.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => false,
+        }
+    }
+
+    /// Stop the current babeld (if any) and spawn a fresh one. Used on config
+    /// change: babeld 1.13 does not reliably survive a SIGHUP reload in this
+    /// container setup (it exits), so we restart rather than signal.
+    pub async fn restart(&self) -> Result<(), SupervisorError> {
+        self.shutdown().await?;
+        self.spawn().await
     }
 
     /// Send SIGHUP to babeld so it re-reads its config file.
