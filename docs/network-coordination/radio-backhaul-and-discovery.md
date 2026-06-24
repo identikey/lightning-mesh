@@ -4,20 +4,28 @@ Status: living design note. Captures the 2026-06-23 hardware/radio decision, the
 tradeoffs behind it, and the protocol work it implies. See beads
 `mjolnir-mesh-b1d` (wireless backhaul) and the multi-hop-discovery bead.
 
-## TL;DR
+## TL;DR (decision as of 2026-06-24)
 
-- **Decision: stay on the MikroTik hardware (RouterOS / `wifi-qcom`).** The project
-  principle that matters is **protocol symmetry** (a non-authoritative, symmetric
-  P2P protocol), which lives at **L3** (iroh + babeld + CRDT) and is satisfied.
-  Literal **L2 radio symmetry** (802.11s / IBSS) is *not* required and is *not*
-  available on this hardware.
-- **Radio layer: identical-config AP/STA nodes.** Every node runs the same
-  software (AP on one band, station on the other / same band). No designated root,
-  no single point of failure. Which end of a link is "AP" falls out of radio range,
-  not hierarchy — transport plumbing, like TCP's `connect()`/`accept()`.
-- **Next protocol work: multi-hop discovery** (the "babeld/mDNS synchronization"
-  problem). Everything validated so far assumes one shared L2 segment; the forest
-  doesn't have that. See the last section.
+- **Guiding principle: the L3 overlay (iroh + babeld + CRDT) is the product, and it
+  must run on heterogeneous hardware. The radio / L2 layer is whatever each node can
+  do.** The L3 routing is the invariant; everything below it is interchangeable.
+  This *is* the non-authoritative, symmetric, runs-anywhere thesis.
+- **New nodes: whole OpenWrt mt76 boards** (e.g. OpenWrt One / GL-MT3000 — USB-C,
+  self-enclosed, ~$80–90) running **real 802.11s mesh** backhaul + a client AP +
+  the overlay **natively**. Real mesh = multi-link, mobility/churn-robust, and a
+  flat L2 within the island (mDNS works there).
+- **Existing MikroTiks: kept as an AP/STA segment.** `wifi-qcom` can't do 802.11s;
+  interop between the AP/STA segment and the mt76 802.11s island is a **known cost**
+  (gateway node + L3 routing), accepted deliberately — the L3 overlay unifies them.
+- **Heterogeneous fleet ⇒ no universal flat L2 ⇒ discovery must be radio-agnostic**
+  (a gossip-based address book), not flat-mDNS-dependent. This makes multi-hop
+  discovery (`mjolnir-mesh-0yb`) **core, not optional** — it's what makes "runs on
+  any hardware" actually true.
+- **Decision history (why, for the record):** considered staying all-MikroTik
+  AP/STA — protocol symmetry is satisfiable there (per-link AP/STA is transport
+  plumbing, like TCP `connect()`/`accept()`, not a hierarchy), but single-uplink
+  AP/STA is fragile under mobility/churn. Moving new nodes to mt76/802.11s restores
+  multi-link robustness and a flat L2 within the open island, on open hardware.
 
 ## Background: the two layers
 
