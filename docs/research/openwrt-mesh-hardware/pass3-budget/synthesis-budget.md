@@ -67,7 +67,23 @@ GL.iNet's **GUI "Mesh" feature is proprietary — NOT 802.11s.** But every GL.iN
 
 ---
 
-## 7. Verification
+## 7. Node-role → recommended model
+
+Mesh nodes aren't interchangeable — match the hardware to the job. A typical fleet mixes these roles, and 802.11s interoperates across mt76/ath9k/ath10k (same channel, mesh ID, band, SAE; all on `wpad-mesh-*`), so a mixed fleet is expected and fine.
+
+| Role | What it needs | Recommended | Why / alternates |
+|---|---|---|---|
+| **Gateway / hub** (wired uplink, serves many clients, central) | Fast wired ports, RAM, high client throughput | **GL.iNet Flint 2 (GL-MT6000)** ~$150 | Dual 2.5 GbE uplink, 1 GB RAM, WiFi 6 4×4, mt7986 (on-standard), stable OpenWrt. *Cheaper alt:* **Cudy TR3000** ~$50 (2.5 GbE + USB3, but internal antennas — fine for a hub that doesn't need high-gain radio). |
+| **Backhaul / relay** (mesh reach matters; wants directional high-gain antenna) | **Removable** antennas, rock-solid mesh driver, fixed non-DFS 5 GHz | **GL.iNet Slate Plus (GL-A1300)** ~$65 | 2× detachable RP-SMA + battle-tested ath10k mesh. WiFi 5 is fine here (backhaul gains little from WiFi 6). *More throughput:* used **Netgear R7800** ~$70 (4× removable RP-SMA, QCA9984). *Bare-board tri-radio:* **BPI-R3 + AW7915-NP1** (dedicated 5 GHz backhaul) — see `synthesis-pass2.md`. Budget the ath10k non-CT firmware swap. |
+| **Leaf / client AP** (coverage node, cheap, fixed antennas OK) | Low cost, easy flash, WiFi 6 for clients | **Cudy WR3000** ~$35 | Official OpenWrt, web-UI flash, 4 external (fixed) whips, mt7981 (same mesh family). *AliExpress alt:* **CMCC RAX3000M** ~$25–40. |
+| **Compact / deploy-anywhere leaf** (tight enclosure, low power) | Small footprint, USB-C power | **Cudy TR3000** ~$50 (pocket, internal antennas) | Or **BPI-R3 Mini** if you can get it at a sane price (currently can't). |
+| **Validation / bench** (prove the 802.11s + babeld stack first) | Easy flash, low cost, representative silicon | **GL.iNet Flint 2** (on-standard mt7986) or **Cudy WR3000** | Buy 2, stand up an 802.11s link, validate before fleet commit. |
+
+**Antenna rule of thumb:** only the **backhaul/relay** role truly needs removable high-gain antennas → that's the ath10k GL.iNet/R7800 lane (or a bare-board build). Gateway and leaf roles are fine on fixed/internal antennas, which is exactly where the cheap mt76 routers (Flint 2 / WR3000 / TR3000) live.
+
+---
+
+## 8. Verification
 
 - All four branches written with primary sources (OpenWrt ToH/firmware-selector, vendor stores, retailer listings, forum threads). ✅
 - Stock claims are "as listed June 2026" — live inventory can't be guaranteed; flagged honestly per item (esp. used-market ath9k/ath10k and BPI-R3 Mini scarcity). ⚠️
