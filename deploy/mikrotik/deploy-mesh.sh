@@ -39,24 +39,40 @@ NODES=(
 [ -f "$TAR" ] || { echo "missing image tar: $TAR (build with deploy/mikrotik/build.sh)"; exit 1; }
 [ -x "$BIN" ] || { echo "missing meshd binary: $BIN (cargo build --bin mjolnir-meshd --features daemon)"; exit 1; }
 
-# Derive every node's id + the full peer-id list up front.
-declare -A NAME_ID
+# Identity of what we're about to ship to EVERY node (mjolnir-mesh-auu). The
+# same tar goes to all routers, so its sha256 is the deploy fingerprint; the
+# git stamp is what meshd prints in its startup banner. After deploy we read
+# each node's banner back and assert they all match this — turning "they should
+# be identical" into a checked fact instead of an assumption.
+TAR_SHA="$(shasum -a 256 "$TAR" | awk '{print $1}')"
+EXPECT_BUILD="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+[ -n "$(git status --porcelain 2>/dev/null)" ] && EXPECT_BUILD="${EXPECT_BUILD}-dirty"
+echo ">> shipping $TAR"
+echo "   sha256       : $TAR_SHA"
+echo "   expect build : $EXPECT_BUILD  (must match build= in every node's banner)"
+case "$EXPECT_BUILD" in
+  *-dirty) echo "   WARNING: tree is DIRTY — rebuild the tar (build.sh) so it matches HEAD before trusting this deploy";;
+esac
+
+# Derive every node's id up front into parallel indexed arrays (bash 3.2 on
+# macOS has no associative arrays).
+NAMES=(); IDS=()
 for row in "${NODES[@]}"; do
   read -r name _ip secret <<<"$row"
   id=$("$BIN" id --no-relay --secret-file "$secret" 2>/dev/null | awk '/node id:/{print $3}')
   [ -n "$id" ] || { echo "could not derive node id for $name from $secret"; exit 1; }
-  NAME_ID[$name]="$id"
+  NAMES+=("$name"); IDS+=("$id")
 done
+id_for() { local i; for i in "${!NAMES[@]}"; do [ "${NAMES[$i]}" = "$1" ] && { printf '%s' "${IDS[$i]}"; return; }; done; }
 
 deploy_one() {
   read -r name ip secret <<<"$1"
-  local self_id="${NAME_ID[$name]}"
+  local self_id; self_id=$(id_for "$name")
   # --peer args = every OTHER node's id.
-  local peers=""
-  for row in "${NODES[@]}"; do
-    read -r n _ _ <<<"$row"
-    [ "$n" = "$name" ] && continue
-    peers="$peers --peer ${NAME_ID[$n]}"
+  local peers="" i
+  for i in "${!NAMES[@]}"; do
+    [ "${NAMES[$i]}" = "$name" ] && continue
+    peers="$peers --peer ${IDS[$i]}"
   done
   local secret_hex; secret_hex=$(tr -d '[:space:]' < "$secret")
   echo "================ $name ($ip) — self=$self_id ================"
@@ -72,4 +88,27 @@ deploy_one() {
 }
 
 for row in "${NODES[@]}"; do deploy_one "$row"; done
+
+# Verify every node booted the SAME build (mjolnir-mesh-auu). meshd logs a
+# `mjolnir-meshd starting ... build=<sha>` banner; with logging=yes it lands in
+# RouterOS /log. Read it back from each node and assert all stamps == EXPECT_BUILD.
+echo "================ verifying build stamps (give meshd a few seconds to boot) ================"
+sleep 6
+mismatch=0
+for row in "${NODES[@]}"; do
+  read -r name ip _ <<<"$row"
+  line=$($SSH "admin@$ip" '/log/print where message~"mjolnir-meshd starting"' 2>/dev/null | tail -1)
+  stamp=$(printf '%s' "$line" | sed -n 's/.*build=\([^ ,]*\).*/\1/p')
+  if [ "$stamp" = "$EXPECT_BUILD" ] && [ -n "$stamp" ]; then
+    echo "  OK   $name ($ip): build=$stamp"
+  else
+    echo "  FAIL $name ($ip): build=${stamp:-<no banner in /log yet>} (expected $EXPECT_BUILD)"
+    mismatch=1
+  fi
+done
+if [ "$mismatch" = 0 ]; then
+  echo ">> ALL NODES IDENTICAL: build=$EXPECT_BUILD  (sha256 $TAR_SHA)"
+else
+  echo ">> SKEW OR UNVERIFIED — nodes are NOT provably identical. Re-run deploy, or check /log on the failing node."
+fi
 echo "================ deploy done — check 'endpoint addressable ... 10.254.x' + 'kind=DIRECT' in /log ================"

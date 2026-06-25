@@ -16,6 +16,11 @@ ARG RUST_TARGET=armv7-unknown-linux-musleabihf
 # The mjolnir-meshd bin is gated behind the `daemon` feature (keeps the
 # substrate lib iroh-free). Override if building a different bin.
 ARG FEATURES=daemon
+# Source fingerprint stamped into the binary (mjolnir-mesh-auu). `.git` is
+# dockerignored, so the build can't derive it here — build.sh passes the host's
+# `git rev-parse --short HEAD` (+`-dirty`) in, and build.rs reads MJOLNIR_BUILD.
+# Defaults to "unknown" for a bare `docker build` with no build-arg.
+ARG GIT_SHA=unknown
 
 # --- build stage: bundles the armv7 musl cross toolchain ---
 # Pinned to $BUILDPLATFORM so the cross toolchain runs NATIVELY on the build
@@ -25,6 +30,9 @@ FROM --platform=$BUILDPLATFORM messense/rust-musl-cross:armv7-musleabihf AS buil
 ARG BIN
 ARG RUST_TARGET
 ARG FEATURES
+ARG GIT_SHA
+# build.rs reads this; see crates/mjolnir-mesh/build.rs.
+ENV MJOLNIR_BUILD=${GIT_SHA}
 WORKDIR /src
 COPY . .
 # Builds only the requested bin's dependency tree (so the audio crates are not

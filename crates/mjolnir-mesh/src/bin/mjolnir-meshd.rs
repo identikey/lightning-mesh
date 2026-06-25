@@ -52,6 +52,21 @@ const TUN_PROBE_PORT: u16 = 9999;
 /// Datagram payload used to prove an end-to-end round-trip.
 const PING: &[u8] = b"mjolnir-ping";
 
+/// Connection-wide QUIC idle timeout for tunnel endpoints (mjolnir-mesh-auu).
+///
+/// iroh's default connection idle timeout is ~30s, which is what killed the
+/// direct tunnel ~36s after the DIRECT path was selected: once iroh fails to
+/// prune the redundant candidate path (`MultipathNotNegotiated`), the selected
+/// path stops carrying traffic and the connection idles out. Raising the
+/// ceiling to 60s gives iroh's holepunch/path-recovery a second window to
+/// re-select a live path before the connection is declared dead. It is NOT a
+/// root-cause fix (if multipath never negotiates, death is merely deferred to
+/// ~66s) — but that deferral is itself a clean discriminator on hardware:
+/// death tracking this value confirms the idle-timeout/prune hypothesis.
+/// Per-path idle is separately clamped to 15s by iroh; this is the connection
+/// envelope, held open by the 5s keep-alive while any path lives.
+const TUNNEL_MAX_IDLE: Duration = Duration::from_secs(60);
+
 #[derive(Parser)]
 #[command(
     name = "mjolnir-meshd",
@@ -164,6 +179,19 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // Build-identity banner. mjolnir-mesh-auu traced a deterministic ~36s tunnel
+    // death to iroh's `MultipathNotNegotiated` — which, on two nodes running the
+    // SAME 1.0.0 binary, should not happen (multipath is on by default). The
+    // cheapest explanation is a binary/version skew between the two routers, so
+    // log our identity loudly: compare this line across nodes before suspecting
+    // an iroh bug. (Pair with a binary sha256 check at deploy time.)
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        build = env!("MJOLNIR_BUILD"),
+        idle_timeout_secs = TUNNEL_MAX_IDLE.as_secs(),
+        "mjolnir-meshd starting",
+    );
 
     let cli = Cli::parse();
 
@@ -1242,6 +1270,23 @@ async fn run_tun_test() -> Result<()> {
     }
 }
 
+/// QUIC transport config shared by both endpoint flavours (LAN and N0).
+///
+/// Only overrides the connection idle timeout ([`TUNNEL_MAX_IDLE`]); every
+/// other knob — multipath (on, 8 paths), 5s keep-alive, 15s per-path idle —
+/// keeps iroh's default. Applied to BOTH the dial and accept sides, since
+/// `connect()` and the protocol router both read the endpoint's static
+/// transport config (mjolnir-mesh-auu).
+fn tunnel_transport_config() -> iroh::endpoint::QuicTransportConfig {
+    iroh::endpoint::QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            TUNNEL_MAX_IDLE
+                .try_into()
+                .expect("TUNNEL_MAX_IDLE is a valid QUIC idle timeout"),
+        ))
+        .build()
+}
+
 /// Build an iroh endpoint with a persisted (or ephemeral) identity. Relays are
 /// on by default (they provide NAT traversal off-LAN); `--no-relay` forces
 /// direct/LAN-only, and `--bind` pins the socket address.
@@ -1259,6 +1304,7 @@ async fn build_endpoint(
         let mut builder = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Disabled)
             .secret_key(secret)
+            .transport_config(tunnel_transport_config())
             .address_lookup(MdnsAddressLookup::builder());
         if let Some(addr) = bind {
             builder = builder.bind_addr(addr).context("invalid --bind address")?;
@@ -1296,6 +1342,7 @@ async fn build_endpoint(
     // fallback, pkarr/DNS as global discovery. Best of all worlds, additive only.
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
+        .transport_config(tunnel_transport_config())
         .address_lookup(MdnsAddressLookup::builder())
         .relay_mode(relay_mode);
     if let Some(addr) = bind {

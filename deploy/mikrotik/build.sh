@@ -22,7 +22,13 @@ cd "${REPO_ROOT}"
 
 FEATURES="${FEATURES:-daemon}"
 
-echo ">> building ${IMAGE} -> ${OUT_TAR} (linux/arm/v7, bin=${BIN}, features=${FEATURES})"
+# Source fingerprint stamped into the binary (mjolnir-mesh-auu). Derived on the
+# HOST because `.git` is dockerignored — passed into the build via --build-arg
+# and surfaced in meshd's startup banner so two routers can be proven identical.
+GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then GIT_SHA="${GIT_SHA}-dirty"; fi
+
+echo ">> building ${IMAGE} -> ${OUT_TAR} (linux/arm/v7, bin=${BIN}, features=${FEATURES}, build=${GIT_SHA})"
 # buildx is required to force the arm/v7 platform on a non-arm host.
 #
 # Output via the buildkit `docker` exporter (type=docker) — this writes a
@@ -34,6 +40,7 @@ docker buildx build \
   --platform linux/arm/v7 \
   --build-arg "BIN=${BIN}" \
   --build-arg "FEATURES=${FEATURES}" \
+  --build-arg "GIT_SHA=${GIT_SHA}" \
   -f deploy/mikrotik/Dockerfile \
   -t "${IMAGE}" \
   --output "type=docker,dest=${OUT_TAR}" \
