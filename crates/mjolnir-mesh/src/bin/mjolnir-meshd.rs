@@ -219,7 +219,24 @@ async fn main() -> Result<()> {
     if let Command::Mesh { backhaul_iface, .. } = &cli.command {
         assign_backhaul_addr(backhaul_iface, &secret.public().to_string()).await;
     }
-    let endpoint = build_endpoint(secret, no_relay, cli.bind, lan, &cli.relay).await?;
+    // Pin the iroh socket to the derived backhaul address in LAN/mesh mode
+    // (mjolnir-mesh-auu). Binding `0.0.0.0` made iroh enumerate AND advertise
+    // every container address — the backhaul `10.254.x` AND the container's
+    // private NAT addr (e.g. `172.20.0.2`, identical on every node and not
+    // reachable peer-to-peer). That second, bogus candidate gave the connection
+    // >1 IP path, so iroh tried to prune one and hit `MultipathNotNegotiated`,
+    // killing the tunnel ~36s in. Binding to the single backhaul IP advertises
+    // exactly one reachable address → one path → no prune. Explicit `--bind`
+    // still wins; non-mesh/non-LAN paths are unchanged.
+    let bind = match cli.bind {
+        Some(addr) => Some(addr),
+        None if lan && mesh_mode => {
+            let ip = mjolnir_mesh::tun::backhaul_addr(&secret.public().to_string());
+            Some(SocketAddr::new(std::net::IpAddr::V4(ip), 0))
+        }
+        None => None,
+    };
+    let endpoint = build_endpoint(secret, no_relay, bind, lan, &cli.relay).await?;
 
     match cli.command {
         Command::Id => {
@@ -1301,15 +1318,37 @@ async fn build_endpoint(
         // LAN-direct: start from the Minimal preset (crypto provider only, no
         // pkarr/n0-DNS publishing, so no internet dependency and no DNS spam),
         // relays off, and add ONLY mDNS address lookup for same-network peers.
-        let mut builder = Endpoint::builder(presets::Minimal)
+        //
+        // `bind` carries the single backhaul address in mesh mode (auu): pinning
+        // the socket to it advertises exactly one reachable addr, avoiding the
+        // multi-candidate-path prune that killed the tunnel. If that addr isn't
+        // on an interface yet (the backhaul assign raced or failed), fall back to
+        // all-interfaces rather than crash-loop the daemon.
+        if let Some(addr) = bind {
+            let attempt = Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .secret_key(secret.clone())
+                .transport_config(tunnel_transport_config())
+                .address_lookup(MdnsAddressLookup::builder())
+                .bind_addr(addr)
+                .context("invalid bind address")?;
+            match attempt.bind().await {
+                Ok(ep) => return Ok(ep),
+                Err(e) => warn!(
+                    %addr,
+                    "binding iroh to the backhaul address failed ({e}); \
+                     falling back to all interfaces",
+                ),
+            }
+        }
+        return Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Disabled)
             .secret_key(secret)
             .transport_config(tunnel_transport_config())
-            .address_lookup(MdnsAddressLookup::builder());
-        if let Some(addr) = bind {
-            builder = builder.bind_addr(addr).context("invalid --bind address")?;
-        }
-        return builder.bind().await.context("failed to bind iroh endpoint");
+            .address_lookup(MdnsAddressLookup::builder())
+            .bind()
+            .await
+            .context("failed to bind iroh endpoint");
     }
 
     let relay_mode = if no_relay {

@@ -90,25 +90,31 @@ deploy_one() {
 for row in "${NODES[@]}"; do deploy_one "$row"; done
 
 # Verify every node booted the SAME build (mjolnir-mesh-auu). meshd logs a
-# `mjolnir-meshd starting ... build=<sha>` banner; with logging=yes it lands in
-# RouterOS /log. Read it back from each node and assert all stamps == EXPECT_BUILD.
-echo "================ verifying build stamps (give meshd a few seconds to boot) ================"
-sleep 6
-mismatch=0
+# `mjolnir-meshd starting ... build="<sha>"` banner; with logging=yes it lands in
+# RouterOS /log. The real identity check is node-to-node agreement on a non-empty
+# stamp — EXPECT_BUILD is only an advisory cross-check (it's `-dirty`-sensitive to
+# any uncommitted file, e.g. a beads note, even when the tar was built clean).
+echo "================ verifying build stamps (waiting ~25s for meshd to boot + log) ================"
+sleep 25
+STAMPS=()
 for row in "${NODES[@]}"; do
   read -r name ip _ <<<"$row"
-  line=$($SSH "admin@$ip" '/log/print where message~"mjolnir-meshd starting"' 2>/dev/null | tail -1)
-  stamp=$(printf '%s' "$line" | sed -n 's/.*build=\([^ ,]*\).*/\1/p')
-  if [ "$stamp" = "$EXPECT_BUILD" ] && [ -n "$stamp" ]; then
-    echo "  OK   $name ($ip): build=$stamp"
-  else
-    echo "  FAIL $name ($ip): build=${stamp:-<no banner in /log yet>} (expected $EXPECT_BUILD)"
-    mismatch=1
-  fi
+  # `mjolnir-meshd starting` is contiguous in the message body; the stamp is the
+  # quoted value after `build` (ANSI escapes sit between `build` and the quote).
+  line=$($SSH "admin@$ip" '/log/print without-paging where message~"mjolnir-meshd starting"' 2>/dev/null | tail -1)
+  stamp=$(printf '%s' "$line" | sed -n 's/.*build[^"]*"\([^"]*\)".*/\1/p')
+  echo "  $name ($ip): build=${stamp:-<no banner in /log — check /log on this node>}"
+  STAMPS+=("$stamp")
 done
-if [ "$mismatch" = 0 ]; then
-  echo ">> ALL NODES IDENTICAL: build=$EXPECT_BUILD  (sha256 $TAR_SHA)"
+first="${STAMPS[0]}"; allsame=1
+for s in "${STAMPS[@]}"; do { [ -n "$s" ] && [ "$s" = "$first" ]; } || allsame=0; done
+if [ "$allsame" = 1 ]; then
+  echo ">> ALL NODES IDENTICAL: build=$first  (tar sha256 $TAR_SHA)"
+  case "$first" in
+    "$EXPECT_BUILD"|"${EXPECT_BUILD%-dirty}") : ;;
+    *) echo "   WARNING: nodes agree on $first but expected ~$EXPECT_BUILD — confirm you deployed the tar you just built";;
+  esac
 else
-  echo ">> SKEW OR UNVERIFIED — nodes are NOT provably identical. Re-run deploy, or check /log on the failing node."
+  echo ">> SKEW OR UNVERIFIED — nodes do NOT all report the same build. Check /log on each node."
 fi
 echo "================ deploy done — check 'endpoint addressable ... 10.254.x' + 'kind=DIRECT' in /log ================"
