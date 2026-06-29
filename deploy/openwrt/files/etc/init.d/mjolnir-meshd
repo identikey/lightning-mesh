@@ -24,13 +24,12 @@ append_peer() {
 start_service() {
 	config_load mjolnir
 
-	local enabled backhaul_iface secret_file babeld babel_config roster mode relay client_iface log_level
+	local enabled backhaul_iface secret_file babel_config roster mode relay client_iface log_level
 	config_get_bool enabled meshd enabled 1
 	[ "$enabled" -gt 0 ] || return 0
 
 	config_get backhaul_iface meshd backhaul_iface 'br-mesh'
 	config_get secret_file    meshd secret_file    '/etc/mjolnir/secret'
-	config_get babeld         meshd babeld         'babeld'
 	config_get babel_config   meshd babel_config   '/etc/mjolnir/babeld.conf'
 	config_get roster         meshd roster         ''
 	config_get mode           meshd mode           'lan'
@@ -44,7 +43,6 @@ start_service() {
 	procd_set_param command "$PROG" mesh
 	procd_append_param command --secret-file "$secret_file"
 	procd_append_param command --backhaul-iface "$backhaul_iface"
-	procd_append_param command --babeld "$babeld"
 	procd_append_param command --babel-config "$babel_config"
 	[ -n "$roster" ]         && procd_append_param command --roster "$roster"
 	# Client-facing bridge for this node's devices; meshd puts the claimed /24's .1

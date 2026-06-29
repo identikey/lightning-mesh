@@ -30,7 +30,7 @@ use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::{Gossip, TopicId};
 use mjolnir_mesh::tun::{spawn_tunnel, DatagramConn, EncapError, Tunnel};
 use mjolnir_mesh::babel::{
-    render_babeld_conf, write_atomic_if_changed, BabelConfigInputs, BabelSupervisor,
+    render_babeld_conf, write_atomic_if_changed, BabelConfigInputs,
 };
 use mjolnir_mesh::{
     alloc, merge_subnet_claim, GossipError, GossipSync, GossipTransport, MergeResult, PeerEntry,
@@ -155,9 +155,6 @@ enum Command {
         /// if missing. babeld is started once there's a live tunnel to route over.
         #[arg(long, default_value = "/etc/mjolnir/babeld.conf")]
         babel_config: PathBuf,
-        /// babeld binary to supervise (PATH name or absolute path).
-        #[arg(long, default_value = "babeld")]
-        babeld: PathBuf,
         /// The local client-facing interface (bridge) serving this node's devices.
         /// On claiming a /24, meshd assigns `<net>.1/24` here as a connected route so
         /// babeld redistributes a real route and inbound mesh traffic for the /24 is
@@ -254,7 +251,6 @@ async fn main() -> Result<()> {
             roster,
             peer,
             babel_config,
-            babeld,
             client_iface,
             // backhaul_iface was used before bind in `main`; the resolved name
             // flows in via `l2_backhaul`.
@@ -270,7 +266,6 @@ async fn main() -> Result<()> {
                 roster,
                 peer,
                 babel_config,
-                babeld,
                 client_iface,
                 lan,
                 l2,
@@ -437,7 +432,6 @@ async fn run_mesh(
     roster_path: Option<PathBuf>,
     peer_args: Vec<String>,
     babel_config: PathBuf,
-    babeld: PathBuf,
     client_iface: String,
     lan: bool,
     l2_backhaul: Option<String>,
@@ -563,18 +557,18 @@ async fn run_mesh(
         }
     };
 
-    // babeld supervision (mjolnir-mesh-83k): a reconciler regenerates babeld.conf
+    // babeld config reconciler (mjolnir-mesh-83k / m8t): regenerates babeld.conf
     // from the live tunnel set (TunnelRegistry) plus our subnet claim (ClaimStore)
-    // and starts/SIGHUPs babeld as they change. babeld absence is non-fatal.
-    let babel_sup = Arc::new(BabelSupervisor::new(babel_config.clone(), babeld));
+    // and triggers the `mjolnir-babeld` procd service to (re)load on change. procd
+    // — not meshd — owns the babeld PROCESS (start/respawn/boot/stop); meshd only
+    // owns the config. babeld absence is non-fatal.
     let babel_task = {
-        let sup = babel_sup.clone();
         let registry = registry.clone();
         let claims = claims.clone();
         let me = self_id_str.clone();
         let l2 = l2_backhaul.clone();
         tokio::spawn(async move {
-            babel_reconciler(sup, registry, claims, me, babel_config, l2).await
+            babel_reconciler(registry, claims, me, babel_config, l2).await
         })
     };
     if let Some(iface) = &l2_backhaul {
@@ -633,9 +627,8 @@ async fn run_mesh(
         t.abort();
     }
     babel_task.abort();
-    if let Err(e) = babel_sup.shutdown().await {
-        warn!("babeld shutdown error: {e}");
-    }
+    // babeld runs as its own procd service (mjolnir-babeld); intentionally NOT
+    // stopped here so a meshd restart doesn't churn it (mjolnir-mesh-m8t).
     router.shutdown().await.context("router shutdown")?;
     Ok(())
 }
@@ -978,14 +971,42 @@ fn enable_ip_forwarding() {}
 
 // --- babeld supervision (mjolnir-mesh-83k) -------------------------------
 
-/// Reconcile babeld against live mesh state. Every few seconds it renders
-/// babeld.conf from the current tunnel interfaces ([`TunnelRegistry`]) and our
-/// local subnet claim ([`ClaimStore`]); it starts babeld once there's a tunnel
-/// to route over and SIGHUPs it whenever the rendered config changes. babeld
-/// being absent or unstartable is non-fatal — routing is disabled but the TUN
-/// data plane keeps running.
+/// Run a procd action (`start`/`stop`/`restart`/`enable`) on the `mjolnir-babeld`
+/// service. procd owns the babeld PROCESS lifecycle; meshd only renders the config
+/// and triggers reloads through here (mjolnir-mesh-m8t). Returns whether it
+/// succeeded. Best-effort: a failure is logged, not fatal.
+#[cfg(target_os = "linux")]
+async fn babeld_service(action: &str) -> bool {
+    match tokio::process::Command::new("/etc/init.d/mjolnir-babeld")
+        .arg(action)
+        .status()
+        .await
+    {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            warn!(action, code = ?s.code(), "mjolnir-babeld action failed");
+            false
+        }
+        Err(e) => {
+            warn!(action, "could not run /etc/init.d/mjolnir-babeld: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn babeld_service(_action: &str) -> bool {
+    false
+}
+
+/// Reconcile babeld's CONFIG against live mesh state (mjolnir-mesh-m8t). Every few
+/// seconds it renders babeld.conf from the current tunnel interfaces
+/// ([`TunnelRegistry`]) and our local subnet claim ([`ClaimStore`]). procd owns the
+/// babeld process via the `mjolnir-babeld` service; this loop only enables/starts it
+/// once there's an interface to route over, asks procd to restart it when the
+/// rendered config changes, and stops it when no interface remains. babeld being
+/// absent is non-fatal — routing is disabled but the data plane keeps running.
 async fn babel_reconciler(
-    sup: Arc<BabelSupervisor>,
     registry: TunnelRegistry,
     claims: ClaimStore,
     self_id: String,
@@ -1003,8 +1024,7 @@ async fn babel_reconciler(
         warn!("could not create babeld config dir {}: {e}", parent.display());
     }
 
-    let mut spawned = false;
-    let mut babeld_unavailable = false;
+    let mut started = false;
     loop {
         // Snapshot the live tunnel interfaces and our own claimed subnet.
         let mut ifaces: Vec<String> = {
@@ -1034,43 +1054,28 @@ async fn babel_reconciler(
         match write_atomic_if_changed(&config_path, &conf) {
             Ok(changed) => {
                 if !have_ifaces {
-                    // babeld refuses to run with zero interfaces ("Eek... asked to
-                    // run on no interfaces!") and exits. When nothing is up, keep
-                    // babeld stopped rather than restart-looping it into an empty
-                    // config; it starts again once an interface reappears.
-                    if spawned {
+                    // babeld refuses to run on zero interfaces and exits; stop the
+                    // service until one returns (only reachable in dynamic --internet
+                    // mode — in LAN mode the L2 backhaul is permanent).
+                    if started {
                         warn!("no live interfaces — stopping babeld until one returns");
-                        let _ = sup.shutdown().await;
-                        spawned = false;
+                        babeld_service("stop").await;
+                        started = false;
                     }
-                } else if !spawned && !babeld_unavailable {
-                    // Start babeld once there's at least one interface to route over.
-                    match sup.spawn().await {
-                        Ok(()) => {
-                            spawned = true;
-                            let count = ifaces.len() + l2_refs.len();
-                            info!(config = %config_path.display(), ifaces = count, "babeld started");
-                        }
-                        Err(e) => {
-                            babeld_unavailable = true;
-                            warn!("could not start babeld (cross-site routing disabled): {e}");
-                        }
+                } else if !started {
+                    // procd owns the process: enable (survive reboot) then start it.
+                    babeld_service("enable").await;
+                    if babeld_service("restart").await {
+                        started = true;
+                        let count = ifaces.len() + l2_refs.len();
+                        info!(config = %config_path.display(), ifaces = count, "babeld started (procd: mjolnir-babeld)");
                     }
-                } else if spawned {
-                    // babeld 1.13 exits on a SIGHUP reload in this container, so
-                    // RESTART on config change rather than signal — and respawn it
-                    // if it has died (the reconciler is also the keep-alive).
-                    if sup.has_exited().await {
-                        warn!("babeld exited — restarting");
-                        if let Err(e) = sup.restart().await {
-                            warn!("babeld restart failed: {e}");
-                        }
-                    } else if changed {
-                        info!("babeld config changed — restarting babeld");
-                        if let Err(e) = sup.restart().await {
-                            warn!("babeld restart failed: {e}");
-                        }
-                    }
+                } else if changed {
+                    // Config changed → ask procd to restart babeld (babeld 1.13 exits
+                    // on SIGHUP, so a clean restart, not a signal-reload). procd
+                    // independently respawns it on crash — meshd no longer keep-alives.
+                    info!("babeld config changed — restarting babeld (procd)");
+                    babeld_service("restart").await;
                 }
             }
             Err(e) => warn!("failed to write babeld config {}: {e}", config_path.display()),
