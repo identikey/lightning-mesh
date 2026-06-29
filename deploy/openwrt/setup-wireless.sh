@@ -83,8 +83,19 @@ uci set wireless.clientap.network='lan'
 uci set wireless.clientap.encryption='sae-mixed'
 uci set wireless.clientap.key="$CLIENT_KEY"
 
+# --- firewall: put the mesh backhaul in the 'lan' zone so IP *input* (babel hellos,
+# iroh, ping) and client<->mesh *forward* (transit) aren't dropped by OpenWrt's
+# default input=REJECT / forward=REJECT. Without this, the radios associate at L2
+# (ARP resolves) but no IP crosses the mesh and babel never peers. ---
+fw_lan_zone=$(uci show firewall | sed -n 's/^firewall\.\(@zone\[[0-9]*\]\)\.name=.lan./\1/p' | head -1)
+if [ -n "$fw_lan_zone" ]; then
+	uci -q get firewall.$fw_lan_zone.network | grep -qw mesh || uci add_list firewall.$fw_lan_zone.network='mesh'
+fi
+
 uci commit network
 uci commit wireless
+uci commit firewall
+fw4 reload >/dev/null 2>&1 || /etc/init.d/firewall reload >/dev/null 2>&1
 
 cat <<EOF
 >> committed. Now:
