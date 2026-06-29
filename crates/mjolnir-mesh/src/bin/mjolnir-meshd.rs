@@ -158,12 +158,13 @@ enum Command {
         /// babeld binary to supervise (PATH name or absolute path).
         #[arg(long, default_value = "babeld")]
         babeld: PathBuf,
-        /// The container's gateway to the router (veth peer). When this node
-        /// claims a /24, meshd installs a kernel route for it via this gateway,
-        /// so babeld can redistribute the /24 and inbound mesh traffic reaches
-        /// the router for local-client delivery. Matches container-net.rsc.
-        #[arg(long, default_value = "172.20.0.1")]
-        client_gateway: Ipv4Addr,
+        /// The local client-facing interface (bridge) serving this node's devices.
+        /// On claiming a /24, meshd assigns `<net>.1/24` here as a connected route so
+        /// babeld redistributes a real route and inbound mesh traffic for the /24 is
+        /// delivered on-link (mjolnir-mesh-e4r). Native OpenWrt has no container/veth
+        /// gateway — the router sits directly on the client L2.
+        #[arg(long, default_value = "br-lan")]
+        client_iface: String,
         /// The container interface on the shared L2 segment (the veth facing the
         /// other mesh nodes). meshd self-assigns this node's derived IPv4 backhaul
         /// address here so peers discover + connect directly over the LAN, no DHCP.
@@ -254,7 +255,7 @@ async fn main() -> Result<()> {
             peer,
             babel_config,
             babeld,
-            client_gateway,
+            client_iface,
             // backhaul_iface was used before bind in `main`; the resolved name
             // flows in via `l2_backhaul`.
             backhaul_iface: _,
@@ -270,7 +271,7 @@ async fn main() -> Result<()> {
                 peer,
                 babel_config,
                 babeld,
-                client_gateway,
+                client_iface,
                 lan,
                 l2,
             )
@@ -437,7 +438,7 @@ async fn run_mesh(
     peer_args: Vec<String>,
     babel_config: PathBuf,
     babeld: PathBuf,
-    client_gateway: Ipv4Addr,
+    client_iface: String,
     lan: bool,
     l2_backhaul: Option<String>,
 ) -> Result<()> {
@@ -550,7 +551,7 @@ async fn run_mesh(
                 let store = claims.clone();
                 let me = self_id_str.clone();
                 tokio::spawn(async move {
-                    claim_manager(sync, store, me, client_gateway, reclaim_rx).await
+                    claim_manager(sync, store, me, client_iface, reclaim_rx).await
                 })
             };
 
@@ -744,26 +745,27 @@ async fn claim_manager<T: GossipTransport>(
     sync: Arc<GossipSync<T>>,
     store: ClaimStore,
     self_id: String,
-    client_gateway: Ipv4Addr,
+    client_iface: String,
     mut reclaim_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
 ) {
     tokio::time::sleep(CLAIM_WARMUP).await;
-    claim_and_publish(&sync, &store, &self_id, client_gateway).await;
+    claim_and_publish(&sync, &store, &self_id, &client_iface).await;
     while reclaim_rx.recv().await.is_some() {
         // Brief pause so a conflict storm settles before we re-pick.
         tokio::time::sleep(Duration::from_secs(1)).await;
         info!("lost our subnet claim in a conflict — re-claiming");
-        claim_and_publish(&sync, &store, &self_id, client_gateway).await;
+        claim_and_publish(&sync, &store, &self_id, &client_iface).await;
     }
 }
 
-/// Pick a free /24 (avoiding known claims), record it, install its local route
-/// (so babeld can redistribute it), and gossip the claim.
+/// Pick a free /24 (avoiding known claims), record it, assign its `.1` to the
+/// client interface as a connected route (so babeld can redistribute it), and
+/// gossip the claim.
 async fn claim_and_publish<T: GossipTransport>(
     sync: &GossipSync<T>,
     store: &ClaimStore,
     self_id: &str,
-    client_gateway: Ipv4Addr,
+    client_iface: &str,
 ) {
     let claimed: HashSet<Ipv4Net> = {
         let s = store.lock().expect("claim store poisoned");
@@ -808,39 +810,60 @@ async fn claim_and_publish<T: GossipTransport>(
         Err(e) => warn!(subnet = %net, "claimed subnet but gossip publish failed: {e}"),
     }
 
-    // Install the kernel route for our /24 toward the router, so babeld has a
-    // concrete route to redistribute and inbound mesh traffic for it reaches
-    // the local LAN (mjolnir-mesh-df4).
-    install_client_route(net, client_gateway).await;
+    // Assign the /24's gateway address (.1) to the client interface, so babeld has
+    // a concrete connected route to redistribute and inbound mesh traffic for the
+    // /24 is delivered on-link (mjolnir-mesh-e4r, supersedes the df4 gateway route).
+    assign_client_addr(net, client_iface).await;
 }
 
-/// Install a kernel route `subnet via gateway` in this (container) netns. Gives
-/// babeld a concrete route to redistribute for our claimed /24 and routes
-/// inbound mesh traffic for it back to the router for local-client delivery.
-/// Idempotent in effect: an already-present route (EEXIST) is fine.
+/// Assign this node's claimed /24 gateway address (`<net>.1/prefix`) to the local
+/// client interface, giving babeld a concrete *connected* route to redistribute and
+/// letting inbound mesh traffic for the /24 be delivered on-link. Replaces the old
+/// container-gateway route hop (mjolnir-mesh-e4r): native OpenWrt has no veth
+/// gateway — the router is itself on the client L2. Idempotent in effect: an
+/// already-present address (EEXIST) is fine. Best-effort: a missing interface is
+/// logged, not fatal.
 #[cfg(target_os = "linux")]
-async fn install_client_route(subnet: Ipv4Net, gateway: Ipv4Addr) {
-    use rtnetlink::{new_connection, RouteMessageBuilder};
+async fn assign_client_addr(subnet: Ipv4Net, iface: &str) {
+    use rtnetlink::new_connection;
+    // The router takes `.1` of its claimed /24.
+    let gw = Ipv4Addr::from(u32::from(subnet.network()) + 1);
+    let prefix = subnet.prefix_len();
+    let index = match std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        Some(i) => i,
+        None => {
+            warn!(%subnet, iface, "client interface not found — cannot assign client subnet address");
+            return;
+        }
+    };
     let (connection, handle, _) = match new_connection() {
         Ok(c) => c,
         Err(e) => {
-            warn!(%subnet, "netlink connect for client route failed: {e}");
+            warn!(%subnet, "netlink connect for client address failed: {e}");
             return;
         }
     };
     tokio::spawn(connection);
-    let route = RouteMessageBuilder::<Ipv4Addr>::new()
-        .destination_prefix(subnet.network(), subnet.prefix_len())
-        .gateway(gateway)
-        .build();
-    match handle.route().add(route).execute().await {
-        Ok(()) => info!(%subnet, %gateway, "installed client subnet route"),
-        Err(e) => warn!(%subnet, %gateway, "could not install client route (may already exist): {e}"),
+    match handle
+        .address()
+        .add(index, std::net::IpAddr::V4(gw), prefix)
+        .execute()
+        .await
+    {
+        Ok(()) => {
+            info!(%subnet, %gw, iface, "assigned client subnet gateway address (connected route for babeld)")
+        }
+        Err(e) => {
+            warn!(%subnet, %gw, iface, "could not assign client address (may already exist): {e}")
+        }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn install_client_route(_subnet: Ipv4Net, _gateway: Ipv4Addr) {}
+async fn assign_client_addr(_subnet: Ipv4Net, _iface: &str) {}
 
 /// Self-assign this node's derived IPv4 backhaul address (`10.254.0.0/16`, host
 /// from the node id) to the shared-segment interface, so every node has a stable,

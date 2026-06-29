@@ -1,0 +1,33 @@
+# UCI config for mjolnir-meshd. Read by /etc/init.d/mjolnir-meshd.
+# Reload after edits:  service mjolnir-meshd restart
+
+config meshd 'meshd'
+	option enabled '1'
+
+	# The L2 the overlay peers over (meshd self-assigns its 10.254.x backhaul
+	# address here and babel runs over it as `type wired`).
+	#   - WIRED bench bring-up: set to the bridge carrying the management switch,
+	#     usually 'br-lan'.
+	#   - 802.11s radio backhaul: use 'br-mesh' (created by setup-wireless.sh).
+	option backhaul_iface 'br-mesh'
+
+	# Client-facing bridge serving this node's devices. meshd assigns the claimed
+	# /24's .1 here as a connected route babeld redistributes. A dedicated client
+	# bridge is cleanest in production; 'br-lan' is fine for the bench.
+	option client_iface 'br-lan'
+
+	option secret_file '/etc/mjolnir/secret'
+	option babeld 'babeld'
+	option babel_config '/etc/mjolnir/babeld.conf'
+
+	# Transport mode: 'lan' (offline mDNS, no relay) or 'internet' (n0/relay).
+	option mode 'lan'
+	# option relay 'https://your-relay.example/'   # only when mode='internet'
+
+	option log_level 'info'
+
+	# Peers = the OTHER nodes' iroh node-ids (64-hex) or address blobs. Repeat.
+	# Print a node's id with:
+	#   mjolnir-meshd id --secret-file /etc/mjolnir/secret
+	# list peer '<node-id-of-another-router>'
+	# list peer '<node-id-of-another-router>'

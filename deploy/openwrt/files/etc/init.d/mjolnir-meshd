@@ -1,0 +1,71 @@
+#!/bin/sh /etc/rc.common
+# procd init script for mjolnir-meshd — native OpenWrt mesh overlay daemon.
+# Config lives in /etc/config/mjolnir (UCI). See deploy/openwrt/README.md and
+# beads mjolnir-mesh-0xu / mjolnir-mesh-w1l (Cudy MT7981 fleet).
+#
+# Install:
+#   scp this file -> /etc/init.d/mjolnir-meshd ; chmod +x ; /etc/init.d/mjolnir-meshd enable
+#   scp the static binary -> /usr/bin/mjolnir-meshd
+#   opkg install babeld kmod-tun
+#   edit /etc/config/mjolnir (peers + backhaul_iface), then: service mjolnir-meshd start
+
+USE_PROCD=1
+# Start late so the backhaul L2 (br-mesh / 802.11s, or the wired bridge) exists.
+# meshd also self-retries for ~20s waiting for the iface, so a small race is fine.
+START=95
+STOP=10
+
+PROG=/usr/bin/mjolnir-meshd
+
+append_peer() {
+	procd_append_param command --peer "$1"
+}
+
+start_service() {
+	config_load mjolnir
+
+	local enabled backhaul_iface secret_file babeld babel_config roster mode relay client_iface log_level
+	config_get_bool enabled meshd enabled 1
+	[ "$enabled" -gt 0 ] || return 0
+
+	config_get backhaul_iface meshd backhaul_iface 'br-mesh'
+	config_get secret_file    meshd secret_file    '/etc/mjolnir/secret'
+	config_get babeld         meshd babeld         'babeld'
+	config_get babel_config   meshd babel_config   '/etc/mjolnir/babeld.conf'
+	config_get roster         meshd roster         ''
+	config_get mode           meshd mode           'lan'
+	config_get relay          meshd relay          ''
+	config_get client_iface   meshd client_iface   'br-lan'
+	config_get log_level      meshd log_level      'info'
+
+	mkdir -p "$(dirname "$secret_file")" "$(dirname "$babel_config")" 2>/dev/null
+
+	procd_open_instance meshd
+	procd_set_param command "$PROG" mesh
+	procd_append_param command --secret-file "$secret_file"
+	procd_append_param command --backhaul-iface "$backhaul_iface"
+	procd_append_param command --babeld "$babeld"
+	procd_append_param command --babel-config "$babel_config"
+	[ -n "$roster" ]         && procd_append_param command --roster "$roster"
+	# Client-facing bridge for this node's devices; meshd puts the claimed /24's .1
+	# here as a connected route babeld redistributes (mjolnir-mesh-e4r).
+	procd_append_param command --client-iface "$client_iface"
+	config_list_foreach meshd peer append_peer
+
+	# Transport mode. Default (lan) = offline mDNS, no relay. internet = n0/relay.
+	case "$mode" in
+		internet) procd_append_param command --internet ;;
+	esac
+	[ -n "$relay" ] && procd_append_param command --relay "$relay"
+
+	procd_set_param env RUST_LOG="$log_level"
+	# Supervise: restart forever (final 0 = infinite retries) after a 5s settle.
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger mjolnir
+}
