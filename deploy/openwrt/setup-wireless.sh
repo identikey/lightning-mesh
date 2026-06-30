@@ -23,6 +23,7 @@ CLIENT_CHANNEL_5G="${CLIENT_CHANNEL_5G:-36}"
 CLIENT_AP_2G="${CLIENT_AP_2G:-1}"            # 1 => also run a client AP on 2.4 GHz (concurrent with the mesh-point) for 2.4-only IoT/ESP32; 0 => backhaul-only
 CLIENT_AP_2G_ENC="${CLIENT_AP_2G_ENC:-psk2}" # WPA2-PSK by default: most ESP32/cheap IoT lack WPA3-SAE. Set to 'sae-mixed' to match 5 GHz, or 'none' for open.
 COUNTRY="${COUNTRY:-DE}"                  # regulatory domain — REQUIRED, or the radios won't initiate (vifs never appear)
+DISTANCE="${DISTANCE:-}"                  # metres to the farthest mesh peer; sets ACK timeout for long/foliage links. empty = driver default
 
 # Discover which radio is 2.4 vs 5 GHz by its 'band' option.
 radio_2g=""; radio_5g=""
@@ -52,6 +53,8 @@ uci set network.br_mesh.type='bridge'
 uci set wireless.$radio_2g.channel="$MESH_CHANNEL_2G"
 uci set wireless.$radio_2g.country="$COUNTRY"
 uci set wireless.$radio_2g.disabled='0'
+# Long/foliage links: widen the ACK timeout so distant peers aren't dropped (if=guard keeps set -e happy when unset).
+if [ -n "$DISTANCE" ]; then uci set wireless.$radio_2g.distance="$DISTANCE"; fi
 uci set wireless.$radio_5g.channel="$CLIENT_CHANNEL_5G"
 uci set wireless.$radio_5g.country="$COUNTRY"
 uci set wireless.$radio_5g.disabled='0'
@@ -119,9 +122,21 @@ uci commit wireless
 uci commit firewall
 fw4 reload >/dev/null 2>&1 || /etc/init.d/firewall reload >/dev/null 2>&1
 
+# --- persist: kill WiFi power-save on the 802.11s backhaul iface (mt76 mesh+PS = peering/latency flaps) ---
+# Hotplug fires when `wifi reload` brings the mesh-point iface up, so it survives reboots/reloads.
+mkdir -p /etc/hotplug.d/net
+cat > /etc/hotplug.d/net/30-mesh-powersave <<'HOTPLUG'
+#!/bin/sh
+[ "$ACTION" = add ] || exit 0
+case "$(iw dev "$DEVICENAME" info 2>/dev/null | sed -n 's/^[[:space:]]*type //p')" in
+	"mesh point") iw dev "$DEVICENAME" set power_save off ;;
+esac
+HOTPLUG
+chmod +x /etc/hotplug.d/net/30-mesh-powersave
+
 cat <<EOF
 >> committed. Now:
-     wifi reload
+     wifi reload                              # brings up mesh0; hotplug auto-disables power-save on it
    Verify the island + bridge:
      iw dev                                  # find the mesh ifname (mode 'mesh point')
      iw dev <mesh-ifname> station dump       # peers appear once another node is up

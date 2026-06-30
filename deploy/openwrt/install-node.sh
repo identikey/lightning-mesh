@@ -2,6 +2,9 @@
 # Push mjolnir-meshd + its init/config to a freshly-flashed OpenWrt node and
 # install deps. Idempotent — safe to re-run. See deploy/openwrt/README.md.
 #
+# RUN OVER ETHERNET / out-of-band. The wpad-basic->wpad-mesh swap and setup-wireless
+# bounce wifi; SSHing in over the wifi you're reconfiguring will cut your own session.
+#
 # Usage:  deploy/openwrt/install-node.sh root@<node-ip>
 set -euo pipefail
 
@@ -28,6 +31,18 @@ if command -v apk >/dev/null 2>&1; then
   apk update && apk add babeld && apk add kmod-tun || echo "WARN: babeld installed; kmod-tun skipped (not needed for the LAN bench)"
 else
   opkg update && opkg install babeld && opkg install kmod-tun || echo "WARN: babeld installed; kmod-tun skipped (not needed for the LAN bench)"
+fi'
+
+echo ">> wpad-mesh-mbedtls (802.11s SAE) — swaps stock wpad-basic-mbedtls, which lacks mesh"
+# Removing wpad bounces wifi; fine — nodes are managed out-of-band over eth. Open mesh
+# (no MESH_KEY) needs none of this; only SAE backhaul requires the mesh-capable wpad.
+ssh "$HOST" '
+if command -v apk >/dev/null 2>&1; then
+  apk del wpad-basic-mbedtls 2>/dev/null
+  apk add wpad-mesh-mbedtls || echo "WARN: wpad-mesh-mbedtls missing — SAE mesh wont auth (open mesh still works)"
+else
+  opkg remove wpad-basic-mbedtls 2>/dev/null
+  opkg update && opkg install wpad-mesh-mbedtls || echo "WARN: wpad-mesh-mbedtls missing — SAE mesh wont auth (open mesh still works)"
 fi'
 
 echo ">> babeld lifecycle -> procd (m8t): disable the stock babeld service, use mjolnir-babeld"
