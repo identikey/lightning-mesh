@@ -1030,18 +1030,23 @@ fn enable_ip_forwarding() {}
 /// succeeded. Best-effort: a failure is logged, not fatal.
 #[cfg(target_os = "linux")]
 async fn babeld_service(action: &str) -> bool {
-    match tokio::process::Command::new("/etc/init.d/mjolnir-babeld")
-        .arg(action)
-        .status()
-        .await
-    {
-        Ok(s) if s.success() => true,
-        Ok(s) => {
+    let mut cmd = tokio::process::Command::new("/etc/init.d/mjolnir-babeld");
+    cmd.arg(action);
+    // Hard 10s timeout: a procd/ubus service call has wedged under rapid
+    // invocation (qz9). Never let one stall the reconciler — bail and let procd
+    // (which independently respawns + file-watches the config) sort itself out.
+    match tokio::time::timeout(Duration::from_secs(10), cmd.status()).await {
+        Ok(Ok(s)) if s.success() => true,
+        Ok(Ok(s)) => {
             warn!(action, code = ?s.code(), "mjolnir-babeld action failed");
             false
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(action, "could not run /etc/init.d/mjolnir-babeld: {e}");
+            false
+        }
+        Err(_) => {
+            warn!(action, "mjolnir-babeld action timed out after 10s — leaving it to procd");
             false
         }
     }
@@ -1066,6 +1071,10 @@ async fn babel_reconciler(
     config_path: PathBuf,
     l2_backhaul: Option<String>,
 ) {
+    // Debounce window: wait this long for the mesh state to settle before
+    // (re)writing babeld.conf, so a convergence burst doesn't thrash babeld (qz9).
+    const BABEL_SETTLE: Duration = Duration::from_secs(2);
+
     // The shared-L2 backhaul interface, if any, is a permanent `type wired`
     // babel link (mjolnir-mesh-auu) — present from startup, so babeld runs
     // continuously instead of flapping with the per-peer tunnels.
@@ -1078,6 +1087,7 @@ async fn babel_reconciler(
     }
 
     let mut started = false;
+    let mut last_rendered: Option<String> = None;
     loop {
         // Snapshot the live tunnel interfaces and our own claimed subnet.
         let mut ifaces: Vec<String> = {
@@ -1099,36 +1109,48 @@ async fn babel_reconciler(
         let inputs =
             BabelConfigInputs::new(local_subnet, &iface_refs).l2_interfaces(&l2_refs);
         let conf = render_babeld_conf(&inputs);
+
+        // Debounce (qz9): when the desired config changes, let the mesh state
+        // settle before writing — a tunnel coming up and then a subnet claim
+        // landing are two changes seconds apart, and rewriting on each one makes
+        // procd thrash babeld (and historically meshd wedged driving those
+        // restarts). Wait one settle window, re-render, and only reconcile a
+        // config that held steady across it.
+        if last_rendered.as_deref() != Some(conf.as_str()) {
+            last_rendered = Some(conf);
+            tokio::time::sleep(BABEL_SETTLE).await;
+            continue;
+        }
+
         // babeld needs at least one interface — the L2 backhaul (if present) or a
         // live tunnel. With an L2 backhaul this is always true, so babeld runs
         // continuously rather than flapping with the tunnel set.
         let have_ifaces = !ifaces.is_empty() || !l2_refs.is_empty();
 
         match write_atomic_if_changed(&config_path, &conf) {
-            Ok(changed) => {
+            Ok(_changed) => {
+                // procd owns babeld restarts now: the mjolnir-babeld init watches
+                // this file (`procd_set_param file`) and restarts babeld whenever
+                // it changes. meshd only (a) starts babeld once when the first
+                // valid config is ready and (b) stops it on zero interfaces
+                // (dynamic --internet mode; LAN keeps the L2 backhaul permanently).
+                // meshd no longer drives per-change restarts — that synchronous
+                // procd loop wedged the daemon (qz9).
                 if !have_ifaces {
-                    // babeld refuses to run on zero interfaces and exits; stop the
-                    // service until one returns (only reachable in dynamic --internet
-                    // mode — in LAN mode the L2 backhaul is permanent).
                     if started {
                         warn!("no live interfaces — stopping babeld until one returns");
                         babeld_service("stop").await;
                         started = false;
                     }
                 } else if !started {
-                    // procd owns the process: enable (survive reboot) then start it.
+                    // Enable (survive reboot) then start it once; from here procd's
+                    // file-watch handles every config-change restart.
                     babeld_service("enable").await;
                     if babeld_service("restart").await {
                         started = true;
                         let count = ifaces.len() + l2_refs.len();
-                        info!(config = %config_path.display(), ifaces = count, "babeld started (procd: mjolnir-babeld)");
+                        info!(config = %config_path.display(), ifaces = count, "babeld started (procd: mjolnir-babeld); procd watches the config from here");
                     }
-                } else if changed {
-                    // Config changed → ask procd to restart babeld (babeld 1.13 exits
-                    // on SIGHUP, so a clean restart, not a signal-reload). procd
-                    // independently respawns it on crash — meshd no longer keep-alives.
-                    info!("babeld config changed — restarting babeld (procd)");
-                    babeld_service("restart").await;
                 }
             }
             Err(e) => warn!("failed to write babeld config {}: {e}", config_path.display()),
