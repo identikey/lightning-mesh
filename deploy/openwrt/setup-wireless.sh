@@ -1,6 +1,8 @@
 #!/bin/sh
 # Configure the radio layer on an MT7981 OpenWrt node for the mjolnir mesh:
-#   - 2.4 GHz radio  -> 802.11s mesh-point backhaul, bridged into br-mesh
+#   - 2.4 GHz radio  -> 802.11s mesh-point backhaul (bridged into br-mesh)
+#                       + a concurrent client AP on the same channel (for 2.4-only
+#                         IoT/ESP32) unless CLIENT_AP_2G=0
 #   - 5 GHz radio    -> client AP on br-lan
 # Band-detecting, so it's robust to radio0/radio1 ordering across units.
 #
@@ -18,6 +20,8 @@ MESH_CHANNEL_2G="${MESH_CHANNEL_2G:-6}"  # one shared 2.4 GHz channel mesh-wide
 CLIENT_SSID="${CLIENT_SSID:-mjolnir}"
 CLIENT_KEY="${CLIENT_KEY:-changeme-client}"
 CLIENT_CHANNEL_5G="${CLIENT_CHANNEL_5G:-36}"
+CLIENT_AP_2G="${CLIENT_AP_2G:-1}"            # 1 => also run a client AP on 2.4 GHz (concurrent with the mesh-point) for 2.4-only IoT/ESP32; 0 => backhaul-only
+CLIENT_AP_2G_ENC="${CLIENT_AP_2G_ENC:-psk2}" # WPA2-PSK by default: most ESP32/cheap IoT lack WPA3-SAE. Set to 'sae-mixed' to match 5 GHz, or 'none' for open.
 COUNTRY="${COUNTRY:-DE}"                  # regulatory domain — REQUIRED, or the radios won't initiate (vifs never appear)
 
 # Discover which radio is 2.4 vs 5 GHz by its 'band' option.
@@ -82,6 +86,24 @@ uci set wireless.clientap.ssid="$CLIENT_SSID"
 uci set wireless.clientap.network='lan'
 uci set wireless.clientap.encryption='sae-mixed'
 uci set wireless.clientap.key="$CLIENT_KEY"
+
+# --- 2.4 GHz client AP, concurrent with the mesh-point on the SAME radio/channel ---
+# Most ESP32s (classic/S2/S3/C3/C6) and a lot of cheap IoT are 2.4-GHz-only; the
+# 5 GHz AP alone locks them out. mt76 runs a mesh-point + AP concurrently on one
+# radio — they share channel $MESH_CHANNEL_2G and its airtime (fine for low-bandwidth
+# IoT; steer heavy clients to 5 GHz). Same SSID/key as the 5 GHz AP so a device roams
+# across bands on one L2. Default WPA2-PSK for max IoT compatibility. CLIENT_AP_2G=0
+# restores the old backhaul-only behaviour. (mjolnir-mesh-ab4)
+uci -q delete wireless.clientap2g || true
+if [ "$CLIENT_AP_2G" = 1 ]; then
+	uci set wireless.clientap2g='wifi-iface'
+	uci set wireless.clientap2g.device="$radio_2g"
+	uci set wireless.clientap2g.mode='ap'
+	uci set wireless.clientap2g.ssid="$CLIENT_SSID"
+	uci set wireless.clientap2g.network='lan'
+	uci set wireless.clientap2g.encryption="$CLIENT_AP_2G_ENC"
+	[ "$CLIENT_AP_2G_ENC" = none ] || uci set wireless.clientap2g.key="$CLIENT_KEY"
+fi
 
 # --- firewall: put the mesh backhaul in the 'lan' zone so IP *input* (babel hellos,
 # iroh, ping) and client<->mesh *forward* (transit) aren't dropped by OpenWrt's
