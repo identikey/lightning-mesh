@@ -167,8 +167,24 @@ enum Command {
         /// address here so peers discover + connect directly over the LAN, no DHCP.
         #[arg(long, default_value = "eth0")]
         backhaul_iface: String,
+        /// Re-enable per-peer iroh data-plane tunnels in LAN mode (default off —
+        /// LAN data rides the shared-L2 backhaul, babel-routed). Opt-in for the
+        /// mjolnir-mesh-auu retest: native OpenWrt has no duplicate-IP container
+        /// artifact and iroh is pinned to one derived addr+port, so the
+        /// MultipathNotNegotiated churn should be gone — flip this on to verify a
+        /// same-site tunnel stays up. Dials peers by derived address (0yb.1).
+        #[arg(long)]
+        lan_tunnels: bool,
     },
 }
+
+/// Well-known UDP port every mesh node binds its iroh socket to in LAN mode, so
+/// a peer is reachable at a *fully derived* address — `backhaul_addr(node_id)` +
+/// this port — with no mDNS/discovery lookup (mjolnir-mesh-0yb.1). The pinned IP
+/// is unique per node, so the shared port is fine even with several nodes on one
+/// host. If the port is already taken, `build_endpoint` falls back to an
+/// ephemeral bind (losing derivability but staying up).
+const MESH_IROH_PORT: u16 = 49737;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -232,7 +248,9 @@ async fn main() -> Result<()> {
         Some(addr) => Some(addr),
         None if lan && mesh_mode => {
             let ip = mjolnir_mesh::tun::backhaul_addr(&secret.public().to_string());
-            Some(SocketAddr::new(std::net::IpAddr::V4(ip), 0))
+            // Pin a well-known port so peers can dial us at a fully-derived
+            // address (backhaul_addr + MESH_IROH_PORT), no mDNS needed (0yb.1).
+            Some(SocketAddr::new(std::net::IpAddr::V4(ip), MESH_IROH_PORT))
         }
         None => None,
     };
@@ -255,6 +273,7 @@ async fn main() -> Result<()> {
             // backhaul_iface was used before bind in `main`; the resolved name
             // flows in via `l2_backhaul`.
             backhaul_iface: _,
+            lan_tunnels,
         } => {
             // In LAN mode babel routes over the shared-L2 backhaul directly; pass
             // the resolved interface so the reconciler can add it as `type wired`
@@ -268,6 +287,7 @@ async fn main() -> Result<()> {
                 babel_config,
                 client_iface,
                 lan,
+                lan_tunnels,
                 l2,
             )
             .await?
@@ -434,6 +454,7 @@ async fn run_mesh(
     babel_config: PathBuf,
     client_iface: String,
     lan: bool,
+    lan_tunnels: bool,
     l2_backhaul: Option<String>,
 ) -> Result<()> {
     let self_id = endpoint.id();
@@ -585,9 +606,17 @@ async fn run_mesh(
     // churned the per-peer tunnels (mjolnir-mesh-auu). iroh/gossip stays up for
     // the CRDT control plane; only the L3 data-plane tunnels are dropped here.
     let mut dialers = Vec::new();
-    if lan {
+    // LAN default routes data over the shared-L2 backhaul (babel), NOT per-peer
+    // iroh tunnels — they churned in the container era (mjolnir-mesh-auu). The
+    // --lan-tunnels flag re-enables them for the native retest; internet mode
+    // always tunnels.
+    let want_tunnels = !lan || lan_tunnels;
+    if !want_tunnels {
         info!("LAN mode: not dialing per-peer iroh tunnels — babel routes over the shared L2");
     } else {
+        if lan && lan_tunnels {
+            info!("LAN mode: per-peer iroh tunnels ENABLED (--lan-tunnels; mjolnir-mesh-auu retest)");
+        }
         for entry in &peer_entries {
             let addr = match parse_peer(&entry.token) {
                 Ok(a) => a,
@@ -600,6 +629,18 @@ async fn run_mesh(
             if peer == self_id {
                 continue; // our own id appears in the roster — skip
             }
+            // LAN: dial the peer at its DERIVED backhaul address
+            // (10.254.x:MESH_IROH_PORT), reachable over the babel-routed underlay
+            // with no flat-L2 mDNS (mjolnir-mesh-0yb.1). Internet mode keeps
+            // discovery/relay resolution. The pinned port makes this addr
+            // identical to what the peer announces, so the connection still sees
+            // exactly one path (no MultipathNotNegotiated — see auu).
+            let addr = if lan {
+                let ip = mjolnir_mesh::tun::backhaul_addr(&peer.to_string());
+                addr.with_ip_addr(SocketAddr::new(std::net::IpAddr::V4(ip), MESH_IROH_PORT))
+            } else {
+                addr
+            };
             if self_id_str < peer.to_string() {
                 let ep = endpoint.clone();
                 let reg = registry.clone();

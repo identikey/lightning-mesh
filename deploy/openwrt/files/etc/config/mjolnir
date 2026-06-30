@@ -24,6 +24,11 @@ config meshd 'meshd'
 	option mode 'lan'
 	# option relay 'https://your-relay.example/'   # only when mode='internet'
 
+	# auu retest: re-enable per-peer iroh tunnels in LAN mode (default 0 = data
+	# rides the shared-L2 backhaul, babel-routed). Flip to 1 on a test node to
+	# verify the same-site tunnel stays up natively (mjolnir-mesh-auu / 0yb.1).
+	option lan_tunnels '0'
+
 	option log_level 'info'
 
 	# Peers = the OTHER nodes' iroh node-ids (64-hex) or address blobs. Repeat.

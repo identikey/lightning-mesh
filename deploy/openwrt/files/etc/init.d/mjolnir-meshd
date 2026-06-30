@@ -24,7 +24,7 @@ append_peer() {
 start_service() {
 	config_load mjolnir
 
-	local enabled backhaul_iface secret_file babel_config roster mode relay client_iface log_level
+	local enabled backhaul_iface secret_file babel_config roster mode relay client_iface log_level lan_tunnels
 	config_get_bool enabled meshd enabled 1
 	[ "$enabled" -gt 0 ] || return 0
 
@@ -36,6 +36,9 @@ start_service() {
 	config_get relay          meshd relay          ''
 	config_get client_iface   meshd client_iface   'br-lan'
 	config_get log_level      meshd log_level      'info'
+	# auu retest (mjolnir-mesh-auu / 0yb.1): re-enable per-peer iroh tunnels in LAN
+	# mode. Default 0 = data rides the shared-L2 backhaul (babel).
+	config_get_bool lan_tunnels meshd lan_tunnels 0
 
 	mkdir -p "$(dirname "$secret_file")" "$(dirname "$babel_config")" 2>/dev/null
 
@@ -55,6 +58,7 @@ start_service() {
 		internet) procd_append_param command --internet ;;
 	esac
 	[ -n "$relay" ] && procd_append_param command --relay "$relay"
+	[ "$lan_tunnels" -gt 0 ] && procd_append_param command --lan-tunnels
 
 	procd_set_param env RUST_LOG="$log_level"
 	# Supervise: restart forever (final 0 = infinite retries) after a 5s settle.
