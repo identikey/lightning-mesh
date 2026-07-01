@@ -26,34 +26,42 @@ scp -O "$DIR/setup-wireless.sh"               "$HOST:/root/setup-wireless.sh"
 ssh "$HOST" 'chmod +x /etc/init.d/mjolnir-meshd /etc/init.d/mjolnir-babeld /root/setup-wireless.sh'
 
 # UCI config carries node-specific state (peers, client_iface). Install the
-# template ONLY if absent/empty — never clobber a config that's actually been
-# customized (would wipe peers), but DO repair a truncated/empty file left by
-# an interrupted prior run (`-s`, not `-e`, so idempotency actually holds).
-echo ">> uci config (template only if absent/empty — preserves existing peers/config)"
-if ssh "$HOST" '[ -s /etc/config/mjolnir ]'; then
-  echo "   /etc/config/mjolnir present and non-empty — left as-is"
+# template ONLY if it's missing the meshd section — never clobber a config
+# that's actually been customized (would wipe peers), but DO repair a missing,
+# empty, or truncated-before-the-section file left by an interrupted prior
+# run. A plain non-empty check (`-s`) doesn't catch a partial scp that landed
+# a valid-looking prefix without the config stanza, so grep for the marker.
+echo ">> uci config (template only if missing the meshd section — preserves existing peers/config)"
+if ssh "$HOST" "grep -q \"config meshd 'meshd'\" /etc/config/mjolnir 2>/dev/null"; then
+  echo "   /etc/config/mjolnir has a meshd section — left as-is"
 else
   scp -O "$DIR/files/etc/config/mjolnir" "$HOST:/etc/config/mjolnir"
 fi
 
+# apk (OpenWrt 25.12+) vs opkg (older releases) package-manager branch, shared
+# by the babeld/kmod-tun/wpad install steps below so a future tweak to the
+# detection only needs to change one place.
+PM_HELPERS='
+pm_update() { if command -v apk >/dev/null 2>&1; then apk update; else opkg update; fi; }
+pm_install() { if command -v apk >/dev/null 2>&1; then apk add "$1"; else opkg install "$1"; fi; }
+pm_remove() { if command -v apk >/dev/null 2>&1; then apk del "$1" 2>/dev/null; else opkg remove "$1" 2>/dev/null; fi; }
+'
+
 echo ">> deps: babeld (required)"
-# OpenWrt 25.12+ uses apk; older releases use opkg. Needs the node to have internet.
-# babeld is unconditionally required, so its failure is fatal (set -e below).
-ssh "$HOST" '
+# Needs the node to have internet. babeld is unconditionally required for the
+# mesh to route at all, so its failure is fatal — but say so plainly rather
+# than letting a bare `set -e` abort with only the remote package manager's
+# own error text.
+if ! ssh "$HOST" "$PM_HELPERS"'
 set -e
-if command -v apk >/dev/null 2>&1; then
-  apk update && apk add babeld
-else
-  opkg update && opkg install babeld
-fi'
+pm_update
+pm_install babeld'; then
+  echo ">> FATAL: babeld install failed on $HOST — babeld is required for the mesh to route. Fix the node's package feeds/connectivity and re-run install-node.sh." >&2
+  exit 1
+fi
 
 echo ">> deps: kmod-tun (REQUIRED for iroh tunnels: lan_tunnels=1 or --internet)"
-if ssh "$HOST" '
-if command -v apk >/dev/null 2>&1; then
-  apk add kmod-tun
-else
-  opkg install kmod-tun
-fi'; then
+if ssh "$HOST" "$PM_HELPERS"'pm_install kmod-tun'; then
   KMOD_TUN_OK=1
 else
   KMOD_TUN_OK=0
@@ -62,14 +70,9 @@ fi
 echo ">> wpad-mesh-mbedtls (802.11s SAE) — swaps stock wpad-basic-mbedtls, which lacks mesh"
 # Removing wpad bounces wifi; fine — nodes are managed out-of-band over eth. Open mesh
 # (no MESH_KEY) needs none of this; only SAE backhaul requires the mesh-capable wpad.
-ssh "$HOST" '
-if command -v apk >/dev/null 2>&1; then
-  apk del wpad-basic-mbedtls 2>/dev/null
-  apk add wpad-mesh-mbedtls || echo "WARN: wpad-mesh-mbedtls missing — SAE mesh wont auth (open mesh still works)"
-else
-  opkg remove wpad-basic-mbedtls 2>/dev/null
-  opkg update && opkg install wpad-mesh-mbedtls || echo "WARN: wpad-mesh-mbedtls missing — SAE mesh wont auth (open mesh still works)"
-fi'
+ssh "$HOST" "$PM_HELPERS"'
+pm_remove wpad-basic-mbedtls
+pm_install wpad-mesh-mbedtls || echo "WARN: wpad-mesh-mbedtls missing — SAE mesh wont auth (open mesh still works)"'
 
 echo ">> babeld lifecycle -> procd (m8t): disable the stock babeld service, use mjolnir-babeld"
 ssh "$HOST" '
