@@ -90,23 +90,32 @@ for p in $PKGS; do
 done
 echo \"\$missing\"")
 
-# No feeds on the node (fresh box with no WAN)? Push from the local cache.
+# Top up the node's stage from the local cache: push EVERY cached file the
+# node doesn't have staged, not just the packages that failed to fetch —
+# 'apk add --no-network' resolves dependencies only among files it can see,
+# so kmod dependency CLOSURES must be present as staged files on feed-less
+# nodes (mjolnir-mesh-9dj). Staging is cheap and harmless; only packages
+# named by the applier ever get INSTALLED.
+REMOTE_HAVE=$(ssh "$HOST" "ls $STAGE/pkgs 2>/dev/null" || true)
+TO_PUSH=()
+for f in "$PKG_CACHE"/*.apk "$PKG_CACHE"/*.ipk; do
+	[ -f "$f" ] || continue
+	grep -qxF "$(basename "$f")" <<<"$REMOTE_HAVE" || TO_PUSH+=("$f")
+done
+if [ "${#TO_PUSH[@]}" -gt 0 ]; then
+	echo "   pushing ${#TO_PUSH[@]} cached package(s) the node lacks (incl. dependency closures)"
+	scp -O "${TO_PUSH[@]}" "$HOST:$STAGE/pkgs/"
+fi
+
+# Anything REQUIRED but still nowhere (not fetched, not in cache, not installed)?
 if [ -n "${MISSING// /}" ]; then
-	echo "   node couldn't fetch:${MISSING} — trying local cache $PKG_CACHE"
 	for p in $MISSING; do
-		found=0
-		for f in "$PKG_CACHE/$p"-[0-9]*.apk "$PKG_CACHE/$p"_*.ipk; do
-			[ -f "$f" ] || continue
-			scp -O "$f" "$HOST:$STAGE/pkgs/"
-			found=1
-		done
-		if [ "$found" = 0 ]; then
-			if ssh "$HOST" "command -v apk >/dev/null 2>&1 && apk info -e '$p' >/dev/null 2>&1 || opkg list-installed 2>/dev/null | grep -q '^$p '"; then
-				echo "   $p: not prefetched, but already installed on the node — ok"
-			else
-				echo "   WARN: $p unavailable (no feeds on node, not in cache, not installed)."
-				echo "         The applier will warn/skip or refuse depending on the package."
-			fi
+		ls "$PKG_CACHE/$p"-[0-9]*.apk "$PKG_CACHE/$p"_*.ipk >/dev/null 2>&1 && continue
+		if ssh "$HOST" "command -v apk >/dev/null 2>&1 && apk info -e '$p' >/dev/null 2>&1 || opkg list-installed 2>/dev/null | grep -q '^$p '"; then
+			echo "   $p: not prefetched, but already installed on the node — ok"
+		else
+			echo "   WARN: $p unavailable (no feeds on node, not in cache, not installed)."
+			echo "         The applier will warn/skip or refuse depending on the package."
 		fi
 	done
 fi

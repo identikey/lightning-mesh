@@ -67,13 +67,58 @@ pm_installed() { if command -v apk >/dev/null 2>&1; then apk info -e "$1" >/dev/
 # package is always "UNTRUSTED signature" — even an authentic one (verified
 # on 25.12.4 hardware). Integrity comes from the staging chain instead:
 # HTTPS from downloads.openwrt.org into pkg-cache, authenticated SSH to here.
+# Dependency names a package FILE declares (apk v3 `adbdump` 'depends:' block).
+# Version constraints are stripped; negative deps (!conflict) and so:/cmd:
+# pseudo-deps are skipped. Empty output (adbdump absent/old apk) just degrades
+# to the old single-file install.
+pkg_file_deps() {
+	apk adbdump "$1" 2>/dev/null | awk '
+		/^  depends:/ { d=1; next }
+		d && /^    - / { sub(/^    - /,""); sub(/[=<>~].*/,""); if ($0 !~ /^!/ && $0 !~ /:/) print; next }
+		d { exit }'
+}
+
+# The staged-file dependency CLOSURE of package $1 (mjolnir-mesh-9dj):
+# `apk add --no-network` resolves deps only among the files it is HANDED, so a
+# lone kmod file fails when its dep chain isn't installed. Walk depends:
+# breadth-first over stage/pkgs, skipping deps that are already installed, and
+# echo every file apk needs to see in one `add`.
+pkg_closure_files() {
+	local queue="$1" seen=" $1 " files="" name f dep
+	while [ -n "$queue" ]; do
+		name="${queue%% *}"
+		[ "$name" = "$queue" ] && queue="" || queue="${queue#* }"
+		for f in "$STAGE/pkgs/$name"-[0-9]*.apk; do
+			[ -f "$f" ] || continue
+			files="$files $f"
+			for dep in $(pkg_file_deps "$f"); do
+				case "$seen" in *" $dep "*) continue ;; esac
+				seen="$seen$dep "
+				pm_installed "$dep" && continue
+				# no staged file for it? apk will name it in its error — queue anyway
+				queue="${queue:+$queue }$dep"
+			done
+			break
+		done
+	done
+	echo "$files"
+}
+
 pkg_local_install() {
-	local f
+	local f files
 	for f in "$STAGE/pkgs/$1"-[0-9]*.apk "$STAGE/pkgs/$1"_*.ipk; do
 		[ -f "$f" ] || continue
-		log "installing $1 from prefetched $f"
-		if command -v apk >/dev/null 2>&1; then apk add --no-network --allow-untrusted "$f" && return 0
-		else opkg install "$f" && return 0; fi
+		if command -v apk >/dev/null 2>&1; then
+			files=$(pkg_closure_files "$1")
+			log "installing $1 from prefetched:$files"
+			# shellcheck disable=SC2086 -- the file list is intentionally word-split
+			apk add --no-network --allow-untrusted $files && return 0
+		else
+			# opkg resolves deps against its own feeds only; single-file install
+			# covers the no-extra-deps cases (babeld/wpad on an otherwise-stock node)
+			log "installing $1 from prefetched $f"
+			opkg install "$f" && return 0
+		fi
 	done
 	log "no prefetched file for $1 (or local install failed)"
 	return 1
