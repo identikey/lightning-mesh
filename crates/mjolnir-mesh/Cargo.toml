@@ -37,10 +37,20 @@ tracing-subscriber = { workspace = true, optional = true }
 [features]
 daemon = ["dep:iroh", "dep:iroh-mdns-address-lookup", "dep:iroh-gossip", "dep:futures-lite", "dep:clap", "dep:anyhow", "dep:data-encoding", "dep:rand", "dep:tracing-subscriber"]
 
+# buw.1 spike: a minimal single-overlay-TUN node that stands a UDP socket in for
+# the iroh DatagramConn seam, so babel-over-overlay can be validated with real
+# babeld and no iroh. Linux-only (TUN + rtnetlink). See spike/buw-multicast-spike.sh.
+spike = ["tokio/net", "tokio/macros", "tokio/rt-multi-thread", "tokio/io-util", "tokio/signal", "dep:tracing-subscriber"]
+
 # The headless iroh-transport daemon. Requires --features daemon to build.
 [[bin]]
 name = "mjolnir-meshd"
 required-features = ["daemon"]
+
+# buw.1 spike node — see the `spike` feature above.
+[[bin]]
+name = "buw-overlay-spike"
+required-features = ["spike"]
 
 [dev-dependencies]
 tempfile = "3"
