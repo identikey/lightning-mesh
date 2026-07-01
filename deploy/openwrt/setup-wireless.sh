@@ -24,6 +24,13 @@ CLIENT_AP_2G="${CLIENT_AP_2G:-1}"            # 1 => also run a client AP on 2.4 
 CLIENT_AP_2G_ENC="${CLIENT_AP_2G_ENC:-psk2}" # WPA2-PSK by default: most ESP32/cheap IoT lack WPA3-SAE. Set to 'sae-mixed' to match 5 GHz, or 'none' for open.
 COUNTRY="${COUNTRY:-DE}"                  # regulatory domain — REQUIRED, or the radios won't initiate (vifs never appear)
 DISTANCE="${DISTANCE:-}"                  # metres to the farthest mesh peer; sets ACK timeout for long/foliage links. empty = driver default
+# 802.11r fast transition (mjolnir-mesh-bnd): empty FT_KEY (default) => FT left off,
+# same "off means untouched" convention as MESH_KEY above. Set FT_KEY to turn it on for
+# EVERY client AP this script configures (5 GHz SAE + 2.4 GHz PSK, when present) — same
+# key + mobility domain on every node, or roaming clients reject the handoff as a
+# different mobility domain / can't validate the pushed key.
+FT_KEY="${FT_KEY:-}"                         # 256-bit hex string (64 hex chars), shared mesh-wide — the r0kh/r1kh key-holder push secret
+FT_MOBILITY_DOMAIN="${FT_MOBILITY_DOMAIN:-a1b2}" # 2-octet hex MDID, shared mesh-wide (must match on every node/band the client roams across)
 
 # Discover which radio is 2.4 vs 5 GHz by its 'band' option.
 radio_2g=""; radio_5g=""
@@ -80,6 +87,25 @@ else
 	uci set wireless.meshbh.encryption='none'
 fi
 
+# 802.11r fast transition for a wifi-iface UCI section, keyed by a shared secret instead
+# of a per-node peer list: wildcard r0kh (accept a key-holder pull from ANY node) +
+# wildcard r1kh (accept a key-holder push FROM any node) let every AP in the mesh push/
+# pull PMK-R1 to/from every other AP without this template script knowing peer BSSIDs
+# up front (nodes are provisioned one at a time — see the file header). Needed for
+# FT-SAE specifically: unlike FT-PSK there's no local-derivation shortcut (a SAE PMK
+# isn't a shared secret the way a PSK is), so cross-node roaming needs this key-holder
+# push wired up or the fast handoff will only ever work on the ORIGINAL AP the client
+# associated to. VERIFY on hardware: the exact r0kh/r1kh field separator UCI expects
+# (space vs comma) isn't confirmable without a live wpad — check the rendered
+# hostapd-*.conf (`ubus call network.wireless status` / /var/run/hostapd-phy*.conf) for
+# literal `r0kh=`/`r1kh=` lines after `wifi reload`.
+add_ft_wildcard_rxkh() {
+	uci -q delete wireless.$1.r0kh || true
+	uci -q delete wireless.$1.r1kh || true
+	uci add_list wireless.$1.r0kh="ff:ff:ff:ff:ff:ff * $FT_KEY"
+	uci add_list wireless.$1.r1kh="00:00:00:00:00:00 00:00:00:00:00:00 $FT_KEY"
+}
+
 # --- 5 GHz client AP -> br-lan ---
 uci -q delete wireless.clientap || true
 uci set wireless.clientap='wifi-iface'
@@ -89,6 +115,14 @@ uci set wireless.clientap.ssid="$CLIENT_SSID"
 uci set wireless.clientap.network='lan'
 uci set wireless.clientap.encryption='sae-mixed'
 uci set wireless.clientap.key="$CLIENT_KEY"
+if [ -n "$FT_KEY" ]; then
+	# FT-SAE: nasid/r1_key_holder are left unset — hostapd's own default (the AP's own
+	# BSSID) is already unique per node, which is exactly what's needed here.
+	uci set wireless.clientap.ieee80211r='1'
+	uci set wireless.clientap.mobility_domain="$FT_MOBILITY_DOMAIN"
+	uci set wireless.clientap.ft_over_ds='0'
+	add_ft_wildcard_rxkh clientap
+fi
 
 # --- 2.4 GHz client AP, concurrent with the mesh-point on the SAME radio/channel ---
 # Most ESP32s (classic/S2/S3/C3/C6) and a lot of cheap IoT are 2.4-GHz-only; the
@@ -106,6 +140,22 @@ if [ "$CLIENT_AP_2G" = 1 ]; then
 	uci set wireless.clientap2g.network='lan'
 	uci set wireless.clientap2g.encryption="$CLIENT_AP_2G_ENC"
 	[ "$CLIENT_AP_2G_ENC" = none ] || uci set wireless.clientap2g.key="$CLIENT_KEY"
+	if [ -n "$FT_KEY" ] && [ "$CLIENT_AP_2G_ENC" != none ]; then
+		uci set wireless.clientap2g.ieee80211r='1'
+		uci set wireless.clientap2g.mobility_domain="$FT_MOBILITY_DOMAIN"
+		uci set wireless.clientap2g.ft_over_ds='0'
+		case "$CLIENT_AP_2G_ENC" in
+		*sae*)
+			# FT-SAE, same as the 5 GHz AP above — no local-derivation shortcut.
+			add_ft_wildcard_rxkh clientap2g
+			;;
+		*)
+			# FT-PSK: hostapd derives PMK-R0/R1 locally from the shared PSK, so no
+			# r0kh/r1kh key-holder push is needed between nodes at all.
+			uci set wireless.clientap2g.ft_psk_generate_local='1'
+			;;
+		esac
+	fi
 fi
 
 # --- firewall: put the mesh backhaul in the 'lan' zone so IP *input* (babel hellos,
@@ -143,3 +193,15 @@ cat <<EOF
      ip link show br-mesh                    # must be UP (if DOWN: ip link set br-mesh up)
    Then point meshd at it:  uci set mjolnir.meshd.backhaul_iface='br-mesh'; service mjolnir-meshd restart
 EOF
+
+if [ -n "$FT_KEY" ]; then
+	cat <<EOF
+>> 802.11r (FT_KEY set) — VERIFY before trusting it, this is the untested part:
+     grep -E 'ieee80211r|mobility_domain|r0kh|r1kh|ft_psk_generate_local' /var/run/hostapd-phy*.conf
+       confirm r0kh=/r1kh= actually rendered (not silently dropped by a uci field-format mismatch)
+     iw dev <ap-ifname> info | grep -i 'ft\|mobility'   # or: hostapd_cli -i <ap-ifname> get_config
+   Then roam-test: associate a client to one node's AP, walk it to another node, and on
+   the client run its own re-assoc timer (or watch \`logread -f | grep -i 'FT\|reassoc'\`
+   on both nodes) — should be single-digit milliseconds, not a full handshake.
+EOF
+fi

@@ -89,6 +89,11 @@ fi
 echo ">> wpad-mesh-mbedtls (802.11s SAE) — swaps stock wpad-basic-mbedtls, which lacks mesh"
 # Removing wpad bounces wifi; fine — nodes are managed out-of-band over eth. Open mesh
 # (no MESH_KEY) needs none of this; only SAE backhaul requires the mesh-capable wpad.
+# Also carries AP-side 802.11r (mjolnir-mesh-bnd, setup-wireless.sh FT_KEY): confirmed
+# from OpenWrt's hostapd package Makefile — the mesh package variant's CONFIG_VARIANT
+# resolves to 'full' (not 'basic'), so it's built from hostapd-full.config, which sets
+# CONFIG_IEEE80211R=y same as basic does. Not on-hardware-verified; see FT_KEY's
+# printed VERIFY block in setup-wireless.sh for the actual check.
 # wpad-basic-mbedtls and wpad-mesh-mbedtls are mutually-exclusive alternatives
 # (both PROVIDE/CONFLICT on `wpad`), so installing the replacement while the
 # stock package is still present always fails — remove MUST come first. That
