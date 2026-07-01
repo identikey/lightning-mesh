@@ -131,8 +131,18 @@ Host 10.254.*
 New box? Provision it over ethernet first (`install-node.sh root@192.168.1.1`,
 then `--wireless`), get its id (`mjolnir-meshd id`), and add its line to
 `fleet-nodes.conf`. Design rationale: `docs/deploy/node-operations.md`.
-Wireless env files passed via `--wireless` carry `MESH_KEY`/`CLIENT_KEY` —
-keep them **out of git**.
+### Secrets
+
+Fleet-wide wireless secrets (`MESH_KEY`, `CLIENT_KEY`, `FT_KEY`, …) live in
+`fleet-secrets/wireless.env` — **gitignored**; copy the checked-in
+`wireless.env.example` and fill it in, then pass it with
+`--wireless fleet-secrets/wireless.env`. The applier wipes the staged copy
+from the node after use (the values persist in `/etc/config/wireless`, which
+is their job). Secrets that deliberately do NOT live in the repo or this dir:
+each node's iroh identity (`/etc/mjolnir/secret`, generated on-node, never
+leaves it — a dead node means a new identity + inventory line, by design),
+root passwords (set at flash time, keep them in your password manager), and
+the workstation SSH key that dropbear trusts (`~/.ssh`).
 
 ## Reaching & operating nodes (runbook)
 

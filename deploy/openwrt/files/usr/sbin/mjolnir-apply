@@ -255,7 +255,12 @@ if [ "$RUN_WIRELESS" = 1 ]; then
 	if [ -f "$STAGE/wireless.env" ]; then
 		set -a; . "$STAGE/wireless.env"; set +a
 	fi
-	sh /root/setup-wireless.sh || rollback "setup-wireless.sh failed"
+	WIRELESS_RC=0
+	sh /root/setup-wireless.sh || WIRELESS_RC=$?
+	# the env file carries MESH_KEY/CLIENT_KEY/FT_KEY — once consumed, don't
+	# leave a spare plaintext copy in the staging dir (uci now holds the values)
+	rm -f "$STAGE/wireless.env"
+	[ "$WIRELESS_RC" = 0 ] || rollback "setup-wireless.sh failed (rc=$WIRELESS_RC)"
 fi
 
 # 8.5 usb dongles plugged in right now: configure them. Exit 0 means the

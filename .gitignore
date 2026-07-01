@@ -65,3 +65,8 @@ deploy/mikrotik/*.npk
 
 # meshctl per-router node secrets (IROH_SECRET) — never commit
 deploy/mikrotik/secrets/
+
+# OpenWrt fleet secrets (MESH_KEY/CLIENT_KEY/FT_KEY wireless env) — never
+# commit; only the checked-in .example template survives this ignore.
+deploy/openwrt/fleet-secrets/*
+!deploy/openwrt/fleet-secrets/*.example
