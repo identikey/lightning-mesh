@@ -26,15 +26,16 @@ scp -O "$DIR/setup-wireless.sh"               "$HOST:/root/setup-wireless.sh"
 ssh "$HOST" 'chmod +x /etc/init.d/mjolnir-meshd /etc/init.d/mjolnir-babeld /root/setup-wireless.sh'
 
 # UCI config carries node-specific state (peers, client_iface). Install the
-# template ONLY if it's missing the meshd section — never clobber a config
+# template ONLY if it's missing a meshd section — never clobber a config
 # that's actually been customized (would wipe peers), but DO repair a missing,
 # empty, or truncated-before-the-section file left by an interrupted prior
-# run. Ask uci itself whether the section exists rather than grepping for a
-# literal string — UCI's quoting around the type/name is optional, so a
-# hand-edited file with `config meshd meshd` (unquoted) is equally valid and
-# a textual grep would wrongly call it "missing" and clobber it.
-echo ">> uci config (template only if missing the meshd section — preserves existing peers/config)"
-if ssh "$HOST" 'uci -q get mjolnir.meshd >/dev/null 2>&1'; then
+# run. `uci show` dumps every section as `pkg.name=type` (named) or
+# `pkg.@type[N]=type` (anonymous), so grepping its output for a `=meshd` line
+# catches a meshd section under either form — unlike `uci get mjolnir.meshd`,
+# which only resolves the named path and would wrongly call an anonymous
+# `config meshd` (no name token) "missing" and clobber it.
+echo ">> uci config (template only if missing a meshd section — preserves existing peers/config)"
+if ssh "$HOST" "uci -q show mjolnir 2>/dev/null | grep -q '=meshd\$'"; then
   echo "   /etc/config/mjolnir has a meshd section — left as-is"
 else
   scp -O "$DIR/files/etc/config/mjolnir" "$HOST:/etc/config/mjolnir"
@@ -72,10 +73,16 @@ fi
 echo ">> wpad-mesh-mbedtls (802.11s SAE) — swaps stock wpad-basic-mbedtls, which lacks mesh"
 # Removing wpad bounces wifi; fine — nodes are managed out-of-band over eth. Open mesh
 # (no MESH_KEY) needs none of this; only SAE backhaul requires the mesh-capable wpad.
+# Install the replacement BEFORE removing the stock package: if the index
+# refresh or install fails, the node keeps wpad-basic-mbedtls rather than
+# being left with neither installed.
 ssh "$HOST" "$PM_HELPERS"'
-pm_remove wpad-basic-mbedtls
 pm_update
-pm_install wpad-mesh-mbedtls || echo "WARN: wpad-mesh-mbedtls missing — SAE mesh wont auth (open mesh still works)"'
+if pm_install wpad-mesh-mbedtls; then
+  pm_remove wpad-basic-mbedtls
+else
+  echo "WARN: wpad-mesh-mbedtls install failed — left wpad-basic-mbedtls in place (SAE mesh wont auth; open mesh and existing client APs still work)"
+fi'
 
 echo ">> babeld lifecycle -> procd (m8t): disable the stock babeld service, use mjolnir-babeld"
 ssh "$HOST" '
