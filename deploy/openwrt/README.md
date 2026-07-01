@@ -99,11 +99,13 @@ first: `ssh-keygen -R 192.168.1.1`.
 preserved), then `service mjolnir-meshd restart` to exec the new binary. Verify:
 `sha256sum /usr/bin/mjolnir-meshd` matches `deploy/openwrt/mjolnir-meshd-aarch64`.
 
-**Recover / un-stick a node.** The previous binary is backed up at
-`/root/mjolnir-meshd.bak`. To return to the known-good state:
+**Recover / un-stick a node.** If a node hangs after enabling an experimental
+flag (e.g. `lan_tunnels=1` hitting `mjolnir-mesh-qz9`), disable it and restart:
 ```sh
 ssh root@<node> 'uci set mjolnir.meshd.lan_tunnels=0; uci commit mjolnir; service mjolnir-meshd restart'
 ```
+`install-node.sh` does not keep a backup of the previous binary — a bad binary
+is recovered by re-running `install-node.sh` with a known-good build.
 
 **`lan_tunnels` (experimental, default `0`).** `lan_tunnels=1` re-enables per-peer
 iroh tunnels in LAN mode (the `mjolnir-mesh-auu` retest); needs `kmod-tun`. It

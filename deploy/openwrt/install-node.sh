@@ -26,22 +26,38 @@ scp -O "$DIR/setup-wireless.sh"               "$HOST:/root/setup-wireless.sh"
 ssh "$HOST" 'chmod +x /etc/init.d/mjolnir-meshd /etc/init.d/mjolnir-babeld /root/setup-wireless.sh'
 
 # UCI config carries node-specific state (peers, client_iface). Install the
-# template ONLY on a fresh node — never clobber an existing config (would wipe peers).
-echo ">> uci config (template only if absent — preserves existing peers/config)"
-if ssh "$HOST" '[ -e /etc/config/mjolnir ]'; then
-  echo "   /etc/config/mjolnir present — left as-is"
+# template ONLY if absent/empty — never clobber a config that's actually been
+# customized (would wipe peers), but DO repair a truncated/empty file left by
+# an interrupted prior run (`-s`, not `-e`, so idempotency actually holds).
+echo ">> uci config (template only if absent/empty — preserves existing peers/config)"
+if ssh "$HOST" '[ -s /etc/config/mjolnir ]'; then
+  echo "   /etc/config/mjolnir present and non-empty — left as-is"
 else
   scp -O "$DIR/files/etc/config/mjolnir" "$HOST:/etc/config/mjolnir"
 fi
 
-echo ">> deps: babeld + kmod-tun (kmod-tun is REQUIRED for iroh tunnels: lan_tunnels=1 or --internet)"
+echo ">> deps: babeld (required)"
 # OpenWrt 25.12+ uses apk; older releases use opkg. Needs the node to have internet.
+# babeld is unconditionally required, so its failure is fatal (set -e below).
 ssh "$HOST" '
+set -e
 if command -v apk >/dev/null 2>&1; then
-  apk update && apk add babeld && apk add kmod-tun || echo "WARN: a dep failed — babeld is required; kmod-tun is needed once tunnels are enabled (/dev/net/tun)"
+  apk update && apk add babeld
 else
-  opkg update && opkg install babeld && opkg install kmod-tun || echo "WARN: a dep failed — babeld is required; kmod-tun is needed once tunnels are enabled (/dev/net/tun)"
+  opkg update && opkg install babeld
 fi'
+
+echo ">> deps: kmod-tun (REQUIRED for iroh tunnels: lan_tunnels=1 or --internet)"
+if ssh "$HOST" '
+if command -v apk >/dev/null 2>&1; then
+  apk add kmod-tun
+else
+  opkg install kmod-tun
+fi'; then
+  KMOD_TUN_OK=1
+else
+  KMOD_TUN_OK=0
+fi
 
 echo ">> wpad-mesh-mbedtls (802.11s SAE) — swaps stock wpad-basic-mbedtls, which lacks mesh"
 # Removing wpad bounces wifi; fine — nodes are managed out-of-band over eth. Open mesh
@@ -63,6 +79,10 @@ echo "  babeld now supervised by procd via mjolnir-babeld (started/reloaded by m
 
 echo ">> enable meshd service (won't start until you set peers in /etc/config/mjolnir)"
 ssh "$HOST" '/etc/init.d/mjolnir-meshd enable'
+
+if [ "$KMOD_TUN_OK" != "1" ]; then
+  echo ">> WARNING: kmod-tun failed to install on $HOST — iroh tunnels (lan_tunnels=1, --internet) will NOT work (/dev/net/tun missing) until this is fixed and install-node.sh is re-run."
+fi
 
 cat <<EOF
 >> done on $HOST. Next:
