@@ -29,10 +29,12 @@ ssh "$HOST" 'chmod +x /etc/init.d/mjolnir-meshd /etc/init.d/mjolnir-babeld /root
 # template ONLY if it's missing the meshd section — never clobber a config
 # that's actually been customized (would wipe peers), but DO repair a missing,
 # empty, or truncated-before-the-section file left by an interrupted prior
-# run. A plain non-empty check (`-s`) doesn't catch a partial scp that landed
-# a valid-looking prefix without the config stanza, so grep for the marker.
+# run. Ask uci itself whether the section exists rather than grepping for a
+# literal string — UCI's quoting around the type/name is optional, so a
+# hand-edited file with `config meshd meshd` (unquoted) is equally valid and
+# a textual grep would wrongly call it "missing" and clobber it.
 echo ">> uci config (template only if missing the meshd section — preserves existing peers/config)"
-if ssh "$HOST" "grep -q \"config meshd 'meshd'\" /etc/config/mjolnir 2>/dev/null"; then
+if ssh "$HOST" 'uci -q get mjolnir.meshd >/dev/null 2>&1'; then
   echo "   /etc/config/mjolnir has a meshd section — left as-is"
 else
   scp -O "$DIR/files/etc/config/mjolnir" "$HOST:/etc/config/mjolnir"
@@ -72,6 +74,7 @@ echo ">> wpad-mesh-mbedtls (802.11s SAE) — swaps stock wpad-basic-mbedtls, whi
 # (no MESH_KEY) needs none of this; only SAE backhaul requires the mesh-capable wpad.
 ssh "$HOST" "$PM_HELPERS"'
 pm_remove wpad-basic-mbedtls
+pm_update
 pm_install wpad-mesh-mbedtls || echo "WARN: wpad-mesh-mbedtls missing — SAE mesh wont auth (open mesh still works)"'
 
 echo ">> babeld lifecycle -> procd (m8t): disable the stock babeld service, use mjolnir-babeld"
