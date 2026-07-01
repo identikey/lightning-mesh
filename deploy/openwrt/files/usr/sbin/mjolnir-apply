@@ -62,14 +62,20 @@ pm_installed() { if command -v apk >/dev/null 2>&1; then apk info -e "$1" >/dev/
 
 # Install a package from the prefetched files in stage/pkgs (apk names files
 # name-version.apk, opkg names them name_version_arch.ipk).
+# --allow-untrusted is REQUIRED for sideloading: OpenWrt's apk v3 signs the
+# repo INDEX (packages.adb), not individual .apk files, so a standalone
+# package is always "UNTRUSTED signature" — even an authentic one (verified
+# on 25.12.4 hardware). Integrity comes from the staging chain instead:
+# HTTPS from downloads.openwrt.org into pkg-cache, authenticated SSH to here.
 pkg_local_install() {
 	local f
 	for f in "$STAGE/pkgs/$1"-[0-9]*.apk "$STAGE/pkgs/$1"_*.ipk; do
 		[ -f "$f" ] || continue
 		log "installing $1 from prefetched $f"
-		if command -v apk >/dev/null 2>&1; then apk add --no-network "$f" && return 0
+		if command -v apk >/dev/null 2>&1; then apk add --no-network --allow-untrusted "$f" && return 0
 		else opkg install "$f" && return 0; fi
 	done
+	log "no prefetched file for $1 (or local install failed)"
 	return 1
 }
 
@@ -218,6 +224,9 @@ elif [ -f "$STAGE/config-mjolnir" ]; then
 fi
 
 # 7. service wiring: stock babeld off, procd-supervised mjolnir-* on (m8t).
+#    /etc/mjolnir must exist for `mjolnir-meshd id` (the first post-install
+#    step) — only the init script's start path created it otherwise.
+mkdir -p /etc/mjolnir
 /etc/init.d/babeld disable 2>/dev/null; /etc/init.d/babeld stop 2>/dev/null
 /etc/init.d/mjolnir-babeld enable 2>/dev/null
 /etc/init.d/mjolnir-meshd enable 2>/dev/null

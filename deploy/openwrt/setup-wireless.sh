@@ -20,7 +20,10 @@ MESH_CHANNEL_2G="${MESH_CHANNEL_2G:-6}"  # one shared 2.4 GHz channel mesh-wide
 CLIENT_SSID="${CLIENT_SSID:-Lightning Mesh}"
 CLIENT_KEY="${CLIENT_KEY:-lightning!}"
 CLIENT_CHANNEL_5G="${CLIENT_CHANNEL_5G:-36}"
-CLIENT_AP_2G="${CLIENT_AP_2G:-1}"            # 1 => also run a client AP on 2.4 GHz (concurrent with the mesh-point) for 2.4-only IoT/ESP32; 0 => backhaul-only
+CLIENT_AP_2G="${CLIENT_AP_2G:-0}"            # 1 => also run a client AP on 2.4 GHz (concurrent with the mesh-point) for 2.4-only IoT/ESP32; 0 => backhaul-only.
+                                             # DEFAULT OFF (mjolnir-mesh-oaq): the concurrent AP doesn't just come up start_disabled —
+                                             # on WR3000S it blocks the MESH JOIN itself (wpad holds phy0; needs AP removal + reboot
+                                             # to recover). Re-enable per-node only once oaq is solved (mjolnir-mesh-ab4).
 CLIENT_AP_2G_ENC="${CLIENT_AP_2G_ENC:-psk2}" # WPA2-PSK by default: most ESP32/cheap IoT lack WPA3-SAE. Set to 'sae-mixed' to match 5 GHz, or 'none' for open.
 COUNTRY="${COUNTRY:-DE}"                  # regulatory domain — REQUIRED, or the radios won't initiate (vifs never appear)
 DISTANCE="${DISTANCE:-}"                  # metres to the farthest mesh peer; sets ACK timeout for long/foliage links. empty = driver default
