@@ -110,7 +110,14 @@ fi
 # Anything REQUIRED but still nowhere (not fetched, not in cache, not installed)?
 if [ -n "${MISSING// /}" ]; then
 	for p in $MISSING; do
-		ls "$PKG_CACHE/$p"-[0-9]*.apk "$PKG_CACHE/$p"_*.ipk >/dev/null 2>&1 && continue
+		# NB: not `ls glob1 glob2` — ls exits non-zero if ANY glob stays
+		# unmatched-literal, so the never-matching .ipk glob on apk systems
+		# would mask a perfectly good .apk hit (misleading WARNs).
+		in_cache=0
+		for f in "$PKG_CACHE/$p"-[0-9]*.apk "$PKG_CACHE/$p"_*.ipk; do
+			[ -f "$f" ] && { in_cache=1; break; }
+		done
+		[ "$in_cache" = 1 ] && continue
 		if ssh "$HOST" "command -v apk >/dev/null 2>&1 && apk info -e '$p' >/dev/null 2>&1 || opkg list-installed 2>/dev/null | grep -q '^$p '"; then
 			echo "   $p: not prefetched, but already installed on the node — ok"
 		else
