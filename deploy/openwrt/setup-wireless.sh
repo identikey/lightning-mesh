@@ -17,8 +17,8 @@ set -e
 MESH_ID="${MESH_ID:-mjolnir-mesh}"
 MESH_KEY="${MESH_KEY:-}"                 # empty => OPEN mesh (recommended for first bring-up); set => SAE
 MESH_CHANNEL_2G="${MESH_CHANNEL_2G:-6}"  # one shared 2.4 GHz channel mesh-wide
-CLIENT_SSID="${CLIENT_SSID:-mjolnir}"
-CLIENT_KEY="${CLIENT_KEY:-changeme-client}"
+CLIENT_SSID="${CLIENT_SSID:-Lightning Mesh}"
+CLIENT_KEY="${CLIENT_KEY:-lightning!}"
 CLIENT_CHANNEL_5G="${CLIENT_CHANNEL_5G:-36}"
 CLIENT_AP_2G="${CLIENT_AP_2G:-1}"            # 1 => also run a client AP on 2.4 GHz (concurrent with the mesh-point) for 2.4-only IoT/ESP32; 0 => backhaul-only
 CLIENT_AP_2G_ENC="${CLIENT_AP_2G_ENC:-psk2}" # WPA2-PSK by default: most ESP32/cheap IoT lack WPA3-SAE. Set to 'sae-mixed' to match 5 GHz, or 'none' for open.
