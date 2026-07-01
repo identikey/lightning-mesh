@@ -79,6 +79,35 @@ under rapid config churn — `mjolnir-mesh-qz9`.) meshd never `fork()`s babeld
 itself; that chain orphaned babelds on `SIGKILL`. `install-node.sh` disables the
 stock `babeld` service so the two don't both run.
 
+## Fleet rollout
+
+The fleet is inventoried in `fleet-nodes.conf` (name → derived `10.254.x` →
+node id → model; leaf-first order, wired jump node last). Roll an update to
+every reachable node, one at a time, with:
+
+```sh
+deploy/openwrt/update-fleet.sh                       # binary/deps everywhere
+deploy/openwrt/update-fleet.sh --wireless node.env   # + radio config everywhere
+deploy/openwrt/update-fleet.sh m3000                 # a single named node
+```
+
+It halts on the first failure (that node has rolled itself back; re-runs are
+idempotent) and skips-and-reports unreachable nodes. Reaching `10.254.x` from
+the workstation needs one wired node as SSH jump host — add to `~/.ssh/config`:
+
+```
+Host 10.254.*
+    User root
+    ProxyJump root@192.168.1.1
+    StrictHostKeyChecking accept-new
+```
+
+New box? Provision it over ethernet first (`install-node.sh root@192.168.1.1`,
+then `--wireless`), get its id (`mjolnir-meshd id`), and add its line to
+`fleet-nodes.conf`. Design rationale: `docs/deploy/node-operations.md`.
+Wireless env files passed via `--wireless` carry `MESH_KEY`/`CLIENT_KEY` —
+keep them **out of git**.
+
 ## Reaching & operating nodes (runbook)
 
 The gotchas that otherwise get re-discovered every time:
