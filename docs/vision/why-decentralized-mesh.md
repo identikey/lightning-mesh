@@ -32,6 +32,9 @@ A neighborhood mesh where each household runs a node. Shared local services — 
 **4. Global roaming**
 Your travel router connects to your home mesh via Iroh from anywhere in the world. Devices on your travel router can reach services at home by hostname. Your home devices can reach your travel network. One mesh, spanning the globe, encrypted end-to-end.
 
+**5. An appliance you own — and can manage from anywhere**
+A node is a box you plug in, not a system you administer. It joins whatever is around it (802.11s locally, Iroh over any internet egress), and from then on **the mesh manages itself over itself**: every node has a stable overlay address derived from its cryptographic identity, so its owner — authorized by key (IdentiKey), not by being in the room — can configure it and ship it updates from anywhere. Updates apply detached with a health gate and automatic rollback, so a bad push can't strand a box behind a dead radio; plugging in an ethernet cable is the recovery of last resort, never the routine. See [node operations](../deploy/node-operations.md).
+
 ## Why Now
 
 Three things that didn't exist 5 years ago make this feasible:

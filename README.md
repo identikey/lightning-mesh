@@ -116,25 +116,37 @@ and AI agents all coexist on the same fabric.
 - [Mjolnir + mjolnir-mesh integration](docs/vision/mjolnir-integration.md)
 
 ### Architecture
-- [Network architecture (CRDT, routing, subnet allocation)](docs/architecture/network-architecture.md)
-- [DHCP CRDT design](docs/architecture/dhcp-crdt.md)
-- [dnsmasq integration](docs/architecture/dnsmasq-integration.md)
-- [P2P resilience](docs/architecture/p2p-resilience.md)
+- [Network architecture (CRDT, routing, subnet allocation)](docs/network-coordination/network-architecture.md)
+- [Radio backhaul & multi-hop discovery decisions](docs/network-coordination/radio-backhaul-and-discovery.md)
+- [DHCP CRDT design](docs/network-coordination/dhcp-crdt.md)
+- [dnsmasq integration](docs/network-coordination/dnsmasq-integration.md)
+- [P2P resilience](docs/network-coordination/p2p-resilience.md)
 - [Self-healing jitter buffer](docs/architecture/self-healing-jitter-buffer.md)
 - [Neural bridge PLC design](docs/architecture/neural-bridge-plc.md)
-- [Mesh network coordination overview](docs/mesh-network-coordination.md)
+- [Mesh network coordination overview](docs/network-coordination/mesh-network-coordination.md)
+
+### Deploy & operations
+- [Node operations: management plane, in-band updates, OTA](docs/deploy/node-operations.md)
+- [OpenWrt node deploy runbook](deploy/openwrt/README.md)
 
 ### Research
 - [Audio models for neural PLC — deployment-focused synthesis](docs/research/audio-models-for-neural-plc/synthesis.md)
 
 ## Status
 
-In active development. The mesh daemon (`mjolnir-node`), audio pipeline
-(`mjolnir-audio` + `mjolnir-media`), and supporting transport scaffolding
-exist and run. The CRDT/DHCP/DNS coordination layer is designed and
-documented; implementation is ongoing. The neural bridge PLC engine is a
-forward-looking design (v2 lane) sequenced after the FARGAN/DRED
-production answer.
+In active development. A real fleet exists: `mjolnir-meshd`
+(`crates/mjolnir-mesh`) runs natively on OpenWrt MT7981 routers over an
+802.11s backhaul, with babel routing, derived `10.254.x/16` overlay
+addressing, and a single-overlay-TUN data plane for cross-site traffic
+(`buw`). Nodes are installed and updated **in-band** — staged payloads
+applied detached with health-gated auto-rollback, no ethernet required
+(see [node operations](docs/deploy/node-operations.md)). The
+CRDT/DHCP/DNS coordination layer is designed and partially implemented;
+gossip-propagated peer announcement and IdentiKey-authorized remote
+management/OTA are the active trajectory. The audio pipeline
+(`mjolnir-audio` + `mjolnir-media`) exists and runs; the neural bridge
+PLC engine is a forward-looking design (v2 lane) sequenced after the
+FARGAN/DRED production answer.
 
 ## Building
 
@@ -145,8 +157,10 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-The mesh daemon binary is `mjolnir-node`; see that crate's source for
-runtime configuration.
+The mesh daemon binaries are `mjolnir-node` (desktop/VM) and
+`mjolnir-meshd` (`crates/mjolnir-mesh`, the OpenWrt router daemon —
+cross-built static with `deploy/openwrt/build.sh` and pushed with
+`deploy/openwrt/install-node.sh`).
 
 ## License
 

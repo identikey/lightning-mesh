@@ -53,18 +53,39 @@ bd close <id>         # Complete work
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+cargo build --workspace          # Cargo workspace (crates/*)
+cargo test --workspace
+cargo clippy
+deploy/openwrt/build.sh          # cross-build static aarch64 mjolnir-meshd for routers
 ```
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+A decentralized router mesh: symmetric, non-authoritative nodes; **the L3
+overlay (iroh + babeld + CRDT) is the product, the radio is plumbing**.
+
+- `crates/mjolnir-mesh` — `mjolnir-meshd`, the OpenWrt router daemon:
+  802.11s backhaul (`br-mesh`), derived `10.254.<blake3(node_id)>/16`
+  overlay addressing, babel routing, single overlay TUN `mjolnir0` for
+  cross-site iroh traffic (bead `buw`).
+- `crates/mjolnir-node` — desktop/VM mesh daemon (membership, gossip, rooms).
+- `crates/mjolnir-audio`, `mjolnir-media`, `mjolnir-moq` — voice/media over
+  the mesh.
+- `deploy/openwrt/` — fleet install/update: staged payload + detached apply
+  with health-gated rollback (in-band safe; ethernet at `192.168.1.1` is
+  recovery of last resort). See `docs/deploy/node-operations.md`.
+- Design docs live in `docs/network-coordination/` and `docs/vision/`;
+  decisions are tracked in beads (`bd show <id>`).
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- The management plane is the overlay: reach nodes at their derived
+  `10.254.x` address over SSH; keep a maintainer inventory of node ids.
+- No mDNS for mesh-wide/management discovery — gossip/CRDT address book
+  (`buw.9`/`0yb`) is the direction; mDNS is link-local bootstrap only.
+- Never bridge client L2 segments across nodes (breaks broadcast
+  containment); each node owns its routed `/24`.
+- Disruptive node changes go through `mjolnir-apply` (snapshot → apply →
+  health gate → rollback), never through a live SSH session doing the
+  mutation inline.
