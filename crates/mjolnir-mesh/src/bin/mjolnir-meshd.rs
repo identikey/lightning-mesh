@@ -182,6 +182,13 @@ enum Command {
         /// same-site tunnel stays up. Dials peers by derived address (0yb.1).
         #[arg(long)]
         lan_tunnels: bool,
+        /// Where to persist the subnet-claim CRDT store (postcard-encoded). Loaded
+        /// on startup so a rebooting node serves DHCP/DNS immediately without
+        /// waiting to relearn claims over gossip, and rewritten on every
+        /// anti-entropy cycle (mjolnir-mesh-s9v). Its parent dir is created if
+        /// missing.
+        #[arg(long, default_value = "/etc/mjolnir/claims.state")]
+        claims_file: PathBuf,
     },
 }
 
@@ -298,6 +305,7 @@ async fn main() -> Result<()> {
             // flows in via `l2_backhaul`.
             backhaul_iface: _,
             lan_tunnels,
+            claims_file,
         } => {
             // In LAN mode babel routes over the shared-L2 backhaul directly; pass
             // the resolved interface so the reconciler can add it as `type wired`
@@ -313,6 +321,7 @@ async fn main() -> Result<()> {
                 lan,
                 lan_tunnels,
                 l2,
+                claims_file,
             )
             .await?
         }
@@ -480,6 +489,7 @@ async fn run_mesh(
     lan: bool,
     lan_tunnels: bool,
     l2_backhaul: Option<String>,
+    claims_file: PathBuf,
 ) -> Result<()> {
     let self_id = endpoint.id();
     let self_id_str = self_id.to_string();
@@ -515,8 +525,14 @@ async fn run_mesh(
     let registry: TunnelRegistry = Arc::new(Mutex::new(HashMap::new()));
     // Shared CRDT subnet-claim store (mjolnir-mesh-chn): cidr -> claim. Written
     // by the gossip apply loop and the local claim routine; babeld (83k) reads
-    // it for the local subnet to redistribute.
-    let claims: ClaimStore = Arc::new(Mutex::new(HashMap::new()));
+    // it for the local subnet to redistribute. Seeded from disk (mjolnir-mesh-s9v)
+    // so a rebooting node has its own and any known peers' claims immediately,
+    // before gossip has a chance to relearn them.
+    let restored = load_claims(&claims_file);
+    if !restored.is_empty() {
+        info!(count = restored.len(), path = %claims_file.display(), "restored subnet claims from disk");
+    }
+    let claims: ClaimStore = Arc::new(Mutex::new(restored));
 
     // CRDT gossip overlay (mjolnir-mesh-k8c): all mesh nodes join one fixed
     // topic and exchange CRDT updates best-effort, as a second protocol on the
@@ -546,7 +562,7 @@ async fn run_mesh(
         .map(|a| a.id)
         .filter(|id| *id != self_id)
         .collect();
-    let (gossip_dispatch, claim_task) = match gossip.subscribe(mesh_topic_id(), bootstrap).await {
+    let (gossip_dispatch, claim_task, anti_entropy_task) = match gossip.subscribe(mesh_topic_id(), bootstrap).await {
         Ok(topic) => {
             let (sender, receiver) = topic.split();
             let sync = Arc::new(GossipSync::new(IrohGossipTransport {
@@ -594,11 +610,22 @@ async fn run_mesh(
                 })
             };
 
-            (Some(dispatch), Some(claim))
+            // Anti-entropy (mjolnir-mesh-s9v, part 1 of 5r0): periodically re-broadcast
+            // the FULL known claim map (not just our own claim — that weaker form is
+            // `claim_and_publish` above) and persist it to disk. Fixes late-joiner /
+            // dropped-packet / restart convergence cheaply since the map is tiny.
+            let anti_entropy = {
+                let sync = sync.clone();
+                let store = claims.clone();
+                let path = claims_file.clone();
+                tokio::spawn(async move { anti_entropy_loop(sync, store, path).await })
+            };
+
+            (Some(dispatch), Some(claim), Some(anti_entropy))
         }
         Err(e) => {
             warn!("gossip subscribe failed: {e}; continuing without CRDT overlay");
-            (None, None)
+            (None, None, None)
         }
     };
 
@@ -691,6 +718,9 @@ async fn run_mesh(
     if let Some(t) = &claim_task {
         t.abort();
     }
+    if let Some(t) = &anti_entropy_task {
+        t.abort();
+    }
     babel_task.abort();
     // babeld runs as its own procd service (mjolnir-babeld); intentionally NOT
     // stopped here so a meshd restart doesn't churn it (mjolnir-mesh-m8t).
@@ -740,6 +770,13 @@ const CLAIM_WARMUP: Duration = Duration::from_secs(8);
 
 /// Client-subnet size each router claims from the mesh space (10.42.0.0/16).
 const CLIENT_PREFIX_LEN: u8 = 24;
+
+/// Anti-entropy period (mjolnir-mesh-s9v): how often each node re-broadcasts
+/// its full known claim map and rewrites the on-disk claims file. The claim
+/// map is tiny (~64KB at the 256-node cap), so this is cheap; it exists to fix
+/// late-joiner / dropped-packet / restart convergence without any new gossip
+/// protocol, just a resend of what `SubnetClaimUpdate` already carries.
+const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Shared CRDT subnet-claim store: cidr string -> claim. Written by the gossip
 /// apply loop and the local claim routine; babeld (mjolnir-mesh-83k) will read
@@ -872,6 +909,89 @@ async fn claim_and_publish<T: GossipTransport>(
     // a concrete connected route to redistribute and inbound mesh traffic for the
     // /24 is delivered on-link (mjolnir-mesh-e4r, supersedes the df4 gateway route).
     assign_client_addr(net, client_iface).await;
+}
+
+/// Load the persisted claim map from `path`. Returns an empty map (not an
+/// error) if the file is absent — the normal case on first boot — or if it
+/// fails to decode, since the claim store is best-effort and will relearn
+/// current state over gossip either way.
+fn load_claims(path: &Path) -> HashMap<String, SubnetClaim> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            warn!(path = %path.display(), "failed to read persisted claims: {e}");
+            return HashMap::new();
+        }
+    };
+    match postcard::from_bytes(&bytes) {
+        Ok(map) => map,
+        Err(e) => {
+            warn!(path = %path.display(), "failed to decode persisted claims: {e}");
+            HashMap::new()
+        }
+    }
+}
+
+/// Persist a claim-map snapshot to `path`, writing to a sibling temp file and
+/// renaming over the target so a crash or power loss mid-write (a real risk
+/// on routers) can't leave a truncated, undecodable file. Best effort: a
+/// failure is logged, not fatal.
+fn persist_claims(snapshot: &HashMap<String, SubnetClaim>, path: &Path) {
+    let bytes = match postcard::to_allocvec(snapshot) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to encode claims for persistence: {e}");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        warn!(path = %parent.display(), "failed to create claims dir: {e}");
+        return;
+    }
+    let tmp_path = path.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+        warn!(path = %tmp_path.display(), "failed to write claims tmp file: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        warn!(path = %path.display(), "failed to rename claims tmp file into place: {e}");
+    }
+}
+
+/// Anti-entropy loop (mjolnir-mesh-s9v): every [`ANTI_ENTROPY_INTERVAL`],
+/// re-broadcast every claim this node currently knows about — not just its
+/// own — and rewrite the on-disk claims file. Re-broadcasting the full map
+/// (rather than only our own claim, the weaker form `claim_and_publish`
+/// already does) is what lets a late joiner, a node that missed a gossip
+/// packet, or a node that just rebooted converge without any pull-based
+/// reconciliation protocol.
+async fn anti_entropy_loop<T: GossipTransport>(
+    sync: Arc<GossipSync<T>>,
+    store: ClaimStore,
+    claims_file: PathBuf,
+) {
+    let mut ticker = tokio::time::interval(ANTI_ENTROPY_INTERVAL);
+    ticker.tick().await; // first tick fires immediately; the warmup claim publish already covered this
+    loop {
+        ticker.tick().await;
+        let snapshot = store.lock().expect("claim store poisoned").clone();
+        for (cidr, entry) in &snapshot {
+            if let Err(e) = sync
+                .publish(GossipMessage::SubnetClaimUpdate {
+                    cidr: cidr.clone(),
+                    entry: entry.clone(),
+                })
+                .await
+            {
+                warn!(%cidr, "anti-entropy: re-broadcast failed: {e}");
+            }
+        }
+        info!(count = snapshot.len(), "anti-entropy: re-broadcast full claim map");
+        persist_claims(&snapshot, &claims_file);
+    }
 }
 
 /// Assign this node's claimed /24 gateway address (`<net>.1/prefix`) to the local
@@ -2015,5 +2135,64 @@ mod tests {
         };
         apply_subnet_message(&mut store, &stale_release, "self");
         assert!(store.contains_key("10.42.1.0/24"), "stale release must not remove a newer claim");
+    }
+
+    #[test]
+    fn load_claims_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.state");
+        assert!(load_claims(&path).is_empty());
+    }
+
+    #[test]
+    fn load_claims_corrupt_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.state");
+        std::fs::write(&path, b"not a valid postcard payload at all").unwrap();
+        assert!(load_claims(&path).is_empty());
+    }
+
+    #[test]
+    fn persist_then_load_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.state");
+        let mut snapshot = HashMap::new();
+        snapshot.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 100));
+        snapshot.insert("10.42.2.0/24".to_string(), claim("10.42.2.0/24", "peer-c", 200));
+
+        persist_claims(&snapshot, &path);
+        let loaded = load_claims(&path);
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded["10.42.1.0/24"].owner_node_id, "peer-b");
+        assert_eq!(loaded["10.42.2.0/24"].owner_node_id, "peer-c");
+    }
+
+    #[test]
+    fn persist_creates_missing_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("claims.state");
+        let mut snapshot = HashMap::new();
+        snapshot.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 100));
+
+        persist_claims(&snapshot, &path);
+
+        assert!(path.exists());
+        assert_eq!(load_claims(&path).len(), 1);
+    }
+
+    #[test]
+    fn persist_overwrites_stale_tmp_file() {
+        // A previous crash mid-write could leave a stray .tmp sibling; persisting
+        // again must still succeed and leave the target file correct.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.state");
+        std::fs::write(path.with_extension("tmp"), b"leftover garbage").unwrap();
+
+        let mut snapshot = HashMap::new();
+        snapshot.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 100));
+        persist_claims(&snapshot, &path);
+
+        assert_eq!(load_claims(&path).len(), 1);
     }
 }
