@@ -407,10 +407,12 @@ impl DatagramConn for IrohDatagramConn {
 /// impl of the substrate's iroh-free gossip seam (the gossip analogue of
 /// [`IrohDatagramConn`]). Wraps a topic's sender/receiver halves; the receiver
 /// needs `&mut` to poll, so it lives behind an async mutex (only the single
-/// dispatch loop ever reads it).
+/// dispatch loop ever reads it). Neighbor up/down events feed the watch
+/// channel that gates claiming and drives the rejoin loop (mjolnir-mesh-eon).
 struct IrohGossipTransport {
     sender: GossipSender,
     receiver: tokio::sync::Mutex<GossipReceiver>,
+    neighbors_tx: tokio::sync::watch::Sender<usize>,
 }
 
 #[async_trait::async_trait]
@@ -427,14 +429,63 @@ impl GossipTransport for IrohGossipTransport {
         let mut rx = self.receiver.lock().await;
         loop {
             match rx.next().await {
-                // Only `Received` carries an application payload; neighbor
-                // up/down and lag notifications are control events we skip.
+                // Only `Received` carries an application payload.
                 Some(Ok(Event::Received(msg))) => return Ok(msg.content),
+                // Track swarm membership: the count gates the first claim and
+                // wakes the rejoin loop when we drop to an island (eon).
+                Some(Ok(Event::NeighborUp(id))) => {
+                    self.neighbors_tx.send_modify(|c| *c += 1);
+                    info!(peer = %id, count = *self.neighbors_tx.borrow(), "gossip: neighbor up");
+                    continue;
+                }
+                Some(Ok(Event::NeighborDown(id))) => {
+                    self.neighbors_tx.send_modify(|c| *c = c.saturating_sub(1));
+                    info!(peer = %id, count = *self.neighbors_tx.borrow(), "gossip: neighbor down");
+                    continue;
+                }
                 Some(Ok(_)) => continue,
                 Some(Err(e)) => return Err(GossipError::Transport(e.to_string())),
                 None => return Err(GossipError::Closed),
             }
         }
+    }
+}
+
+/// Keep this node in the gossip swarm (mjolnir-mesh-eon). iroh-gossip's
+/// bootstrap join is a one-shot dial: at boot the 802.11s radio and mDNS
+/// discovery usually aren't up yet, every bootstrap dial fails ("No
+/// addressing information available"), and the node stays a gossip island
+/// forever — its anti-entropy broadcasts reach nobody and it merges nobody's,
+/// so the claim-conflict machinery never fires. Meanwhile the tunnel data
+/// plane comes up fine because `connector_loop` redials with backoff. This is
+/// that same retry policy for the gossip swarm: whenever we have zero
+/// neighbors, re-issue `join_peers` with the roster bootstrap set, capped
+/// exponential backoff, resetting once we've been joined.
+async fn gossip_rejoin_loop(
+    sender: GossipSender,
+    bootstrap: Vec<EndpointId>,
+    mut neigh_rx: tokio::sync::watch::Receiver<usize>,
+) {
+    if bootstrap.is_empty() {
+        return;
+    }
+    let min_backoff = Duration::from_secs(5);
+    let max_backoff = Duration::from_secs(60);
+    let mut backoff = min_backoff;
+    loop {
+        while *neigh_rx.borrow() > 0 {
+            backoff = min_backoff; // we were joined; next outage starts fresh
+            if neigh_rx.changed().await.is_err() {
+                return; // transport dropped — shutting down
+            }
+        }
+        info!(peers = bootstrap.len(), "gossip: no neighbors — (re)joining bootstrap peers");
+        if let Err(e) = sender.join_peers(bootstrap.clone()).await {
+            warn!("gossip: join_peers failed: {e}");
+        }
+        // Let the join attempt land (or fail) before trying again.
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(max_backoff);
     }
 }
 
@@ -656,14 +707,26 @@ async fn run_mesh(
         .map(|a| a.id)
         .filter(|id| *id != self_id)
         .collect();
-    let (gossip_dispatch, claim_task, anti_entropy_task) = match gossip.subscribe(mesh_topic_id(), bootstrap).await {
+    let (gossip_dispatch, claim_task, anti_entropy_task, rejoin_task) = match gossip
+        .subscribe(mesh_topic_id(), bootstrap.clone())
+        .await
+    {
         Ok(topic) => {
             let (sender, receiver) = topic.split();
+            // Neighbor count: fed by the dispatch loop's NeighborUp/Down
+            // events; gates the first claim and drives the rejoin loop (eon).
+            let (neighbors_tx, neigh_rx) = tokio::sync::watch::channel(0usize);
+            let rejoin = tokio::spawn(gossip_rejoin_loop(
+                sender.clone(),
+                bootstrap,
+                neigh_rx.clone(),
+            ));
             let sync = Arc::new(GossipSync::new(IrohGossipTransport {
                 sender,
                 receiver: tokio::sync::Mutex::new(receiver),
+                neighbors_tx,
             }));
-            info!("gossip overlay joined (mesh CRDT topic)");
+            info!("gossip topic subscribed; joining swarm in background");
 
             // Signalled by the apply loop when a conflict costs us our claim;
             // carries the lost /24 so the claim manager can retract its address.
@@ -700,8 +763,9 @@ async fn run_mesh(
                 let sync = sync.clone();
                 let store = claims.clone();
                 let me = self_id_str.clone();
+                let neigh_rx = neigh_rx.clone();
                 tokio::spawn(async move {
-                    claim_manager(sync, store, me, client_iface, reclaim_rx).await
+                    claim_manager(sync, store, me, client_iface, reclaim_rx, neigh_rx).await
                 })
             };
 
@@ -716,11 +780,11 @@ async fn run_mesh(
                 tokio::spawn(async move { anti_entropy_loop(sync, store, path).await })
             };
 
-            (Some(dispatch), Some(claim), Some(anti_entropy))
+            (Some(dispatch), Some(claim), Some(anti_entropy), Some(rejoin))
         }
         Err(e) => {
             warn!("gossip subscribe failed: {e}; continuing without CRDT overlay");
-            (None, None, None)
+            (None, None, None, None)
         }
     };
 
@@ -834,6 +898,9 @@ async fn run_mesh(
     if let Some(t) = &anti_entropy_task {
         t.abort();
     }
+    if let Some(t) = &rejoin_task {
+        t.abort();
+    }
     babel_task.abort();
     // babeld runs as its own procd service (mjolnir-babeld); intentionally NOT
     // stopped here so a meshd restart doesn't churn it (mjolnir-mesh-m8t).
@@ -875,11 +942,18 @@ async fn connector_loop(
 
 // --- subnet claim (mjolnir-mesh-chn) -------------------------------------
 
-/// Subnet-claim warmup: after joining gossip, wait this long to learn existing
-/// claims before publishing our own, so a fresh node doesn't stomp an
-/// established claim. (Same-site local-peer detection — claim_cooldown — is a
-/// separate, future concern.)
-const CLAIM_WARMUP: Duration = Duration::from_secs(8);
+/// How long a fresh node (no restored claim) waits for a first gossip
+/// neighbor before claiming blind. Covers slow radio/mDNS bring-up at boot;
+/// the cap exists so the genuinely-first node of a new mesh still claims.
+const CLAIM_JOIN_WAIT_CAP: Duration = Duration::from_secs(60);
+
+/// After the first gossip neighbor appears, wait one full anti-entropy period
+/// (plus slack) so every neighbor's claim map has a chance to arrive before we
+/// pick a subnet. The old blind 8s warmup lost this race in the field by 13s
+/// and re-collided by construction — the deterministic blake3 preferred slot
+/// picks the SAME /24 again unless the peer's claim is already in the store
+/// (mjolnir-mesh-eon).
+const CLAIM_POST_JOIN_WARMUP: Duration = Duration::from_secs(25);
 
 /// Client-subnet size each router claims from the mesh space (10.42.0.0/16).
 const CLIENT_PREFIX_LEN: u8 = 24;
@@ -952,18 +1026,58 @@ fn apply_subnet_message(
     }
 }
 
-/// Manage this node's subnet claim: after a warmup to learn existing claims,
-/// pick a free /24 and publish it; re-claim whenever a conflict costs us ours,
-/// retracting the lost subnet's gateway address first so the node doesn't keep
-/// answering on a /24 the mesh has routed elsewhere.
+/// Wait until the gossip swarm has at least one neighbor, capped at `cap`.
+/// Returns `true` if a neighbor appeared, `false` on timeout or a dropped
+/// channel. Pure over the watch channel so it's unit-tested below.
+async fn wait_for_first_neighbor(
+    mut neigh_rx: tokio::sync::watch::Receiver<usize>,
+    cap: Duration,
+) -> bool {
+    tokio::time::timeout(cap, async {
+        while *neigh_rx.borrow() == 0 {
+            if neigh_rx.changed().await.is_err() {
+                return false;
+            }
+        }
+        true
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Manage this node's subnet claim: learn existing claims, pick a free /24 and
+/// publish it; re-claim whenever a conflict costs us ours, retracting the lost
+/// subnet's gateway address first so the node doesn't keep answering on a /24
+/// the mesh has routed elsewhere.
+///
+/// A node with a restored claim publishes immediately — re-publishing our own
+/// claim is conflict-free (first-writer seniority), so the LAN comes up fast.
+/// A fresh node gates its first pick on gossip actually joining: wait (capped)
+/// for a neighbor, then a full anti-entropy period so existing claims arrive —
+/// the old blind 8s warmup claimed 13s before the first peer claim landed and
+/// re-collided by construction (deterministic preferred slot).
 async fn claim_manager<T: GossipTransport>(
     sync: Arc<GossipSync<T>>,
     store: ClaimStore,
     self_id: String,
     client_iface: String,
     mut reclaim_rx: tokio::sync::mpsc::UnboundedReceiver<Ipv4Net>,
+    neigh_rx: tokio::sync::watch::Receiver<usize>,
 ) {
-    tokio::time::sleep(CLAIM_WARMUP).await;
+    let has_own_claim = {
+        let s = store.lock().expect("claim store poisoned");
+        s.values().any(|c| c.owner_node_id == self_id)
+    };
+    if !has_own_claim {
+        if wait_for_first_neighbor(neigh_rx, CLAIM_JOIN_WAIT_CAP).await {
+            tokio::time::sleep(CLAIM_POST_JOIN_WARMUP).await;
+        } else {
+            warn!(
+                cap = ?CLAIM_JOIN_WAIT_CAP,
+                "no gossip neighbor within the join cap — claiming blind (first node of a new mesh, or peers unreachable)"
+            );
+        }
+    }
     claim_and_publish(&sync, &store, &self_id, &client_iface).await;
     while let Some(lost) = reclaim_rx.recv().await {
         // Brief pause so a conflict storm settles before we re-pick.
@@ -2794,6 +2908,34 @@ mod tests {
         assert!(keep.is_none());
         assert!(extras.is_empty());
         assert!(foreign.is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_neighbor_releases_the_claim_gate() {
+        let (tx, rx) = tokio::sync::watch::channel(0usize);
+        let waiter = tokio::spawn(wait_for_first_neighbor(rx, Duration::from_secs(5)));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send(1).unwrap();
+        assert!(waiter.await.unwrap(), "neighbor up must release the gate");
+    }
+
+    #[tokio::test]
+    async fn no_neighbor_hits_the_cap() {
+        let (_tx, rx) = tokio::sync::watch::channel(0usize);
+        assert!(!wait_for_first_neighbor(rx, Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn already_joined_passes_immediately() {
+        let (_tx, rx) = tokio::sync::watch::channel(1usize);
+        assert!(wait_for_first_neighbor(rx, Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn dropped_channel_does_not_hang_the_gate() {
+        let (tx, rx) = tokio::sync::watch::channel(0usize);
+        drop(tx);
+        assert!(!wait_for_first_neighbor(rx, Duration::from_secs(5)).await);
     }
 
     #[test]
