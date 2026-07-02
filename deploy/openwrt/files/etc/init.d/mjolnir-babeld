@@ -21,11 +21,19 @@ CONF=/etc/mjolnir/babeld.conf
 # routes linger. Runs on every start: whatever race created the stray, the
 # next (re)start reaps it. procd-owned pids are excluded via ubus, so a plain
 # `start` on an already-running service never kills the healthy instance.
+#
+# Match by EXACT full cmdline via /proc, never pgrep -f: substring matching
+# kills innocent processes whose command text merely CONTAINS the babeld path
+# (proven live: it reaped the operator's own SSH diagnostic shell).
 reap_stray_babelds() {
-	local owned pid
+	local owned p pid cmd want
 	owned=$(ubus call service list '{"name":"mjolnir-babeld"}' 2>/dev/null \
 		| jsonfilter -e '@["mjolnir-babeld"].instances[*].pid' 2>/dev/null)
-	for pid in $(pgrep -f "$PROG -c $CONF" 2>/dev/null); do
+	want="$PROG -c $CONF"
+	for p in /proc/[0-9]*; do
+		cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+		[ "${cmd% }" = "$want" ] || continue
+		pid="${p#/proc/}"
 		case " $owned " in
 			*" $pid "*) ;;
 			*)
