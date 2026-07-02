@@ -665,8 +665,9 @@ async fn run_mesh(
             }));
             info!("gossip overlay joined (mesh CRDT topic)");
 
-            // Signalled by the apply loop when a conflict costs us our claim.
-            let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            // Signalled by the apply loop when a conflict costs us our claim;
+            // carries the lost /24 so the claim manager can retract its address.
+            let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::unbounded_channel::<Ipv4Net>();
 
             let dispatch = {
                 let sync = sync.clone();
@@ -683,9 +684,9 @@ async fn run_mesh(
                                 info!(%cidr, owner = %entry.owner_node_id, "gossip: received peer subnet claim");
                             }
                             let mut s = store.lock().expect("claim store poisoned");
-                            if apply_subnet_message(&mut s, &msg, &me) {
+                            if let Some(lost) = apply_subnet_message(&mut s, &msg, &me) {
                                 drop(s);
-                                let _ = reclaim_tx.send(());
+                                let _ = reclaim_tx.send(lost);
                             }
                         })
                         .await;
@@ -908,27 +909,32 @@ fn now_hlc(node_id: &str) -> HLC {
     }
 }
 
-/// Apply an inbound subnet CRDT message to the claim store. Returns `true` if
-/// THIS node lost its own claim in a conflict and must re-claim. Pure over the
-/// map (no I/O) so it's unit-tested below.
+/// Apply an inbound subnet CRDT message to the claim store. Returns the /24
+/// THIS node lost if a conflict cost us our claim — the caller must retract
+/// its gateway address and re-claim. Pure over the map (no I/O) so it's
+/// unit-tested below.
 fn apply_subnet_message(
     store: &mut HashMap<String, SubnetClaim>,
     msg: &GossipMessage,
     self_id: &str,
-) -> bool {
+) -> Option<Ipv4Net> {
     match msg {
         GossipMessage::SubnetClaimUpdate { cidr, entry } => {
             match merge_subnet_claim(store.get(cidr), entry) {
                 MergeResult::Inserted | MergeResult::Updated => {
                     store.insert(cidr.clone(), entry.clone());
-                    false
+                    None
                 }
-                MergeResult::Unchanged => false,
+                MergeResult::Unchanged => None,
                 MergeResult::Conflict { winner, loser } => {
                     let we_lost =
                         loser.owner_node_id == self_id && winner.owner_node_id != self_id;
+                    let lost = match (we_lost, loser.cidr) {
+                        (true, IpNet::V4(n)) => Some(n),
+                        _ => None,
+                    };
                     store.insert(cidr.clone(), winner);
-                    we_lost
+                    lost
                 }
             }
         }
@@ -939,33 +945,77 @@ fn apply_subnet_message(
             {
                 store.remove(cidr);
             }
-            false
+            None
         }
         // Lease/DNS/Service CRDT messages are out of scope for the subnet claim.
-        _ => false,
+        _ => None,
     }
 }
 
 /// Manage this node's subnet claim: after a warmup to learn existing claims,
-/// pick a free /24 and publish it; re-claim whenever a conflict costs us ours.
+/// pick a free /24 and publish it; re-claim whenever a conflict costs us ours,
+/// retracting the lost subnet's gateway address first so the node doesn't keep
+/// answering on a /24 the mesh has routed elsewhere.
 async fn claim_manager<T: GossipTransport>(
     sync: Arc<GossipSync<T>>,
     store: ClaimStore,
     self_id: String,
     client_iface: String,
-    mut reclaim_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    mut reclaim_rx: tokio::sync::mpsc::UnboundedReceiver<Ipv4Net>,
 ) {
     tokio::time::sleep(CLAIM_WARMUP).await;
     claim_and_publish(&sync, &store, &self_id, &client_iface).await;
-    while reclaim_rx.recv().await.is_some() {
+    while let Some(lost) = reclaim_rx.recv().await {
         // Brief pause so a conflict storm settles before we re-pick.
         tokio::time::sleep(Duration::from_secs(1)).await;
-        info!("lost our subnet claim in a conflict — re-claiming");
+        info!(subnet = %lost, "lost our subnet claim in a conflict — retracting its address and re-claiming");
+        retract_client_addr(lost, &client_iface).await;
         claim_and_publish(&sync, &store, &self_id, &client_iface).await;
     }
 }
 
-/// Pick a free /24 (avoiding known claims), record it, assign its `.1` to the
+/// Partition the claim map from `self_id`'s point of view: the senior claim we
+/// own (lowest HLC — first-writer-wins seniority), any extra claims we own
+/// beyond it (to be released), and every other node's claimed v4 subnets (to
+/// be avoided when picking fresh). Pure so it's unit-tested below.
+fn partition_claims(
+    store: &HashMap<String, SubnetClaim>,
+    self_id: &str,
+) -> (
+    Option<(Ipv4Net, SubnetClaim)>,
+    Vec<Ipv4Net>,
+    HashSet<Ipv4Net>,
+) {
+    let mut own: Vec<(Ipv4Net, SubnetClaim)> = store
+        .values()
+        .filter(|c| c.owner_node_id == self_id)
+        .filter_map(|c| match c.cidr {
+            IpNet::V4(n) => Some((n, c.clone())),
+            IpNet::V6(_) => None,
+        })
+        .collect();
+    let foreign: HashSet<Ipv4Net> = store
+        .values()
+        .filter(|c| c.owner_node_id != self_id)
+        .filter_map(|c| match c.cidr {
+            IpNet::V4(n) => Some(n),
+            IpNet::V6(_) => None,
+        })
+        .collect();
+    own.sort_by(|a, b| a.1.claimed_at.cmp(&b.1.claimed_at));
+    let mut own = own.into_iter();
+    let keep = own.next();
+    let extras = own.map(|(n, _)| n).collect();
+    (keep, extras, foreign)
+}
+
+/// Publish this node's subnet claim. A claim we already own — typically
+/// restored from disk across a restart — is reused and re-published as-is
+/// (same `claimed_at`, preserving first-writer seniority), NOT avoided:
+/// treating our own restored claim as foreign made a rebooting node claim a
+/// fresh /24 while still holding and gossiping the old one (mjolnir-mesh-eon).
+/// Extra self-owned claims accumulated by that bug are released. Otherwise
+/// pick a free /24 (avoiding known claims), record it, assign its `.1` to the
 /// client interface as a connected route (so babeld can redistribute it), and
 /// gossip the claim.
 async fn claim_and_publish<T: GossipTransport>(
@@ -974,18 +1024,30 @@ async fn claim_and_publish<T: GossipTransport>(
     self_id: &str,
     client_iface: &str,
 ) {
-    let claimed: HashSet<Ipv4Net> = {
+    let (keep, extras, foreign) = {
         let s = store.lock().expect("claim store poisoned");
-        s.values()
-            .filter_map(|c| match c.cidr {
-                IpNet::V4(n) => Some(n),
-                IpNet::V6(_) => None,
-            })
-            .collect()
+        partition_claims(&s, self_id)
     };
+    for extra in extras {
+        release_claim(sync, store, self_id, extra, client_iface).await;
+    }
+    if let Some((net, claim)) = keep {
+        match sync
+            .publish(GossipMessage::SubnetClaimUpdate {
+                cidr: net.to_string(),
+                entry: claim,
+            })
+            .await
+        {
+            Ok(()) => info!(subnet = %net, "re-published held subnet claim"),
+            Err(e) => warn!(subnet = %net, "re-publishing held claim failed: {e}"),
+        }
+        assign_client_addr(net, client_iface).await;
+        return;
+    }
     let net = match alloc::pick_subnet_or_smaller(
         self_id,
-        &claimed,
+        &foreign,
         alloc::DEFAULT_MESH_SPACE,
         CLIENT_PREFIX_LEN,
     ) {
@@ -1021,6 +1083,36 @@ async fn claim_and_publish<T: GossipTransport>(
     // a concrete connected route to redistribute and inbound mesh traffic for the
     // /24 is delivered on-link (mjolnir-mesh-e4r, supersedes the df4 gateway route).
     assign_client_addr(net, client_iface).await;
+}
+
+/// Release a claim this node owns but should no longer hold: drop it from the
+/// store, gossip a `SubnetClaimRelease` stamped now (≥ its `claimed_at`, so
+/// peers drop it too), and retract its gateway address from the client
+/// interface. Self-heals the duplicate claims a restart could accumulate
+/// before the eon fix.
+async fn release_claim<T: GossipTransport>(
+    sync: &GossipSync<T>,
+    store: &ClaimStore,
+    self_id: &str,
+    net: Ipv4Net,
+    client_iface: &str,
+) {
+    let cidr_key = net.to_string();
+    store
+        .lock()
+        .expect("claim store poisoned")
+        .remove(&cidr_key);
+    match sync
+        .publish(GossipMessage::SubnetClaimRelease {
+            cidr: cidr_key,
+            hlc: now_hlc(self_id),
+        })
+        .await
+    {
+        Ok(()) => info!(subnet = %net, "released extra subnet claim"),
+        Err(e) => warn!(subnet = %net, "releasing subnet claim: gossip publish failed: {e}"),
+    }
+    retract_client_addr(net, client_iface).await;
 }
 
 /// Load the persisted claim map from `path`. Returns an empty map (not an
@@ -1155,6 +1247,63 @@ async fn assign_client_addr(subnet: Ipv4Net, iface: &str) {
 #[cfg(not(target_os = "linux"))]
 async fn assign_client_addr(_subnet: Ipv4Net, _iface: &str) {}
 
+/// Remove this node's gateway address (`<net>.1/prefix`) from the client
+/// interface — the inverse of [`assign_client_addr`], used when a claim is
+/// lost in a conflict or released. Leaving the address up kept collision
+/// losers answering on a /24 the mesh had routed elsewhere (mjolnir-mesh-eon).
+/// Best-effort: an absent interface or address is logged, not fatal.
+#[cfg(target_os = "linux")]
+async fn retract_client_addr(subnet: Ipv4Net, iface: &str) {
+    use futures_util::stream::TryStreamExt;
+    use rtnetlink::new_connection;
+    use rtnetlink::packet_route::address::AddressAttribute;
+    let gw = Ipv4Addr::from(u32::from(subnet.network()) + 1);
+    let prefix = subnet.prefix_len();
+    let index = match std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        Some(i) => i,
+        None => {
+            warn!(%subnet, iface, "client interface not found — cannot retract client subnet address");
+            return;
+        }
+    };
+    let (connection, handle, _) = match new_connection() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(%subnet, "netlink connect for client address retraction failed: {e}");
+            return;
+        }
+    };
+    tokio::spawn(connection);
+    let mut astream = handle.address().get().execute();
+    while let Ok(Some(msg)) = astream.try_next().await {
+        if msg.header.index != index || msg.header.prefix_len != prefix {
+            continue;
+        }
+        let is_gw = msg.attributes.iter().any(|a| {
+            matches!(
+                a,
+                AddressAttribute::Local(IpAddr::V4(v)) | AddressAttribute::Address(IpAddr::V4(v))
+                    if *v == gw
+            )
+        });
+        if !is_gw {
+            continue;
+        }
+        match handle.address().del(msg).execute().await {
+            Ok(()) => info!(%subnet, %gw, iface, "retracted client subnet gateway address"),
+            Err(e) => warn!(%subnet, %gw, iface, "could not retract client address: {e}"),
+        }
+        return;
+    }
+    info!(%subnet, %gw, iface, "no client subnet gateway address to retract (already absent)");
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn retract_client_addr(_subnet: Ipv4Net, _iface: &str) {}
+
 /// Self-assign this node's derived IPv4 backhaul address (`10.254.0.0/16`, host
 /// from the node id) to the shared-segment interface, so every node has a stable,
 /// collision-free, DHCP-free underlay address in one shared /16. Peers are then
@@ -1166,7 +1315,7 @@ async fn assign_client_addr(_subnet: Ipv4Net, _iface: &str) {}
 ///
 /// Returns the resolved backhaul interface name (which may differ from the
 /// configured `iface` — RouterOS doesn't name it `eth0` — via the sole-interface
-/// fallback below). Callers use it as babel's `type wired` L2 interface
+/// fallback below). Callers use it as babel's wireless L2 interface
 /// (mjolnir-mesh-auu). `None` means no usable interface was found.
 #[cfg(target_os = "linux")]
 async fn assign_backhaul_addr(iface: &str, self_id: &str) -> Option<String> {
@@ -2522,7 +2671,7 @@ mod tests {
         let mut store = HashMap::new();
         let incoming = claim("10.42.1.0/24", "peer-b", 100);
         let reclaim = apply_subnet_message(&mut store, &update(&incoming), "self");
-        assert!(!reclaim);
+        assert!(reclaim.is_none());
         assert_eq!(store["10.42.1.0/24"].owner_node_id, "peer-b");
     }
 
@@ -2532,7 +2681,7 @@ mod tests {
         store.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 100));
         let newer = claim("10.42.1.0/24", "peer-b", 200);
         let reclaim = apply_subnet_message(&mut store, &update(&newer), "self");
-        assert!(!reclaim);
+        assert!(reclaim.is_none());
         assert_eq!(store["10.42.1.0/24"].claimed_at.wall_clock, 200);
     }
 
@@ -2542,7 +2691,7 @@ mod tests {
         store.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 200));
         let older = claim("10.42.1.0/24", "peer-b", 100);
         let reclaim = apply_subnet_message(&mut store, &update(&older), "self");
-        assert!(!reclaim);
+        assert!(reclaim.is_none());
         assert_eq!(store["10.42.1.0/24"].claimed_at.wall_clock, 200);
     }
 
@@ -2554,7 +2703,11 @@ mod tests {
         store.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "self", 200));
         let earlier_peer = claim("10.42.1.0/24", "peer-b", 100);
         let reclaim = apply_subnet_message(&mut store, &update(&earlier_peer), "self");
-        assert!(reclaim, "we should re-claim after losing our subnet");
+        assert_eq!(
+            reclaim,
+            Some("10.42.1.0/24".parse().unwrap()),
+            "we should retract + re-claim after losing our subnet"
+        );
         assert_eq!(store["10.42.1.0/24"].owner_node_id, "peer-b");
     }
 
@@ -2566,7 +2719,7 @@ mod tests {
         store.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "self", 100));
         let later_peer = claim("10.42.1.0/24", "peer-b", 200);
         let reclaim = apply_subnet_message(&mut store, &update(&later_peer), "self");
-        assert!(!reclaim);
+        assert!(reclaim.is_none());
         assert_eq!(store["10.42.1.0/24"].owner_node_id, "self");
     }
 
@@ -2583,7 +2736,7 @@ mod tests {
             },
         };
         let reclaim = apply_subnet_message(&mut store, &release, "self");
-        assert!(!reclaim);
+        assert!(reclaim.is_none());
         assert!(!store.contains_key("10.42.1.0/24"), "newer release should remove the claim");
     }
 
@@ -2601,6 +2754,46 @@ mod tests {
         };
         apply_subnet_message(&mut store, &stale_release, "self");
         assert!(store.contains_key("10.42.1.0/24"), "stale release must not remove a newer claim");
+    }
+
+    #[test]
+    fn partition_reuses_own_restored_claim() {
+        // The eon manifestation-1 setup: after a restart the store holds our
+        // own claim restored from disk. It must come back as the claim to
+        // keep, not land in the avoid set (which made us claim a fresh /24).
+        let mut store = HashMap::new();
+        store.insert("10.42.12.0/24".to_string(), claim("10.42.12.0/24", "self", 100));
+        store.insert("10.42.7.0/24".to_string(), claim("10.42.7.0/24", "peer-b", 50));
+        let (keep, extras, foreign) = partition_claims(&store, "self");
+        let (net, entry) = keep.expect("own restored claim must be reused");
+        assert_eq!(net, "10.42.12.0/24".parse::<Ipv4Net>().unwrap());
+        assert_eq!(entry.claimed_at.wall_clock, 100, "claimed_at must be preserved (seniority)");
+        assert!(extras.is_empty());
+        assert_eq!(foreign.len(), 1);
+        assert!(foreign.contains(&"10.42.7.0/24".parse().unwrap()));
+    }
+
+    #[test]
+    fn partition_keeps_senior_own_claim_releases_extras() {
+        // Damage from the pre-fix restart bug: we own TWO claims. Keep the
+        // senior one (lowest HLC) and mark the newer one for release.
+        let mut store = HashMap::new();
+        store.insert("10.42.13.0/24".to_string(), claim("10.42.13.0/24", "self", 200));
+        store.insert("10.42.12.0/24".to_string(), claim("10.42.12.0/24", "self", 100));
+        let (keep, extras, foreign) = partition_claims(&store, "self");
+        let (net, _) = keep.expect("a claim must be kept");
+        assert_eq!(net, "10.42.12.0/24".parse::<Ipv4Net>().unwrap(), "senior claim wins");
+        assert_eq!(extras, vec!["10.42.13.0/24".parse::<Ipv4Net>().unwrap()]);
+        assert!(foreign.is_empty());
+    }
+
+    #[test]
+    fn partition_empty_store_picks_fresh() {
+        let store = HashMap::new();
+        let (keep, extras, foreign) = partition_claims(&store, "self");
+        assert!(keep.is_none());
+        assert!(extras.is_empty());
+        assert!(foreign.is_empty());
     }
 
     #[test]
