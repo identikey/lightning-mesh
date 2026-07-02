@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use ipnet::{IpNet, Ipv4Net};
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::endpoint::Connection;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
@@ -707,6 +708,33 @@ async fn run_mesh(
         .map(|a| a.id)
         .filter(|id| *id != self_id)
         .collect();
+    // LAN mode: seed iroh's address book with every roster peer's fully
+    // DERIVED address — backhaul ip from the node id + the well-known mesh
+    // port (0yb.1). Every node BINDS at that address, but dialing by bare id
+    // relied on mDNS, which is unreliable over 802.11s and not yet resolved
+    // at boot — so gossip bootstrap dials failed outright ("No addressing
+    // information available") and, with the one-shot join, left every node a
+    // permanent gossip island (mjolnir-mesh-eon). Derivation needs no
+    // discovery at all; mDNS stays as a second candidate source.
+    if lan {
+        match endpoint.address_lookup() {
+            Ok(services) => {
+                let derived = MemoryLookup::new();
+                for id in &bootstrap {
+                    let addr = SocketAddr::new(
+                        std::net::IpAddr::V4(mjolnir_mesh::tun::backhaul_addr(&id.to_string())),
+                        MESH_IROH_PORT,
+                    );
+                    derived.add_endpoint_info(EndpointAddr::new(*id).with_ip_addr(addr));
+                    info!(peer = %id, %addr, "seeded derived peer address (no-discovery dialing)");
+                }
+                services.add(derived);
+            }
+            Err(e) => {
+                warn!("address-lookup services unavailable — cannot seed derived peer addresses: {e}")
+            }
+        }
+    }
     let (gossip_dispatch, claim_task, anti_entropy_task, rejoin_task) = match gossip
         .subscribe(mesh_topic_id(), bootstrap.clone())
         .await
