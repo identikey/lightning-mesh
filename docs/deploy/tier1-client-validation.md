@@ -1,5 +1,20 @@
 # Tier 1 — client data-plane validation (offline runbook)
 
+> **Status 2026-07-01 (field session).** Steps 1.1–1.3 PASS from a live laptop,
+> but only after two live bench workarounds, tracked as beads:
+> **kf7** — the rendered babeld filter `redistribute ip <..>/24 ge 24 le 24
+> allow` never matches, so claimed /24s weren't announced; a bare
+> `redistribute ip <claimed /24> allow` line is hand-inserted in
+> `/etc/mjolnir/babeld.conf` on tr3000/m3000-b/m3000 (reverts whenever meshd
+> re-renders the conf — e.g. service restart). **659** — DHCP served stock
+> 192.168.1.0/24 everywhere; `network.lan.ipaddr` is now the uci list
+> `['<claimed .1>/24','192.168.1.1/24']` on those three nodes (claimed /24
+> primary, stock kept as wired-recovery alias). **wr3000s-a is parked**: it
+> lost the 10.42.242 claim collision to m3000 and holds no client subnet
+> (bead eon) — don't associate test clients to it. Also filed: **eon** (claim
+> lifecycle: restart self-collision, loser never re-claims) and **nrr**
+> (meshd restart leaks a second babeld; babeld /32 local-address export spam).
+
 Self-contained: everything needed is in this file. Run from the laptop while
 associated to the mesh client AP. Nothing to build; this validates what is
 already deployed.
