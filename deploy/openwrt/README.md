@@ -120,15 +120,25 @@ deploy/openwrt/update-fleet.sh m3000                 # a single named node
 ```
 
 It halts on the first failure (that node has rolled itself back; re-runs are
-idempotent) and skips-and-reports unreachable nodes. Reaching `10.254.x` from
-the workstation needs one wired node as SSH jump host — add to `~/.ssh/config`:
+idempotent) and skips-and-reports unreachable nodes. After a rollout, sweep the
+fleet with `deploy/openwrt/validate-fleet.sh` (read-only: build stamp, effective
+backhaul vs inventory, pt9 claim convergence, babel routes).
 
-```
-Host 10.254.*
-    User root
-    ProxyJump root@192.168.1.1
-    StrictHostKeyChecking accept-new
-```
+Reaching `10.254.x` depends on where the workstation sits:
+
+- **On the mesh** (client Wi-Fi or a node's LAN port): `10.254/16` is
+  babel-routed directly from the client subnet — **no jump host**. A stale
+  `ProxyJump` line actively breaks this; keep the stanza jump-free:
+
+  ```
+  Host 10.254.*
+      User root
+      StrictHostKeyChecking accept-new
+  ```
+
+- **On the upstream LAN** (outside the mesh, e.g. the network feeding the
+  gateway's WAN): the mesh correctly refuses SSH on WAN, so you need one wired
+  node as jump host — add `ProxyJump root@192.168.1.1` to the stanza above.
 
 New box? Provision it over ethernet first (`install-node.sh root@192.168.1.1`,
 then `--wireless`), get its id (`mjolnir-meshd id`), and add its line to
