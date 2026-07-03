@@ -25,8 +25,8 @@ expected to become the basis for the public website documentation.
    guessing; we're starting where they arrived.
 4. What this buys philosophically: structural sovereignty, hardware mortality
    without network mortality, discovery as a product instead of an accident.
-5. The network becomes a projection of a set of keys — and that changes who gets
-   to publish services.
+5. The network becomes a projection of a set of keys — which is why we don't
+   need IPv6, and which changes who gets to publish services.
 6. Where this goes next: user identity, service mesh, and a network you own the
    way you own your keys.
 
@@ -213,6 +213,40 @@ What follows from identity-addressing:
   network" are answered by keys and webs of trust, not by MAC filters and
   shared passwords.
 
+### The IPv6 question (and why the answer is keys)
+
+There's a fair question this audience will ask: *why is a next-generation mesh
+running on IPv4?* We asked it ourselves, seriously — sat down and designed the
+IPv6 migration, then red-teamed it. The answer surprised us.
+
+IPv6 made three promises: address space so vast that collisions stop being a
+coordination problem, a stable end-to-end address for every device and
+service, and the end of NAT's middlebox authority. Look at that list again —
+**the identity layer already keeps all three.** A node's public key is a
+collision-free identifier from a space of 2²⁵⁶ that no registry allocates and
+no one can squat. A service reached by key is reachable from anywhere, through
+any NAT, because reachability is negotiated by the identity layer instead of
+begged from the addressing plan. And a key can't be reassigned by whoever runs
+the middlebox, because it isn't a number someone agreed to route — it *is* the
+identity.
+
+So the requirement that seemed to demand IPv6 — a stable address for
+everything — had simply been filed under the wrong layer. Once service
+identity lives in keys, IP stops being the network's identity layer at all
+and demotes to what it's genuinely good at: access plumbing. A familiar,
+debuggable, universally supported way for an ordinary phone to hand packets
+to the nearest node. And IPv4's famous scarcity stops mattering when nothing
+scarce is being asked of it.
+
+This is the narrow waist moving up, one layer at a time: Cerf and Kahn
+unified heterogeneous *links* under IP; we unify heterogeneous *networks* —
+radio islands, NATed households, cloud VMs — under cryptographic identity,
+and IP itself drops below the waist to join the plumbing. What IPv6 tried to
+achieve by widening the number, the identity layer achieves by replacing the
+number with a key. (And nothing is foreclosed: if a single physical island
+ever truly outgrows IPv4, v6 can still be adopted *as plumbing* — nothing
+above the waist would notice.)
+
 ## 9. Publishing a service without paying rent
 
 Here is where the architecture becomes political, in a way this audience will
@@ -254,8 +288,13 @@ Credibility with this audience comes from naming the limits plainly:
   block may announce it" — is a natural extension, planned alongside the
   IdentiKey and service-mesh work. Most meshes can't build this because they
   have no identity layer at all.
-- **Addressing.** Per-node /24s from a private /16 is a finite pool; the
-  hierarchy-and-IPv6 escape hatch is understood and tracked.
+- **Addressing.** Per-node /24s from a private /16 is a finite pool — 256
+  sites per mesh at defaults, expandable to tens of thousands. We evaluated
+  an IPv6 migration and declined it deliberately (see section 8: identity
+  lives in keys, so IP is plumbing); collisions in derived addresses are
+  resolved through the same CRDT machinery that arbitrates subnet claims.
+  If a single physical island ever outgrows IPv4, v6 remains available as
+  plumbing without touching anything above it.
 - **Directory scaling.** Full replication of the address book is comfortable to
   thousands of routers. Beyond that: sharding or DHT-style lookup — a genuinely
   fun future problem, and one the flat-L2 systems never get to have because
@@ -283,6 +322,10 @@ Credibility with this audience comes from naming the limits plainly:
   product, not an accident."
 - "The network is a projection of a set of keys. Everything physical is routing
   detail — as it should be."
+- "We don't need IPv6. We have keys."
+- "IPv6 widened the number. We replaced the number with a key."
+- "Everything IPv6 promised — no scarcity, end-to-end addresses, no NAT
+  middlemen — the identity layer already delivers. IP is just plumbing now."
 - "Ownership by key, not by physical access."
 - "Reachability shouldn't be a subscription."
 - "This is the shape you never have to migrate away from."
