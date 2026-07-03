@@ -1,5 +1,10 @@
 # Why Decentralized Mesh Networking
 
+> Companion doc: [Philosophical outcomes of the architecture](philosophical-outcomes.md)
+> — what the "heterogeneous link islands stitched by L3 routing" design buys, and how
+> it places Lightning Mesh in the lineage of Cerf & Kahn. The public talk narrative
+> lives in [docs/talk/dweb-2026-lightning-mesh.md](../talk/dweb-2026-lightning-mesh.md).
+
 ## The Problem
 
 Today's networks are centralized by default. Your home has one router. Your office has managed switches and a network admin. Events rely on a single AP or a vendor-locked mesh system (Ubiquiti, eero, Google WiFi). If the central device fails, the network fails.
@@ -16,7 +21,7 @@ For events like DWEB (Decentralized Web), the irony is sharp: a movement about d
 
 **Any router can join the mesh. Any router can leave. The network keeps working.**
 
-mjolnir-mesh turns commodity OpenWrt routers (like $60 GL.iNet travel routers) into nodes in a self-organizing mesh network. Plug in a router, it joins. Unplug it, the mesh adapts. No configuration. No central controller. No vendor lock-in.
+Lightning Mesh (formerly mjolnir-mesh) turns commodity OpenWrt routers (like $60 GL.iNet travel routers) into nodes in a self-organizing mesh network. Plug in a router, it joins. Unplug it, the mesh adapts. No configuration. No central controller. No vendor lock-in.
 
 What this enables:
 
@@ -48,20 +53,20 @@ Three things that didn't exist 5 years ago make this feasible:
 ## What Makes This Different
 
 **vs. Traditional mesh WiFi (eero, Ubiquiti, Google WiFi)**:
-- Those systems have a "controller" node. mjolnir-mesh doesn't.
-- Those systems only work with their own hardware. mjolnir-mesh works with any OpenWrt device.
-- Those systems don't cross the internet. mjolnir-mesh does, via Iroh.
+- Those systems have a "controller" node. Lightning Mesh doesn't.
+- Those systems only work with their own hardware. Lightning Mesh works with any OpenWrt device.
+- Those systems don't cross the internet. Lightning Mesh does, via Iroh.
 
 **vs. VPNs (WireGuard, Tailscale)**:
-- VPNs are point-to-point or hub-and-spoke. mjolnir-mesh is full mesh.
-- VPNs don't coordinate DHCP or DNS across nodes. mjolnir-mesh does.
-- VPNs require manual peer configuration. mjolnir-mesh self-organizes.
-- Tailscale is close in spirit but requires their coordination server. mjolnir-mesh is fully self-hosted.
+- VPNs are point-to-point or hub-and-spoke. Lightning Mesh is full mesh.
+- VPNs don't coordinate DHCP or DNS across nodes. Lightning Mesh does.
+- VPNs require manual peer configuration. Lightning Mesh self-organizes.
+- Tailscale is close in spirit but requires their coordination server. Lightning Mesh is fully self-hosted.
 
 **vs. Mesh networking protocols (B.A.T.M.A.N., OLSR, babel)**:
 - Those operate at Layer 2/3 — they route packets between nodes but don't coordinate network services.
-- mjolnir-mesh coordinates DHCP, DNS, service discovery, and routing as a unified system.
-- Those protocols are designed for ad-hoc wireless links. mjolnir-mesh works over any transport Iroh supports (direct, relayed, internet).
+- Lightning Mesh coordinates DHCP, DNS, service discovery, and routing as a unified system.
+- Those protocols are designed for ad-hoc wireless links. Lightning Mesh works over any transport Iroh supports (direct, relayed, internet).
 
 ## Why Flat Mesh Networks Hit a Wall (and This One Doesn't)
 
@@ -117,7 +122,7 @@ Every router runs this stack. No special roles. No leaders. Fully symmetric.
 
 ## One Network on Any Substrate
 
-Look at that stack again, bottom to top. Most mesh products *are* their radio layer — an eero mesh is eeros talking to eeros over eero's radios; pull out the radio and there is no network. mjolnir-mesh inverts that. **The network is the Layer-3 overlay — identity, routing, and coordination — and it rides on top of whatever link happens to be there: an 802.11s radio mesh, a plain WiFi access point, an Ethernet cable, a fiber run, or the open internet.** The radio is plumbing. The network is the layer above it.
+Look at that stack again, bottom to top. Most mesh products *are* their radio layer — an eero mesh is eeros talking to eeros over eero's radios; pull out the radio and there is no network. Lightning Mesh inverts that. **The network is the Layer-3 overlay — identity, routing, and coordination — and it rides on top of whatever link happens to be there: an 802.11s radio mesh, a plain WiFi access point, an Ethernet cable, a fiber run, or the open internet.** The radio is plumbing. The network is the layer above it.
 
 That sounds like a technicality. It is the most consequential design decision in the project, and here is what it buys:
 
@@ -142,7 +147,7 @@ This turns a group of routers into a **decentralized application platform**, not
 
 ## Relationship to Mjolnir
 
-mjolnir-mesh is part of the Mjolnir ecosystem. Mjolnir provides:
+Lightning Mesh is part of the Mjolnir ecosystem. Mjolnir provides:
 - **MicroVMs** with Iroh built into their network stack
 - **MCP (Model Context Protocol)** for AI agent interaction
 - **BTRFS snapshots** for instant VM cloning

@@ -1,4 +1,8 @@
-# mjolnir-mesh
+# Lightning Mesh
+
+> **Naming:** Lightning Mesh is the project's public name. The repository,
+> crates, and binaries keep the `mjolnir-` prefix (`mjolnir-meshd`, etc.), and
+> the overlay interface is `mjolnir0`.
 
 A decentralized router mesh that turns commodity OpenWrt hardware into a
 self-organizing peer-to-peer network. Any router can join. Any router can
@@ -89,7 +93,7 @@ survey in
 
 ## How it composes with the broader vision
 
-mjolnir-mesh provides the *networking*. The complementary projects
+Lightning Mesh provides the *networking*. The complementary projects
 provide compute and access:
 
 - **Mjolnir** runs microVMs on cluster nodes, each with an Iroh endpoint
@@ -112,8 +116,13 @@ and AI agents all coexist on the same fabric.
 ## Documentation
 
 ### Vision
+- [Philosophical outcomes of the architecture](docs/vision/philosophical-outcomes.md)
 - [Why decentralized mesh networking](docs/vision/why-decentralized-mesh.md)
-- [Mjolnir + mjolnir-mesh integration](docs/vision/mjolnir-integration.md)
+- [Mjolnir + Lightning Mesh integration](docs/vision/mjolnir-integration.md)
+
+### Public / talk
+- [DWeb talk source material](docs/talk/dweb-2026-lightning-mesh.md) — the
+  public narrative; eventually the basis for website documentation
 
 ### Architecture
 - [Network architecture (CRDT, routing, subnet allocation)](docs/network-coordination/network-architecture.md)
