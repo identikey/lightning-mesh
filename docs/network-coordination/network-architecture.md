@@ -358,7 +358,13 @@ nodes matters.
 
 ## Relationship to Iroh and IPv4
 
-The two layers have complementary roles:
+The two layers have complementary roles — and the split is deliberate: **iroh is
+the identity/addressing layer, IP is access plumbing.** Node-ids give the mesh
+what IPv6 promised (collision-free identifiers, stable end-to-end addresses for
+services, no NAT authority) with no allocation protocol at all, which is why an
+IPv6 migration was evaluated and rejected
+([decision record](ipv6-addressing-decision.md); philosophy in
+[philosophical-outcomes](../vision/philosophical-outcomes.md) §6):
 
 **Iroh provides:**
 - Encrypted QUIC transport between routers (the tunnel substrate)

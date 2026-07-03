@@ -117,7 +117,43 @@ which island, which radio, which continent — is routing detail. As it should b
   announce it) as a natural extension rather than a bolt-on — most meshes cannot
   build it because they have no identity layer.
 
-## 6. Reachability is not a subscription
+## 6. IPv6's promises, kept by keys
+
+IPv6 made three promises: address space so vast that collisions stop being a
+coordination problem, a stable end-to-end address for every device and service,
+and the end of NAT's middlebox authority. Thirty years on, those promises are
+kept — in Lightning Mesh — by a different layer. An iroh node-id is a
+collision-free identifier from a space of 2²⁵⁶, needs no allocation authority,
+no claim protocol, and no regional registry; it is end-to-end reachable from
+anywhere, through NATs, because reachability is negotiated by the identity
+layer rather than begged from the addressing plan; and it cannot be squatted,
+spoofed, or reassigned, because it *is* a public key rather than a number
+someone agreed to route.
+
+This is why the project examined an IPv6 migration and declined it
+([decision record](../network-coordination/ipv6-addressing-decision.md)) — not
+out of conservatism, but because the requirement that seemed to demand IPv6
+(a stable address for every service) had been misassigned to the IP layer.
+Once service identity lives in keys, IP stops being the network's identity
+layer at all and demotes to what it is genuinely good at: **access plumbing** —
+a familiar, debuggable, universally-supported way for ordinary devices to hand
+packets to the nearest node. IPv4's scarcity stops mattering when nothing
+scarce is being asked of it.
+
+The deeper pattern: the narrow waist moved up. Cerf and Kahn unified
+heterogeneous links under IP; we unify heterogeneous *networks* — islands,
+sites, NATed households, cloud VMs — under cryptographic identity, and IP
+itself becomes one more link technology below the waist. What IPv6 tried to
+achieve by widening the number, the identity layer achieves by replacing the
+number with a key.
+
+**Outcome:** the mesh gets IPv6's endgame — every service stably addressable,
+no scarcity, no NAT authority — without the migration, the dual-stack tax, or
+the dependence on an allocation hierarchy. And it composes: if a giant
+physical island someday genuinely exhausts IPv4 space, IPv6 can still be
+adopted *as plumbing*, because nothing above it would need to change.
+
+## 7. Reachability is not a subscription
 
 Publishing a service today means becoming a network wizard (port forwarding,
 dynamic DNS, certificates, NAT traversal) or renting the capability back from
@@ -149,6 +185,7 @@ is a property of participation, not a product you subscribe to.
 | No authority anywhere | Nothing to configure: genuine plug-and-play |
 | Discovery via gossip/CRDT, not the wire | Partition-tolerant, identity-keyed directory — the durable core |
 | Addresses derived from keys | Network as projection of keys; ownership by key, not physical access |
+| Service identity in keys, not IP | IPv6's endgame without the migration; IP demoted to access plumbing |
 | Joining is reachability | Services without rent; a platform for being of service |
 
 ## Related
