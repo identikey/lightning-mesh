@@ -5,11 +5,23 @@ self-organizing peer-to-peer network. Any router can join. Any router can
 leave. The network keeps working. No controller, no leader, no vendor.
 
 Built on [Iroh](https://www.iroh.computer/) (QUIC + NAT traversal + identity)
-and CRDTs (conflict-free replicated state for shared DHCP/DNS/service
-discovery). Plug in a $30–$80 OpenWrt router; it joins the mesh. Same SSID
-across all of them. Devices roam. Services discoverable by `.mesh` hostname.
-Iroh tunnels stitch the local mesh to remote nodes across the internet when
-they have connectivity, and the mesh keeps functioning when they don't.
+and CRDTs (conflict-free replicated state for shared network coordination).
+
+**The North Star:** plug in a $30–$80 OpenWrt router; it joins the mesh. Same
+SSID across all of them. Devices roam freely. Services broadcast on the local
+mesh, discoverable by `.mesh` hostname, reachable locally *and* over the
+internet via the iroh L3 overlay. Censorship-resistant, truly peer-to-peer, no
+implicit authority, ad hoc join/leave, scalable — one of the most powerful
+upgrades to the internet. Those aren't marketing adjectives; they're hard
+requirements the design is held to.
+
+**What's real today** (field-validated on a four-router fleet): each node owns
+its own routed client `/24`, claimed via CRDT and routed between nodes with
+babel over an 802.11s backhaul — client traffic flows to the internet and
+across LANs. Client L2 is deliberately *not* bridged across nodes (broadcast
+containment is what lets this scale), which means the roaming and
+service-discovery experience is the next phase, not a shipped feature. The
+current data plane is the stepping stone that phase builds on.
 
 See [docs/vision/why-decentralized-mesh.md](docs/vision/why-decentralized-mesh.md)
 for the full motivation, [docs/vision/mjolnir-integration.md](docs/vision/mjolnir-integration.md)
@@ -19,22 +31,21 @@ for how this composes with the broader Mjolnir microVM platform.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  mjolnir-node                                                 │
-│  The daemon: mesh membership, gossip, room/peer management,  │
-│  CRDT state, transport setup                                  │
+│  mjolnir-mesh → mjolnir-meshd                                 │
+│  THE product: the OpenWrt router daemon. 802.11s backhaul,   │
+│  CRDT subnet claims, babel routing, derived overlay          │
+│  addressing, overlay TUN for cross-site iroh traffic         │
 ├──────────────────────────────────────────────────────────────┤
-│  mjolnir-audio                                                │
-│  Real-time multi-peer voice: Opus capture/encode/decode,      │
-│  PLC backends (FARGAN today, neural bridge engine planned),   │
-│  jitter-buffer-fed mixer driving cpal output                  │
+│  mjolnir-meshctl → meshctl                                    │
+│  Operator-side RouterOS reconciler                            │
 ├──────────────────────────────────────────────────────────────┤
-│  mjolnir-media                                                │
-│  Transport-agnostic media primitives: jitter buffer, the     │
-│  Recover trait (decode + conceal seam), SelfHealingBuffer    │
+│  mjolnir-node → mjolnir-mesh (binary)                         │
+│  Desktop/VM mesh daemon: membership, gossip, room/peer       │
+│  management, transport setup                                  │
 ├──────────────────────────────────────────────────────────────┤
-│  mjolnir-moq                                                  │
-│  Media-over-QUIC broadcast scaffolding for one-to-many       │
-│  streaming (distinct from the direct bidi audio path)         │
+│  mjolnir-audio · mjolnir-media · mjolnir-moq                  │
+│  Voice/media subsystem (dormant): Opus pipeline, PLC         │
+│  backends, jitter buffer, Media-over-QUIC scaffolding        │
 └──────────────────────────────────────────────────────────────┘
                             │
                             ▼
@@ -43,49 +54,38 @@ for how this composes with the broader Mjolnir microVM platform.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-| Crate                                    | Role                                                                 |
-|------------------------------------------|----------------------------------------------------------------------|
-| [`mjolnir-node`](crates/mjolnir-node)    | The mesh daemon binary — membership, rooms, gossip, transport wiring |
-| [`mjolnir-audio`](crates/mjolnir-audio)  | Voice pipeline — Opus codec, PLC backends, mixer, capture/playback   |
-| [`mjolnir-media`](crates/mjolnir-media)  | Transport-agnostic media primitives — jitter, `Recover`, self-healing buffer |
-| [`mjolnir-moq`](crates/mjolnir-moq)      | Media-over-QUIC broadcast transport (one-to-many)                     |
+| Crate                                          | Binary          | Role                                                                 |
+|------------------------------------------------|-----------------|----------------------------------------------------------------------|
+| [`mjolnir-mesh`](crates/mjolnir-mesh)          | `mjolnir-meshd` | **The deployed OpenWrt router daemon** — CRDT, gossip, babel, overlay TUN |
+| [`mjolnir-meshctl`](crates/mjolnir-meshctl)    | `meshctl`       | Operator-side RouterOS reconciler                                     |
+| [`mjolnir-node`](crates/mjolnir-node)          | `mjolnir-mesh`  | Desktop/VM mesh daemon — membership, rooms, gossip, transport wiring  |
+| [`mjolnir-audio`](crates/mjolnir-audio)        | —               | Voice pipeline — Opus codec, PLC backends, mixer, capture/playback    |
+| [`mjolnir-media`](crates/mjolnir-media)        | —               | Transport-agnostic media primitives — jitter, `Recover`, self-healing buffer |
+| [`mjolnir-moq`](crates/mjolnir-moq)            | —               | Media-over-QUIC broadcast transport (one-to-many)                     |
 
-## The audio sub-problem
+Note the naming wrinkle: the crate `mjolnir-node` builds a binary named
+`mjolnir-mesh`, while the crate `mjolnir-mesh` builds `mjolnir-meshd` (the
+router daemon). When this README names a binary, it means the binary.
 
-A decentralized mesh is exactly the kind of network where real-time voice
-will *break* the way a centralized network won't. Packets take multiple
-paths. Paths fail and reconverge. A router at the edge of the room briefly
-loses its uplink and rejoins via a different neighbor. The wire is
-adversarial in ways that VoIP designed for a single broadband uplink never
-sees.
+## The audio side-quest
 
-The audio layer is built to keep voice intelligible under exactly those
-conditions. Three problems, three answers in this repo:
+Voice was the original entry point into this project — a decentralized mesh
+is exactly the network where real-time audio breaks in ways single-uplink
+VoIP never sees, and building for that adversarial wire produced the jitter
+buffer, the `Recover` decode-and-conceal seam, and the PLC backend designs.
+That track is now **dormant**: the mesh data plane is the product, and the
+audio crates are a subsystem that will matter again once the service-mesh
+phase gives them a network worth streaming over.
 
-1. **Reorder and jitter under multipath delivery.** Solved by a
-   sequence-keyed jitter buffer with adaptive depth
-   ([`mjolnir-media`](crates/mjolnir-media), design in
-   [`docs/architecture/self-healing-jitter-buffer.md`](docs/architecture/self-healing-jitter-buffer.md)).
-2. **Short packet losses (< 80 ms).** Solved by Opus's built-in decoder
-   PLC — heuristic LPC today, FARGAN neural PLC once linked against
-   libopus 1.5+ — exposed behind a `Recover` trait so the implementation
-   can evolve without touching call sites
-   ([`mjolnir-audio::OpusPlc`](crates/mjolnir-audio/src/conceal.rs)).
-3. **Long burst losses (200 ms – multi-second), DRED redundancy, and
-   out-of-order packets from a future moment.** Designed as a streaming
-   speech LM with fill-in-the-middle training, a speculative output
-   buffer whose depth tracks model entropy, and a metadata sidechannel
-   that surfaces uncertainty to the client. See
-   [`docs/architecture/neural-bridge-plc.md`](docs/architecture/neural-bridge-plc.md).
-   The deployment-focused survey of existing options that motivated this
-   design is in
-   [`docs/research/audio-models-for-neural-plc/synthesis.md`](docs/research/audio-models-for-neural-plc/synthesis.md).
-
-Voice in a mesh is not just "VoIP that happens to be P2P." It is the
-acid test for whether the rest of the architecture — multipath routing,
-self-healing paths, decentralized membership — actually delivers
-something a person can hear cleanly. The PLC work is where the rubber
-meets the road.
+What exists: a sequence-keyed jitter buffer with a self-healing pull path
+([`mjolnir-media`](crates/mjolnir-media), design in
+[`docs/architecture/self-healing-jitter-buffer.md`](docs/architecture/self-healing-jitter-buffer.md)),
+Opus decode with FEC and codec-native concealment behind the `Recover` trait
+([`mjolnir-audio`](crates/mjolnir-audio)), and a forward-looking design for
+long-burst neural concealment
+([`docs/architecture/neural-bridge-plc.md`](docs/architecture/neural-bridge-plc.md),
+survey in
+[`docs/research/audio-models-for-neural-plc/synthesis.md`](docs/research/audio-models-for-neural-plc/synthesis.md)).
 
 ## How it composes with the broader vision
 
@@ -118,12 +118,12 @@ and AI agents all coexist on the same fabric.
 ### Architecture
 - [Network architecture (CRDT, routing, subnet allocation)](docs/network-coordination/network-architecture.md)
 - [Radio backhaul & multi-hop discovery decisions](docs/network-coordination/radio-backhaul-and-discovery.md)
-- [DHCP CRDT design](docs/network-coordination/dhcp-crdt.md)
-- [dnsmasq integration](docs/network-coordination/dnsmasq-integration.md)
 - [P2P resilience](docs/network-coordination/p2p-resilience.md)
 - [Self-healing jitter buffer](docs/architecture/self-healing-jitter-buffer.md)
 - [Neural bridge PLC design](docs/architecture/neural-bridge-plc.md)
-- [Mesh network coordination overview](docs/network-coordination/mesh-network-coordination.md)
+- Archived early designs: [mesh coordination overview](docs/archive/network-coordination/mesh-network-coordination.md),
+  [DHCP CRDT](docs/archive/network-coordination/dhcp-crdt.md),
+  [dnsmasq integration](docs/archive/network-coordination/dnsmasq-integration.md)
 
 ### Deploy & operations
 - [Node operations: management plane, in-band updates, OTA](docs/deploy/node-operations.md)
@@ -134,19 +134,28 @@ and AI agents all coexist on the same fabric.
 
 ## Status
 
-In active development. A real fleet exists: `mjolnir-meshd`
-(`crates/mjolnir-mesh`) runs natively on OpenWrt MT7981 routers over an
-802.11s backhaul, with babel routing, derived `10.254.x/16` overlay
-addressing, and a single-overlay-TUN data plane for cross-site traffic
-(`buw`). Nodes are installed and updated **in-band** — staged payloads
+**The data plane is complete and field-validated** (July 2026) on a
+four-router OpenWrt fleet: `mjolnir-meshd` (`crates/mjolnir-mesh`) runs
+natively over an 802.11s backhaul (`br-mesh`); each node claims a routed
+client `/24` out of `10.42.0.0/16` via CRDT (first-writer-wins,
+gossip-converged over iroh); supervised babeld routes between nodes; a
+derived `10.254.<blake3(node_id)>/16` overlay carries backhaul and
+management; a single overlay TUN (`mjolnir0`) carries cross-site iroh
+traffic. Client traffic is validated end-to-end — to the internet and
+cross-LAN. Nodes are installed and updated **in-band** — staged payloads
 applied detached with health-gated auto-rollback, no ethernet required
-(see [node operations](docs/deploy/node-operations.md)). The
-CRDT/DHCP/DNS coordination layer is designed and partially implemented;
-gossip-propagated peer announcement and IdentiKey-authorized remote
-management/OTA are the active trajectory. The audio pipeline
-(`mjolnir-audio` + `mjolnir-media`) exists and runs; the neural bridge
-PLC engine is a forward-looking design (v2 lane) sequenced after the
-FARGAN/DRED production answer.
+(see [node operations](docs/deploy/node-operations.md)).
+
+A key lesson from deployment: a local mesh routes most efficiently over
+its own L2 island; the iroh L3 overlay earns its keep on internet hops
+and as a first-hop security gateway, not as the local fast path.
+
+Next up (tracked in beads): the gossip address book / multi-hop discovery
+(`0yb` — derived-address seeding is the first stone laid), the
+service-mesh architecture pass (`e21` — broadcast peer/service discovery
+plus conflict resolution), and the IPv6-vs-IPv4 addressing question
+(`bsa` — IPv4 `/24` claims hand out a limited resource). Known gaps:
+babeld SIGHUP respawn (`2zz`) and the validation matrices (`b9a`, `0pv`).
 
 ## Building
 
@@ -157,10 +166,12 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-The mesh daemon binaries are `mjolnir-node` (desktop/VM) and
-`mjolnir-meshd` (`crates/mjolnir-mesh`, the OpenWrt router daemon —
-cross-built static with `deploy/openwrt/build.sh` and pushed with
-`deploy/openwrt/install-node.sh`).
+Binaries (note the crate/binary naming wrinkle): `mjolnir-meshd` comes
+from `crates/mjolnir-mesh` (the OpenWrt router daemon — cross-built
+static aarch64 with `deploy/openwrt/build.sh` and pushed with
+`deploy/openwrt/install-node.sh`); `meshctl` comes from
+`crates/mjolnir-meshctl`; and the desktop/VM daemon binary `mjolnir-mesh`
+comes from `crates/mjolnir-node`.
 
 ## License
 

@@ -1,3 +1,10 @@
+> **ARCHIVED 2026-07-02 — SUPERSEDED OVERVIEW.** The shared-L2 / unified-DHCP model
+> described here was replaced by per-node routed /24s claimed from `10.42.0.0/16` via
+> the subnet-claim CRDT, routed by babeld over the 802.11s backhaul. See
+> `docs/network-coordination/network-architecture.md` ("Why This Scales: No Shared L2
+> Broadcast Domain") for the current, field-validated model. Kept for historical
+> reference.
+
 # mjolnir-mesh: Mesh VPN with Distributed Network Coordination
 
 **Status:** Architecture overview | **Updated:** 2026-03-26
@@ -258,9 +265,9 @@ dependencies align.
 ## Architecture Details
 
 - **CRDT design**: `dhcp-crdt.md`
-- **Network topology**: `network-architecture.md`
+- **Network topology**: `../../network-coordination/network-architecture.md`
 - **dnsmasq integration**: `dnsmasq-integration.md`
-- **Babel routing integration**: `babel-routing.md`
+- **Babel routing integration**: `../../network-coordination/babel-routing.md`
 - **Vision**: `docs/vision/why-decentralized-mesh.md`
 
 ## Crate Architecture
@@ -298,7 +305,7 @@ The DHCP/DNS/CRDT coordination described in this doc suite lives in the mjolnir-
 For newcomers to the project:
 1. [Why Decentralized Mesh](vision/why-decentralized-mesh.md) — motivation and big picture
 2. [This document](mesh-network-coordination.md) — architecture overview
-3. [Network Architecture](architecture/network-architecture.md) — local vs remote modes, routing
+3. [Network Architecture](../../network-coordination/network-architecture.md) — local vs remote modes, routing
 4. [DHCP CRDT](dhcp-crdt.md) — distributed state design and Rust types
 5. [dnsmasq Integration](dnsmasq-integration.md) — practical integration reference
 6. [Mjolnir Integration](vision/mjolnir-integration.md) — how the mesh ties into Mjolnir's microVM platform

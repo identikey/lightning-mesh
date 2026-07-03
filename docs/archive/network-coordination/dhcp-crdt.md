@@ -1,3 +1,10 @@
+> **ARCHIVED 2026-07-02 — PARTIALLY IMPLEMENTED / SUPERSEDED.** The subnet-claim CRDT
+> (`/subnets/{cidr}`, HLC first-writer-wins) shipped as designed and lives in
+> `crates/mjolnir-mesh/src/crdt/`. The lease/DHCP/deauth machinery in this document
+> (CRDT hostsfile, lease lifecycle, conflict deauth, Merkle anti-entropy) was never
+> built — shipped anti-entropy is a full-claim-map rebroadcast every 20s. Kept as
+> design reference for the service-mesh phase (bead `e21`).
+
 # DHCP CRDT Architecture: Distributed Lease Synchronization
 
 **Status:** Architecture specification | **Date:** 2026-03-26 | **Author:** mjolnir-mesh team
@@ -58,7 +65,7 @@ The CRDT is a key/value store with a structured namespace:
 
 Where `{mac}` is the lowercase colon-separated MAC address (e.g., `aa:bb:cc:dd:ee:ff`), `{hostname}` is lowercase and DNS-safe, `{name}` is the service name, and `{cidr}` is CIDR notation with `/` escaped to `_` (e.g., `10.42.1.0_24`).
 
-**Note:** the `/subnets/` namespace is *not* a routing table — it records which router owns which subnet range so two routers don't claim the same /24 at first boot. Actual route computation, propagation, and installation is delegated to Babel (`babeld`). See [babel-routing.md](babel-routing.md) for the rationale and integration.
+**Note:** the `/subnets/` namespace is *not* a routing table — it records which router owns which subnet range so two routers don't claim the same /24 at first boot. Actual route computation, propagation, and installation is delegated to Babel (`babeld`). See [babel-routing.md](../../network-coordination/babel-routing.md) for the rationale and integration.
 
 ### 2.2 Schema Summary
 
@@ -504,9 +511,9 @@ pub struct SubnetClaim {
 }
 ```
 
-Keyed by CIDR with `/` escaped to `_` (e.g., `/subnets/10.42.1.0_24` or `/subnets/10.42.0.0_22`). Records which mesh node has claimed a given subnet range so other routers don't claim an overlapping range. **Not a routing table** — has no `via_node_id`, no metric, no expiry. Babel (see [babel-routing.md](babel-routing.md)) handles route computation and installation. The CRDT entry exists only to coordinate first-boot subnet claims and survive partition/heal scenarios where two routers may have picked overlapping ranges independently.
+Keyed by CIDR with `/` escaped to `_` (e.g., `/subnets/10.42.1.0_24` or `/subnets/10.42.0.0_22`). Records which mesh node has claimed a given subnet range so other routers don't claim an overlapping range. **Not a routing table** — has no `via_node_id`, no metric, no expiry. Babel (see [babel-routing.md](../../network-coordination/babel-routing.md)) handles route computation and installation. The CRDT entry exists only to coordinate first-boot subnet claims and survive partition/heal scenarios where two routers may have picked overlapping ranges independently.
 
-The CIDR's prefix length is configurable per router — operators pick the size their site needs (/24 for ≤254 devices, /22 for ~1 000, /20 for ~4 000, /16 for the whole base). See [network-architecture.md](network-architecture.md) "Subnet Allocation for Remote Sites" and the `mjolnir_mesh::alloc` module.
+The CIDR's prefix length is configurable per router — operators pick the size their site needs (/24 for ≤254 devices, /22 for ~1 000, /20 for ~4 000, /16 for the whole base). See [network-architecture.md](../../network-coordination/network-architecture.md) "Subnet Allocation for Remote Sites" and the `mjolnir_mesh::alloc` module.
 
 Conflicts (two routers write overlapping `/subnets/{cidr}` entries — at the same prefix or with one containing the other) resolve FWW on `claimed_at` HLC. The loser picks the next free slot at its configured prefix length and rewrites its claim.
 
@@ -681,5 +688,5 @@ If two devices present the same MAC (rare but possible with MAC randomization bu
 - **Related docs**:
   - `mesh-network-coordination.md` — high-level mesh vision
   - [§8 Gossip Protocol](#8-gossip-protocol) — iroh gossip transport details (this document)
-  - `network-architecture.md` — subnet claim lifecycle and cross-site packet flow
-  - `babel-routing.md` — Babel integration; rationale for delegating routing
+  - `../../network-coordination/network-architecture.md` — subnet claim lifecycle and cross-site packet flow
+  - `../../network-coordination/babel-routing.md` — Babel integration; rationale for delegating routing

@@ -1,5 +1,11 @@
 # Mjolnir + mjolnir-mesh: A Unified Compute + Networking Fabric
 
+> **Status (2026-07-02):** This is a target-state integration vision. The mesh
+> transport and CRDT subnet-claim data plane exist today (field-validated,
+> `crates/mjolnir-mesh`), but VM registration, `.mesh` service DNS, and
+> per-device CRDT registries are design-stage — they are the substance of the
+> service-mesh phase (bead `e21`).
+
 mjolnir-mesh (the router mesh network) and Mjolnir (the microVM orchestration platform) are separate systems built on the same transport layer — Iroh QUIC. Together, they form a platform where any device on the mesh can spawn and reach VMs anywhere, and any VM can be discovered by hostname. This document describes their integration and the architectural vision it enables.
 
 ## The Three Layers
@@ -239,5 +245,5 @@ The gateway is for reach. The mesh is for performance and sovereignty.
 
 - [Why Decentralized Mesh Networking](why-decentralized-mesh.md) — Motivation and vision for mjolnir-mesh
 - [Network Architecture](../network-coordination/network-architecture.md) — CRDT, routing, subnet allocation
-- [CRDT Design](../network-coordination/dhcp-crdt.md) — Conflict-free replicated data for mesh state
+- [CRDT Design](../archive/network-coordination/dhcp-crdt.md) — Conflict-free replicated data for mesh state (archived design reference; live CRDT doc: [gossip-and-crdt](../network-coordination/gossip-and-crdt.md))
 - [Mjolnir Documentation](https://mjolnir.local) — VM orchestration, snapshots, MCP tools

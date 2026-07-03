@@ -159,10 +159,14 @@ The mesh layer means VMs can be spawned on any node and be instantly reachable b
 
 ## Current Status
 
-mjolnir-mesh is in active development. The Iroh-based mesh node exists (`crates/mjolnir-node`), the MoQ media layer is scaffolded (`crates/mjolnir-moq`), and the CRDT/DHCP/DNS coordination layer is designed and documented. Next: implementation of the CRDT store and dnsmasq integration.
+*Updated 2026-07-02.* The CRDT data plane is shipped and field-validated on a real four-router OpenWrt fleet. `mjolnir-meshd` (`crates/mjolnir-mesh`) runs natively on each router: 802.11s radio backhaul (`br-mesh`), a routed client `/24` per node claimed out of `10.42.0.0/16` via CRDT (first-writer-wins, gossip-converged over Iroh), supervised babel routing between nodes, a derived `10.254.<blake3(node_id)>/16` backhaul-and-management overlay, and a single overlay TUN carrying cross-site Iroh traffic. Client traffic is validated to the internet and cross-LAN. Deploys are in-band with health gates and automatic rollback.
+
+One lesson from the field is worth recording: a local mesh routes most efficiently over its own L2 island. The Iroh L3 overlay is for internet hops and as a first-hop security gateway — not the local fast path.
+
+This is a deliberate stepping stone, not the end state. Next: the gossip address book and multi-hop discovery (bead `0yb`), the service-mesh architecture pass — broadcast peer/service discovery and conflict resolution (bead `e21`), and the IPv6-vs-IPv4 addressing decision, since IPv4 `/24` claims hand out a limited resource (bead `bsa`).
 
 ## References
-- Technical overview: docs/network-coordination/mesh-network-coordination.md
-- CRDT design: docs/network-coordination/dhcp-crdt.md
 - Network architecture: docs/network-coordination/network-architecture.md
-- dnsmasq integration: docs/network-coordination/dnsmasq-integration.md
+- Technical overview (archived): docs/archive/network-coordination/mesh-network-coordination.md
+- CRDT design (archived): docs/archive/network-coordination/dhcp-crdt.md
+- dnsmasq integration (archived): docs/archive/network-coordination/dnsmasq-integration.md

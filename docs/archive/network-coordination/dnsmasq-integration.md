@@ -1,3 +1,10 @@
+> **ARCHIVED 2026-07-02 — NOT IMPLEMENTED / SUPERSEDED.** The daemon never managed
+> dnsmasq files or a dhcp-script; shipped reality is stock OpenWrt dnsmasq steered by
+> UCI reconciliation of the node's claimed /24 (see `reconcile_client_uci` in
+> `crates/mjolnir-mesh/src/bin/mjolnir-meshd.rs` — it sets `network.lan.ipaddr` and
+> restarts dnsmasq via init.d; never SIGHUP). Kept as design reference for the
+> service-mesh phase (bead `e21`).
+
 # dnsmasq Integration
 
 ## Summary
@@ -317,5 +324,5 @@ The 9 non-selected routers simply discard their tentative allocation per RFC 213
 ## References
 
 - CRDT design: `dhcp-crdt.md`
-- Network architecture: `network-architecture.md`
+- Network architecture: `../../network-coordination/network-architecture.md`
 - Top-level overview: `mesh-network-coordination.md`

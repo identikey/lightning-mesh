@@ -1,3 +1,5 @@
+> **ARCHIVED 2026-07-02.** The RouterOS-container MikroTik track is retired (beads ut9/ns1/ecd closed; AP/STA architecture retired). The live fleet is native OpenWrt — see deploy/openwrt/README.md. Kept as historical reference; the backing scripts remain in deploy/mikrotik/.
+
 # Mesh client routing — what it does and why
 
 This explains the route and firewall rules that let a WiFi or LAN client behind

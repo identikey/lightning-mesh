@@ -1,19 +1,29 @@
 # Network Architecture
 
+**Status (2026-07-02):** the routed-/24 model described in "Why This Scales" below is
+shipped and field-validated on a 4-router OpenWrt 802.11s fleet. Sections are annotated
+where the original design diverged from what shipped.
+
 ## Overview
 
-mjolnir-mesh creates a decentralized mesh network across OpenWrt routers. Routers that share a
-physical network (same L2 broadcast domain) bridge into a unified subnet, presenting a single flat
-network to devices. Routers at different physical sites connect via Iroh QUIC tunnels and route IP
-traffic between their local subnets. Both modes coexist: a DWEB event might have 10 co-located
-routers sharing one /24 plus 3 remote participants tunneled in from separate locations.
+mjolnir-mesh creates a decentralized mesh network across OpenWrt routers. Each node owns
+its **own routed client `/24`**, claimed from `10.42.0.0/16` via the subnet-claim CRDT
+(gossip over iroh, HLC first-writer-wins). babeld routes between the /24s over the
+802.11s radio backhaul (`br-mesh`), where each node has a derived
+`10.254.<blake3(node_id)>/16` backhaul/management address. Routers at different physical
+sites connect via the iroh QUIC overlay — a single TUN `mjolnir0` multiplexing all peers
+— and route IP traffic between their local subnets.
+
+The operational lesson from deployment: **local mesh traffic routes most efficiently
+over the 802.11s L2 island; the iroh L3 overlay is for internet hops and as a first-hop
+security gateway.**
 
 ```
-Site A (local L2)                          Site B (remote)
+Site A (802.11s island, babel-routed)      Site B (remote)
  ┌──────────────────────────┐               ┌──────────────────┐
  │  Router-1  Router-2  ... │               │     Router-5     │
- │  10.42.1.0/24            │◄──Iroh QUIC──►│  10.42.2.0/24   │
- │  (shared subnet)         │               │                  │
+ │  10.42.1/24  10.42.2/24  │◄──Iroh QUIC──►│  10.42.5.0/24    │
+ │  (one routed /24 each)   │   (mjolnir0)  │                  │
  └──────────────────────────┘               └──────────────────┘
 ```
 
@@ -21,37 +31,50 @@ Site A (local L2)                          Site B (remote)
 
 ## Two Modes of Interconnection
 
-### Mode 1: Local (Same L2)
+### Mode 1: Flat Local Island — FUTURE / OPTIONAL, NOT SHIPPED
 
-When routers can reach each other directly — same ethernet switch, same WiFi backhaul, or wired
-together at a single venue — they operate in local mode.
+> **Status:** design for the North-Star roaming experience (same SSID everywhere,
+> devices roam seamlessly, `.mesh` services discoverable locally). It is **not** the
+> shipped default — every node runs its own routed `/24` even when co-located, and the
+> CRDT hostsfile that would make a shared subnet safe is not implemented (service-mesh
+> phase, bead `e21`). See "Why This Scales" for why the routed model is the default.
+
+If a flat island mode is enabled in the future, co-located routers would share a single
+subnet:
 
 - Routers detect each other via mDNS (`_mjolnir-mesh._tcp.local`) or Iroh connection latency
   below the local threshold (~5ms round-trip)
 - All local routers share a single subnet (e.g., `10.42.1.0/24`)
-- Each router runs dnsmasq covering the full shared range; the CRDT hostsfile prevents IP
+- Each router runs dnsmasq covering the full shared range; a CRDT hostsfile prevents IP
   conflicts by distributing MAC-to-IP bindings across all nodes
 - Devices see one flat broadcast domain and can reach any device on any AP without routing
 - mDNS, Bonjour, and AirPlay work natively because they remain on the same broadcast segment
 - Roaming between APs is seamless: the device keeps the same IP, and dnsmasq on the new AP
   already has the MAC reservation from the CRDT
 
-### Mode 2: Remote (Via Iroh)
+### Mode 2: Remote (Via Iroh) — SHIPPED (data plane)
 
-When routers are at different physical locations, they connect through Iroh QUIC tunnels.
+When routers are at different physical locations, they connect through the Iroh QUIC
+overlay.
 
-- Each site has its own subnet (e.g., Site A: `10.42.1.0/24`, Site B: `10.42.2.0/24`)
+- Each site has its own subnet(s) — every node claims one (e.g. `10.42.1.0/24`)
 - Iroh provides NAT traversal, encryption, and relay fallback — no port forwarding required
-- The mjolnir-mesh daemon manages a TUN interface on each router and encapsulates IP packets
-  into the Iroh QUIC stream for delivery to the remote site
-- DNS is synced via CRDT so any device can resolve hostnames registered at any site
-- mDNS is forwarded across sites via avahi-daemon in reflector mode
+- The mjolnir-mesh daemon manages a single overlay TUN (`mjolnir0`) on each router and
+  encapsulates IP packets into Iroh QUIC datagrams for delivery to the remote peer
+- Mesh-wide DNS sync and cross-site mDNS reflection are **planned** (bead `e21`), not shipped
 
 ---
 
 ## Cross-Site Routing
 
-### Packet flow
+> **SUPERSEDED (2026-07):** the per-peer TUN model below (`mj-peer-*` /31s in
+> `10.255.0.0/16`, ipset/iptables forwarding filters) was replaced by what shipped:
+> **babeld peers directly over the 802.11s L2 backhaul** (`br-mesh`, rendered as
+> `type wireless` with RTT metrics), and cross-site iroh traffic rides a **single
+> overlay TUN `mjolnir0`** that multiplexes all peers (bead `buw`). The per-peer
+> tunnel code still exists but is default-off legacy. Kept below for the record.
+
+### Packet flow (superseded per-peer model)
 
 ```
 Alice (10.42.1.50, Router-1 at Site A) → Bob's server (10.42.2.30, Router-5 at Site B)
@@ -63,27 +86,12 @@ Alice (10.42.1.50, Router-1 at Site A) → Bob's server (10.42.2.30, Router-5 at
 5. Return traffic follows the same path in reverse
 ```
 
-### Linux routing setup
+In the shipped model the packet flow is the same shape, but step 2 resolves to either
+a next hop on `br-mesh` (same-island, pure L2 forwarding under babel) or to `mjolnir0`
+(cross-site), and the daemon dispatches per-destination inside the single overlay TUN.
 
-Each router exposes one TUN interface **per active Iroh peer**, managed by the mjolnir-mesh daemon. Babel (`babeld`) runs on each router, peers over those TUN interfaces, and installs/withdraws Linux routes as remote subnets become reachable.
-
-```bash
-# Per-peer Iroh tunnel interface, created on Iroh connect
-ip link add mj-peer-aabbccdd type tun
-ip addr add 10.255.0.1/31 dev mj-peer-aabbccdd  # link-local /31 from reserved 10.255.0.0/16
-ip link set mj-peer-aabbccdd up
-
-# babeld peers on this interface and learns 10.42.2.0/24 from Router-5
-# babeld installs the route directly:
-# ip route add 10.42.2.0/24 dev mj-peer-aabbccdd  ← done by babeld via netlink
-
-# iptables: only forward traffic between known mesh subnets
-iptables -A FORWARD -i mj-peer-+ -o br-lan -m set --match-set mesh-subnets dst -j ACCEPT
-iptables -A FORWARD -i br-lan -o mj-peer-+ -m set --match-set mesh-subnets dst -j ACCEPT
-iptables -A FORWARD -i mj-peer-+ -j DROP
-```
-
-The daemon owns the read-side of each `mj-peer-<id>` TUN. Packets read from a TUN are encapsulated and sent into the corresponding Iroh QUIC stream; incoming packets from Iroh are written back to the matching TUN for kernel delivery. Forwarding decisions are made by the kernel from babeld-installed routes — the daemon does not maintain its own forwarding table.
+What survives from the original design: forwarding decisions are made by the kernel
+from babeld-installed routes — the daemon does not maintain its own forwarding table.
 
 See [babel-routing.md](babel-routing.md) for the full Babel integration spec, including babeld config, failure modes, and the rationale for delegating routing to a battle-tested protocol.
 
@@ -103,8 +111,8 @@ When a router claims a subnet, it writes one entry and reconfigures babeld to re
 Conflicts on `/subnets/` (two routers claim the same /24) resolve via HLC first-writer-wins, same rule as IP-lease conflicts. The loser picks the next free /24 and rewrites its claim.
 
 When a router goes offline:
-- Iroh disconnect tears down the per-peer TUN
-- Babel marks the route unreachable within its hello interval and withdraws it
+- Babel marks its routes unreachable within its hello interval and withdraws them
+  (loss of hello/IHU on `br-mesh`, or iroh disconnect for overlay peers)
 - The `/subnets/` entry persists (the subnet is still *claimed*, just not reachable). On the owner's reboot, Babel re-announces; on a graceful permanent departure, the daemon tombstones the entry.
 
 No heartbeat gossip, no route-TTL refresh, no daemon-side stale-route reaping. Babel handles all of that.
@@ -132,44 +140,54 @@ usable_hosts}`.
    rejected if a containing /22 is already claimed. (CIDR blocks form a tree: overlap reduces to
    `a.contains(b) || b.contains(a)`.)
 5. Write to CRDT: `/subnets/{cidr} → { owner_node_id, site_name, claimed_at }`.
-6. Configure dnsmasq with that range and begin issuing leases.
-7. Add a `redistribute ip {cidr} ge {prefix} le {prefix} allow` line to babeld config; SIGHUP babeld.
-8. If another router later joins the same physical site, it detects the local peer (see below),
-   abandons its own subnet claim, and joins the existing subnet in Mode 1 instead.
+6. Reconcile OpenWrt UCI (`network.lan.ipaddr`) to the claimed /24 and restart dnsmasq
+   via init.d — stock dnsmasq then serves the right pool. (The daemon never edits
+   dnsmasq files directly, and never SIGHUPs it; see `reconcile_client_uci`.)
+7. Add a `redistribute ip {cidr} allow` line to the rendered babeld config; babeld is
+   cleanly **restarted** (procd watches the config file — babeld 1.13 dies on SIGHUP,
+   bead `2zz`).
 
 The two-phase approach (derive then check) is optimistic: hash-based derivation makes collisions
 rare, and the CRDT resolves the uncommon case where two routers happen to prefer the same slot.
 
 ### Claim Cooldown
 
-A router that determines it needs a new subnet waits 10 seconds before writing the claim to the CRDT. This aligns with the local peer detection window — if a local peer is found during the cooldown, the router abandons the claim and joins the existing subnet instead.
+A router that determines it needs a new subnet waits before writing the claim to the
+CRDT (`claim_cooldown.rs`), giving gossip from existing claimants time to arrive so the
+node doesn't claim a /24 that is already taken. (The original rationale — abandoning
+the claim to join a shared subnet in Mode 1 — is future/flat-island only.)
 
 If two routers at different sites claim overlapping subnets (rare — hash derivation across the
 slot count at the chosen prefix makes collision probability `~1/N` where N is the slot count):
 - FWW resolves: lower HLC wins the `/subnets/` entry
 - The loser has zero or very few devices (it just started) — it picks the next free slot at its
   configured prefix length, rewrites its claim, and updates babeld redistribute config
-- If the loser has already assigned IPs from the contested range, those devices are deauthed and
-  re-DHCP on the new range
-- If no free slot exists at the loser's chosen prefix length, the allocator returns `None` and
-  the daemon must escalate (operator widens the mesh space, picks a smaller subnet size, or fails
-  loud — the library does not silently shrink the request)
+- Clients on the losing range simply re-DHCP after the UCI reconcile moves the pool
+  (active deauth was designed but never built)
+- If no free slot exists at the requested prefix length, the daemon automatically
+  retries at smaller sizes (`alloc::pick_subnet_or_smaller`) before failing loud —
+  see `collective-coordination-protocol.md`
 
-### Late Local Peer Discovery
+### Late Local Peer Discovery — FUTURE (flat-island mode only)
 
-If a router claims a subnet and then discovers (via delayed mDNS or gossip) that its site already has one:
-1. Relinquish its subnet claim (tombstone `/subnets/{cidr}` in CRDT)
-2. Remove the corresponding `redistribute` line from babeld config; SIGHUP babeld
-3. Reconfigure dnsmasq to the existing site subnet
-4. Deauth any devices already assigned IPs from the abandoned range
-5. Those devices reconnect and get IPs from the correct subnet
+In the shipped model a late-discovered co-located peer is a non-event: each node keeps
+its own /24 and babel routes between them. Only in a future flat-island mode would a
+router relinquish its claim (tombstone `/subnets/{cidr}`), drop its `redistribute` line
+(babeld restart), and re-point dnsmasq at the shared subnet.
 
 ---
 
-## Local Peer Detection
+## Local Peer Detection — DESIGN ONLY
 
-A router entering a venue needs to determine whether it is joining an existing local cluster or
-starting a new remote site. Detection uses multiple signals in parallel:
+> **Status:** not shipped. There is no latency probe, UDP broadcast probe, or automatic
+> mode selection — there is no mode to select, since every node runs the routed-/24
+> model. Shipped discovery is **derived-address seeding + gossip**: a peer's backhaul
+> address is computable from its node id (`10.254.<blake3(node_id)>`), and the gossip
+> address book (bead `0yb`) carries the rest. mDNS is link-local bootstrap only.
+
+The original design, kept for the flat-island future: a router entering a venue
+determines whether it is joining an existing local cluster or starting a new remote
+site, using multiple signals in parallel:
 
 | Method | Signal | Reliability |
 |---|---|---|
@@ -189,15 +207,14 @@ When a local peer is confirmed:
 
 ---
 
-## SSID and VLAN Guidance
+## SSID Guidance
 
-**Recommended:** All routers use the same SSID and the same VLAN (one broadcast domain). This gives the best experience: seamless roaming, single subnet, native mDNS/Bonjour.
-
-**Different SSIDs, same VLAN:** Works identically. DHCP operates at L2; the SSID is irrelevant once frames are bridged to the shared VLAN. Devices may not roam automatically between different SSIDs (depends on client behavior), but the network coordination is unaffected.
-
-**Different VLANs (even if co-located):** Each VLAN is a separate L2 domain. Routers on different VLANs cannot exchange DHCP broadcasts and are treated as Mode 2 (remote sites) with separate subnets and Iroh tunnel routing, regardless of physical proximity.
-
-**Multi-VLAN on one router:** Future extension. Would require per-VLAN dnsmasq instances and per-VLAN hostsfile management. Not in scope for MVP.
+In the shipped model each node's client AP fronts its own routed `/24`; client L2
+segments are **never bridged across nodes** (see "Why This Scales"). Nodes may share an
+SSID — clients then re-associate to the nearest AP and re-DHCP onto that node's /24
+(an L3 roam; sessions break). The North-Star seamless-roaming experience (same SSID,
+same IP across APs) belongs to the future flat-island mode / `/32` host-route work
+described under Roaming below.
 
 ---
 
@@ -256,20 +273,22 @@ seamless roaming becomes an L3 problem (see below) rather than a free L2 propert
 
 ## Roaming Across Sites
 
-A device physically moving from Site A to Site B:
+What ships today: a device moving between nodes re-associates and re-DHCPs onto the new
+node's `/24` — TCP sessions break, new sessions work immediately. No lease/DNS CRDT is
+consulted (that lane is the `e21` service-mesh phase). The design below is the roadmap:
 
 ```
 1. Device disconnects from Site A's WiFi (Router-1)
 2. Device connects to Site B's WiFi (Router-5)
-3. Router-5's dnsmasq checks the CRDT hostsfile
-4a. [MVP] Device's MAC has a binding at 10.42.1.x — offer a new IP from Site B's range (10.42.2.x)
+3. [Future] Router-5's dnsmasq checks the CRDT hostsfile
+4a. Device's MAC has a binding at 10.42.1.x — offer a new IP from Site B's range (10.42.2.x)
     DNS entry updated via CRDT. TCP sessions break; new sessions work immediately.
-4b. [Future] Offer the same IP (10.42.1.50) — Router-5 redistributes a /32 host route
+4b. Offer the same IP (10.42.1.50) — Router-5 redistributes a /32 host route
     via babeld, Router-1 withdraws its /32 advertisement. TCP sessions survive.
 ```
 
-Option (a) is the MVP behavior: simpler implementation, no host-route management, but TCP
-sessions break on roam. Option (b) enables seamless cross-site roaming by letting Babel carry per-device /32 routes — natively supported but deferred to a later milestone for operational simplicity.
+Option (b) enables seamless cross-site roaming by letting Babel carry per-device /32
+routes — natively supported by babeld but deferred for operational simplicity.
 
 ### Fast roaming (802.11r) and the L2/L3 split
 
@@ -279,10 +298,10 @@ milliseconds instead of running a full 4-way / EAP handshake — which is what m
 enough for latency-sensitive traffic like VoIP. It works on both bands and with SAE (FT-SAE) and
 WPA2-PSK (FT-PSK). So **yes, 802.11r still works** — but *what* it buys depends on the mode:
 
-- **Flat-L2 island (the default: one SSID, one subnet, `mesh_fwding=1`):** 802.11r gives
+- **Flat-L2 island (future mode: one SSID, one subnet, `mesh_fwding=1`):** 802.11r gives
   **fully seamless roaming** — a fast L2 handoff *and* the client keeps its IP, because every AP
   shares the subnet. Nothing else is needed. This is the right mode for dense client roaming
-  (events), and a reason the flat island is the default.
+  (events), and the reason a flat island remains attractive for that use case.
 - **L3-per-hop / cross-site (per-node `/24`, `mesh_fwding=0`, or separate sites):** 802.11r
   still makes the *radio* handoff fast, but it is **necessary, not sufficient** — the client
   lands on a different subnet, so its IP would change and active sessions break unless the IP is
@@ -363,7 +382,9 @@ the underlying transport.
 
 ## References
 
-- CRDT design and hostsfile synchronization: `dhcp-crdt.md`
-- dnsmasq configuration and lease management: `dnsmasq-integration.md`
+- Gossip/CRDT primer (current): `gossip-and-crdt.md`
 - Babel routing integration: `babel-routing.md`
-- Top-level mesh coordination overview: `mesh-network-coordination.md`
+- Archived original designs (lease CRDT, dnsmasq file management, shared-L2 overview):
+  `../archive/network-coordination/dhcp-crdt.md`,
+  `../archive/network-coordination/dnsmasq-integration.md`,
+  `../archive/network-coordination/mesh-network-coordination.md`

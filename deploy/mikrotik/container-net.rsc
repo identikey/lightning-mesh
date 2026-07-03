@@ -9,7 +9,7 @@
 # Upload this file, then:  /import file-name=container-net.rsc
 #
 # Subnet: container 172.20.0.2  <->  router 172.20.0.1 (br-mesh). See
-# docs/deploy/container-networking.md for what each piece does and why.
+# docs/archive/mikrotik-container/container-networking.md for what each piece does and why.
 
 :local sub "172.20.0.0/24"
 

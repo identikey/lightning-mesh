@@ -1,5 +1,10 @@
 # Self-Healing Jitter Buffer
 
+> **Status (2026-07-02):** Design note on the audio track — dormant. Current
+> focus is the router mesh data plane and the service-mesh phase. The core of
+> this design shipped (see "Sequence of work" below); the neural backends did
+> not, and are paused with the rest of the audio track.
+
 A design note for the audio jitter buffer in `mjolnir-audio` and its eventual offload
 to NPU dataflow hardware via [parakeet-aie](https://github.com/duke/parakeet-aie).
 
@@ -92,27 +97,31 @@ forces the runtime to solve the things that matter for *any* real workload (warm
 kernels, host↔NPU streaming submit/return, bounded latency contracts) without the
 distraction of a 600M-param model port.
 
-## The seam
+## The seam — shipped
 
 The seam lives in two crates: the *generic* decode-and-conceal trait is in
 `mjolnir-media` (so a future `mjolnir-video` can share the same shape); the
-*audio-specific* impls and ergonomic aliases live in `mjolnir-audio`.
+*audio-specific* impls and ergonomic aliases live in `mjolnir-audio`. This
+section originally sketched the design; what follows is what shipped. One
+deliberate divergence from the original sketch: instead of an associated
+`type Output` returned by value, output is written into a **caller-owned
+`&mut [i16]` slice** — backends must not allocate on the inference path.
 
-In `mjolnir-media/src/recover.rs`:
+In `mjolnir-media/src/recover.rs` (implemented):
 
 ```rust
 pub trait Recover: Send {
-    type Output;
-    fn decode(&mut self, packet: &[u8]) -> Result<Self::Output>;
+    /// Decode a freshly-arrived encoded packet, writing PCM into `out`.
+    fn decode(&mut self, packet: &[u8], out: &mut [i16]) -> Result<()>;
     /// `lookahead` is the next-in-sequence packet (if it has already
     /// arrived); codecs supporting forward error correction can use it
     /// to reconstruct the lost frame. The lookahead is non-destructive:
     /// it remains in the buffer and is decoded normally at its own slot.
-    fn decode_lost(&mut self, lookahead: Option<&[u8]>) -> Result<Self::Output>;
+    fn decode_lost(&mut self, lookahead: Option<&[u8]>, out: &mut [i16]) -> Result<()>;
     fn supports_speculation(&self) -> bool { false }
 }
 
-// blanket impl so Box<dyn Recover<...>> itself satisfies Recover
+// blanket impl so Box<dyn Recover> itself satisfies Recover
 impl<R: ?Sized + Recover> Recover for Box<R> { ... }
 ```
 
@@ -123,16 +132,17 @@ expensive state mirroring. Backends that want explicit context (a neural PLC
 conditioned on recent PCM) maintain it internally — they observe each decoded
 frame inside their own `decode` impl.
 
-In `mjolnir-media/src/service.rs`:
+In `mjolnir-media/src/service.rs` (implemented):
 
 ```rust
-pub enum Pulled<T> {
-    Empty,            // warming up
-    Decoded(T),       // from a real received packet
-    Concealed(T),     // synthesised by codec PLC or FEC lookahead
+pub enum PullStatus {
+    Empty,                              // warming up; slice untouched
+    Decoded,                            // from a real received packet
+    Concealed { fec_lookahead: bool },  // synthesised; flag = lookahead was available
 }
 
 pub struct BufferStats {
+    pub received: u64,       // raw arrival count from the wire
     pub decoded: u64,
     pub concealed: u64,
     pub fec_recovered: u64,  // concealments where a lookahead was available
@@ -143,41 +153,46 @@ pub struct SelfHealingBuffer<R: Recover> { /* jitter + recover + stats */ }
 
 impl<R: Recover> SelfHealingBuffer<R> {
     pub fn push(&mut self, seq: u64, packet: Bytes) -> PushOutcome { ... }
-    pub fn pull(&mut self) -> Result<Pulled<R::Output>> { ... }
+    pub fn pull(&mut self, out: &mut [i16]) -> Result<PullStatus> { ... }
     pub fn stats(&self) -> BufferStats { ... }
 }
 ```
 
 On `Pull::Gap` the buffer non-destructively peeks the next slot and
 hands it to `decode_lost` as a recovery hint. Provenance flows back to
-the consumer via the `Pulled` variants, enabling cross-fade and
+the consumer via the `PullStatus` variants, enabling cross-fade and
 observability without leaking codec specifics. `BufferStats` is the
 "Redis INFO" surface — running counts the mixer or any other consumer
 can snapshot.
 
-In `mjolnir-audio/src/conceal.rs`:
+In `mjolnir-audio/src/conceal.rs` (implemented):
 
 ```rust
-pub type PlcBackend = dyn Recover<Output = Vec<i16>> + Send;
+pub type PlcBackend = dyn Recover + Send;
 pub type PlcFactory =
     Arc<dyn Fn(&AudioConfig) -> Result<Box<PlcBackend>> + Send + Sync>;
 ```
 
-Four implementations on the roadmap:
+Backends, implemented and planned:
 
-- `OpusPlc` — wraps the Opus decoder; `decode_lost` calls into Opus's built-in
-  concealment (LACE/NoLACE in Opus 1.5+). Ships today as the CPU default;
-  microsecond-class, zero new dependencies.
-- `SilencePlc` — emits zeros on loss. Useful as a worst-case audibility reference
-  and in tests. Also implemented today.
-- `CpuNeuralPlc` — a hosted small neural PLC model in pure Rust (candle / ort / a
-  custom tiny inference loop). The reference implementation against which AIE output
-  is validated.
-- `AiePlc` — talks to a persistent kernel cascade via parakeet-aie's host runtime.
-  Shares weights with `CpuNeuralPlc`; the two should produce numerically close output
-  (within quantization tolerance) for the same input. `supports_speculation()` returns
-  `true`, enabling the mixer to drive the NPU every frame and discard predictions on
-  successful packet arrival.
+- `OpusPlc` — **shipped** (`conceal.rs`). Wraps the Opus decoder; `decode_lost`
+  hands a lookahead packet to Opus's in-band FEC decode when one is available,
+  and falls back to codec-native concealment (LACE/NoLACE in Opus 1.5+)
+  otherwise. The CPU default; microsecond-class, zero new dependencies.
+- `SilencePlc` — **shipped** (`conceal.rs`). Emits zeros on loss. Useful as a
+  worst-case audibility reference and in tests.
+- `TractPlc` — **scaffold shipped** (`plc_tract.rs`). The CPU neural backend,
+  built on [tract-onnx](https://github.com/sonos/tract): it loads and compiles
+  an ONNX plan today, but no PLC model architecture is wired yet —
+  `decode_lost` bails with a pointer to the research notes. This is the real
+  name of what earlier drafts called `CpuNeuralPlc`; the reference
+  implementation against which AIE output will be validated.
+- `AiePlc` — **future, does not exist**. Talks to a persistent kernel cascade
+  via parakeet-aie's host runtime. Shares weights with `TractPlc`; the two
+  should produce numerically close output (within quantization tolerance) for
+  the same input. `supports_speculation()` returns `true`, enabling the mixer
+  to drive the NPU every frame and discard predictions on successful packet
+  arrival.
 
 `default_plc_factory()` / `silence_plc_factory()` helpers thread the choice
 through `Mixer::start_with_plc`; each registered peer mints its own backend
@@ -223,38 +238,45 @@ detecting real loss and reorder — both required for FEC-driven concealment to
 have anything to do. The cpal output callback in
 `crates/mjolnir-audio/src/mixer.rs` drains each peer's buffer at the audio clock
 rate, decoding present frames with Opus's regular path and calling the
-`PlcBackend` for gaps. Opus in-band FEC is already enabled on the encoder side
-(`crates/mjolnir-audio/src/codec.rs`); the next concrete work is wiring the
-`decode_fec` lookahead path into the buffer's pull logic.
+`PlcBackend` for gaps. Opus in-band FEC is enabled on the encoder side
+(`crates/mjolnir-audio/src/codec.rs`), and the `decode_fec` lookahead path is
+wired through the buffer's pull logic: on a gap, `SelfHealingBuffer::pull`
+peeks the next-in-sequence packet and `OpusPlc::decode_lost` reconstructs the
+lost frame from its FEC payload.
 
 ## Sequence of work
 
-1. **CPU jitter buffer + Opus FEC.** Wire FEC on the encoder side, the
-   `decode(None, fec)` path on the decoder side, and a basic adaptive-depth reorder
-   buffer in the middle. `PlcBackend = CpuOpusPlc`. This alone closes the embarrassing
-   gap where the current code silently drops late packets.
+1. **CPU jitter buffer + Opus FEC.** ✅ Done. FEC on the encoder side, the
+   FEC-lookahead `decode_lost` path on the decoder side, and an adaptive-depth
+   reorder buffer in the middle. `PlcBackend` default is `OpusPlc`. This closed
+   the embarrassing gap where the earlier code silently dropped late packets.
 
-2. **Design the `PlcBackend` trait and the buffer's command surface.** Land the trait
-   and the `JitterBuffer` service struct even if only one backend exists. This is the
-   seam other backends slot into later.
+2. **Design the `PlcBackend` trait and the buffer's command surface.** ✅ Done.
+   The `Recover` trait (`mjolnir-media/src/recover.rs`), `SelfHealingBuffer`
+   (`service.rs`), and the `PlcFactory` seam in the mixer all shipped. This is
+   the seam other backends slot into later.
 
-3. **Reference neural PLC on CPU.** Pick a small published model (LACE/NoLACE port, or
-   a tiny custom one) and stand it up as `CpuNeuralPlc`. This is the ground truth that
-   the AIE port must match within tolerance.
+3. **Reference neural PLC on CPU.** ◐ Scaffold shipped. `TractPlc`
+   (`plc_tract.rs`, tract-onnx) loads and compiles an ONNX plan, but the actual
+   PLC model architecture is not wired yet. Picking and wiring a small
+   published model (LACE/NoLACE port, or a tiny custom one) remains open. This
+   is the ground truth that the AIE port must match within tolerance.
 
-4. **parakeet-aie host runtime — minimal slice.** Define and implement the small
+4. **parakeet-aie host runtime — minimal slice.** Open. Define and implement the small
    `load_kernel / start_persistent / submit / poll / shutdown` surface in parakeet-aie,
    targeted specifically at this workload. This gives parakeet-aie a real first
    integration test that isn't ASR-scale.
 
-5. **AIE kernel cascade for the neural PLC.** Port the reference model layer-by-layer
-   to AIE tiles. Validate numerically against `CpuNeuralPlc` on identical input.
+5. **AIE kernel cascade for the neural PLC.** Open. Port the reference model
+   layer-by-layer to AIE tiles. Validate numerically against `TractPlc` on
+   identical input.
 
-6. **`AiePlc` backend in mjolnir-audio.** Trivial once steps 4 and 5 exist — it's just
-   wrapping the parakeet-aie session in the `PlcBackend` trait.
+6. **`AiePlc` backend in mjolnir-audio.** Open. Trivial once steps 4 and 5 exist —
+   it's just wrapping the parakeet-aie session in the `PlcBackend` trait.
 
-Steps 1–2 are immediate work in this repo. Step 3 can run in parallel with step 4.
-Steps 5–6 are downstream of parakeet-aie progress.
+Steps 1–2 are done. The rest is paused with the audio track; step 3 can run in
+parallel with step 4 whenever it resumes, and steps 5–6 are downstream of
+parakeet-aie progress.
 
 ## Open questions
 
@@ -265,7 +287,7 @@ Steps 5–6 are downstream of parakeet-aie progress.
   former: the backend knows whether speculation is cheap for it.
 
 - **Multi-track buffering.** When mjolnir-mesh grows to video and screen-share tracks
-  (see assessment in `../network-coordination/mesh-network-coordination.md` and the moq-lite group story), the
+  (see assessment in `../archive/network-coordination/mesh-network-coordination.md` and the moq-lite group story), the
   jitter buffer abstraction probably wants to be generalized — different deadlines,
   different concealment strategies, but the same Redis-style service shape.
 

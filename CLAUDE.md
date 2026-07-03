@@ -70,6 +70,7 @@ overlay (iroh + babeld + CRDT) is the product, the radio is plumbing**.
   overlay addressing, babel routing, single overlay TUN `mjolnir0` for
   cross-site iroh traffic (bead `buw`).
 - `crates/mjolnir-node` — desktop/VM mesh daemon (membership, gossip, rooms).
+- `crates/mjolnir-meshctl` — `meshctl`, operator-side RouterOS reconciler.
 - `crates/mjolnir-audio`, `mjolnir-media`, `mjolnir-moq` — voice/media over
   the mesh.
 - `deploy/openwrt/` — fleet install/update: staged payload + detached apply

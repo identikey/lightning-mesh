@@ -2,7 +2,7 @@
 
 **Status:** Draft / exploration (substrate-layer governance) | **Date:** 2026-06-10
 
-The DHCP/subnet CRDT (`/subnets/{cidr}`, see `dhcp-crdt.md` and `babel-routing.md`) makes the mesh
+The subnet CRDT (`/subnets/{cidr}`, see `gossip-and-crdt.md` and `babel-routing.md`) makes the mesh
 IPv4 space (`DEFAULT_MESH_SPACE = 10.42.0.0/16`, 65 534 usable; `alloc.rs`) a *shared commons* with
 no central authority. Allocation works cleanly while the space is mostly empty. This note is about
 the part that needs a defined collective behaviour: **what happens as the space fills up.**
@@ -57,10 +57,11 @@ watch for a growing fleet; widening the pool (§3, response B) raises it dramati
 
 Formalising the allocator's "widen / shrink / fail loud," ordered cheapest-first:
 
-- **A. Shrink the request (auto-downgrade).** On `None`, retry with `bump_smaller_subnet` until a
-  slot is found or the `/30` floor is hit. Fully deterministic, no coordination, no authority. This
-  is the first-line response and should be **automatic** — a node should rarely hard-fail just
-  because its *preferred* size was unavailable.
+- **A. Shrink the request (auto-downgrade). — SHIPPED.** On `None`, retry with
+  `bump_smaller_subnet` until a slot is found or the `/30` floor is hit. Fully
+  deterministic, no coordination, no authority. Implemented as
+  `alloc::pick_subnet_or_smaller`, called by the daemon's `claim_and_publish` — a node
+  no longer hard-fails just because its *preferred* size was unavailable.
 - **B. Widen the pool.** `base` is configurable (`DEFAULT_MESH_SPACE` is only the default). A
   production deployment can run `10.0.0.0/8` (≈16 M addresses) or add a second space. This is the
   real scalability lever and is a pure config decision — no protocol needed.
@@ -100,7 +101,7 @@ they meet, claims may overlap or fragment. Merging should be **consensual and co
 Matching effort to the fact that the space is empty but production is near:
 
 **Do before production (cheap, prevents fatal allocation failures):**
-1. **Auto-downgrade on `None`** (response A) — so allocation degrades gracefully instead of hard-failing.
+1. ~~**Auto-downgrade on `None`** (response A)~~ — **DONE** (`alloc::pick_subnet_or_smaller` via `claim_and_publish`); allocation degrades gracefully instead of hard-failing.
 2. **Pool config knob** (response B) — let a deployment widen to `/8`; document the choice.
 3. **Pressure observability** — expose utilisation + largest-free-slot (in the TUI / metrics).
 
@@ -127,7 +128,7 @@ Matching effort to the fact that the space is empty but production is near:
 ## References
 
 - Allocator & pool: `crates/mjolnir-mesh/src/alloc.rs`
-- Subnet / DHCP CRDT: `dhcp-crdt.md`, `babel-routing.md`
+- Subnet CRDT: `gossip-and-crdt.md`, `babel-routing.md` (original lease design archived at `../archive/network-coordination/dhcp-crdt.md`)
 - Liveness & claim cooldown: `network-architecture.md`
 - Identity & endorsement primitive: `membership-enrollment.md`
 - Application-layer groups (out of scope here, parked): issue `mjolnir-mesh-6t7`

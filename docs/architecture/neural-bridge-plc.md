@@ -1,5 +1,8 @@
 # Neural Bridge PLC — A Streaming Speech LM for Multi-Source Concealment
 
+> **Status (2026-07-02):** Design note on the audio track — dormant. Current
+> focus is the router mesh data plane and the service-mesh phase.
+
 A design note for the v2 packet loss concealment lane in `mjolnir-audio`. This is
 the engine that runs *after* FARGAN + DRED stop being enough — long burst losses,
 multi-second mesh detours, broadcast resync. Companion to

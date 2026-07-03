@@ -5,7 +5,7 @@
 # binaries — gitignored, NOT committed — so fetch them on a fresh clone.
 #
 # They are flashed onto the ROUTER (upload to Files + reboot); they are NOT
-# inputs to the container image build. See docs/deploy/mikrotik-routeros-container.md.
+# inputs to the container image build. See docs/archive/mikrotik-container/mikrotik-routeros-container.md.
 #
 # Usage:
 #   deploy/mikrotik/fetch-firmware.sh [VERSION] [ARCH]

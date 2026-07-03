@@ -103,7 +103,9 @@ meshd rewrites it — meshd starts babeld once and otherwise stays out of the
 restart loop. (Driving those restarts synchronously from meshd wedged the daemon
 under rapid config churn — `mjolnir-mesh-qz9`.) meshd never `fork()`s babeld
 itself; that chain orphaned babelds on `SIGKILL`. `install-node.sh` disables the
-stock `babeld` service so the two don't both run.
+stock `babeld` service so the two don't both run. Note babeld 1.13 exits on
+`SIGHUP` rather than reloading, so config reloads are clean restarts
+(`mjolnir-mesh-2zz` tracks adding procd respawn).
 
 ## Fleet rollout
 
@@ -215,15 +217,19 @@ Edit `/etc/config/mjolnir`, then start the service:
 ssh root@<node> 'mjolnir-meshd id --secret-file /etc/mjolnir/secret'
 
 # add the OTHER nodes' ids to /etc/config/mjolnir   (list peer '<64-hex-id>')
-# set backhaul_iface: 'br-lan' for the wired-switch bench, or run
-#   /root/setup-wireless.sh  then set it to 'br-mesh' for the 802.11s backhaul.
+# run /root/setup-wireless.sh and set backhaul_iface: 'br-mesh' for the
+#   802.11s backhaul (backhaul_iface: 'br-lan' is bench-only, superseded —
+#   the fleet runs 802.11s 'br-mesh').
 
 ssh root@<node> 'service mjolnir-meshd start && logread -e mjolnir_meshd'
 ```
 
-The daemon defaults to `--lan` (offline: mDNS, no relay). meshd self-assigns its
-`10.254.0.0/16` backhaul address on `backhaul_iface`, peers discover each other
-over the flat L2 via mDNS, babel routes over it as `type wired`, and meshd assigns
+The daemon defaults to `--lan` (offline, no relay). meshd self-assigns its
+`10.254.0.0/16` backhaul address on `backhaul_iface` and pins iroh's socket to
+it, and seeds iroh's address book with every roster peer's fully derived
+address — gossip dials need no discovery lookup at all (`mjolnir-mesh-0yb.1`;
+mDNS remains a link-local bootstrap fallback only). Babel routes over the
+backhaul as `type wired`, and meshd assigns
 the claimed /24's `.1` on `client_iface` as a connected route babel redistributes
 (`mjolnir-mesh-e4r`).
 

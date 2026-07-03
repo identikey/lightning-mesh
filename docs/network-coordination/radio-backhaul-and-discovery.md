@@ -4,6 +4,17 @@ Status: living design note. Captures the 2026-06-23 hardware/radio decision, the
 tradeoffs behind it, and the protocol work it implies. See beads
 `mjolnir-mesh-b1d` (wireless backhaul) and the multi-hop-discovery bead.
 
+> **Status update 2026-07-02 — milestone reached.** A 4-node 802.11s OpenWrt fleet is
+> deployed with the data plane field-validated (babeld over `br-mesh`, per-node routed
+> /24s, `mjolnir0` overlay). The **AP/STA radio architecture is RETIRED** — strictly
+> worse than 802.11s, so there is no AP/STA segment and no interop gateway; the
+> RouterOS-container MikroTik track is retired with it (see
+> `docs/archive/mikrotik-container/`). Sections below describing the MikroTik AP/STA
+> segment and mixed-fleet interop are kept as decision history. Discovery shipped as
+> derived-address seeding (`10.254.<blake3(node_id)>`) + gossip; the active fronts are
+> the gossip address book (`0yb`) and the service-mesh pass (`e21`). The hardware
+> analysis below remains valid.
+
 ## TL;DR (decision as of 2026-06-24)
 
 - **Guiding principle: the L3 overlay (iroh + babeld + CRDT) is the product, and it
@@ -14,9 +25,9 @@ tradeoffs behind it, and the protocol work it implies. See beads
   self-enclosed, ~$80–90) running **real 802.11s mesh** backhaul + a client AP +
   the overlay **natively**. Real mesh = multi-link, mobility/churn-robust, and a
   flat L2 within the island (mDNS works there).
-- **Existing MikroTiks: kept as an AP/STA segment.** `wifi-qcom` can't do 802.11s;
-  interop between the AP/STA segment and the mt76 802.11s island is a **known cost**
-  (gateway node + L3 routing), accepted deliberately — the L3 overlay unifies them.
+- ~~**Existing MikroTiks: kept as an AP/STA segment.**~~ **RETIRED 2026-07-02:**
+  AP/STA proved strictly worse than 802.11s and the segment (plus its interop
+  gateway) was dropped; the fleet is all-802.11s.
 - **Heterogeneous fleet ⇒ no universal flat L2 ⇒ discovery must be radio-agnostic**
   (a gossip-based address book), not flat-mDNS-dependent. This makes multi-hop
   discovery (`mjolnir-mesh-0yb`) **core, not optional** — it's what makes "runs on
@@ -75,7 +86,7 @@ multi-hop path selection, not channel diversity.
 So: **backhaul on one radio = one channel, period.** The dual-radio split's value
 is isolating client traffic from the backhaul, not multiplying backhaul channels.
 
-## Mixed fleet / interop (planned: real-mesh nodes + AP/STA)
+## Mixed fleet / interop — HISTORICAL (AP/STA segment retired 2026-07-02)
 
 - **L3 (the protocol): interoperates with anything.** It's a Linux process over
   IP — runs identically on a RouterOS container, OpenWrt, a Raspberry Pi, a laptop.
@@ -165,13 +176,13 @@ the MikroTiks — demonstrating the protocol spanning open-mesh + closed-AP/STA
 hardware, which is the portability story for the talk. Full survey + sources in the
 `mjolnir-mesh-b1d` notes.
 
-## Status & next steps
+## Status & next steps (updated 2026-07-02)
 
-- **Validated:** L3 mesh + derived-IPv4 backhaul + direct iroh tunnels + mDNS
-  discovery, end-to-end on a single L2 segment (armv7 Linux containers).
-- **Next concrete step:** `mjolnir-mesh-2j6` — 4-node mesh on the wired switch
-  (real babeld + client data path). Hardware-agnostic; proves the protocol on the
-  known-good shared segment. Precursor to multi-hop discovery.
-- **Then:** multi-hop discovery (babeld/mDNS synchronization) — its own bead.
-- **Radio:** AP/STA identical-node baseline on the MikroTiks; experiment with
-  real-mesh open nodes (hybrid) in parallel; reconcile via L3.
+- **Validated:** the full data plane on real radios — 4-node 802.11s OpenWrt fleet,
+  babeld over `br-mesh`, per-node routed /24s, `mjolnir0` overlay, derived-address
+  discovery + gossip. (The earlier container/wired-switch milestones this section
+  used to track are complete and superseded.)
+- **Next:** the gossip address book (`0yb` — derived-address seeding already landed)
+  and the service-mesh architecture pass (`e21` — broadcast peer/service discovery
+  with CRDT conflict resolution).
+- **Radio:** all-802.11s on mt76 hardware; AP/STA retired.

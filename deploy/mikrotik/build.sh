@@ -3,7 +3,7 @@
 # and export it as a tar for upload to the router.
 #
 # Board: MikroTik L23UGSR-5HaxD2HaxD (IPQ-5010, ARMv7 32-bit). See
-# docs/deploy/mikrotik-routeros-container.md for the on-router steps.
+# docs/archive/mikrotik-container/mikrotik-routeros-container.md for the on-router steps.
 #
 # Usage:
 #   deploy/mikrotik/build.sh [BIN]

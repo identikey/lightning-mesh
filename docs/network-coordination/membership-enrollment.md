@@ -7,9 +7,10 @@ This document sketches a device-onboarding scheme for mesh routers, modelled on
 the Iroh/daemon layer rather than at 802.11. It replaces and elaborates the "Phase 2:
 Membership CRDT" paragraph in `network-architecture.md` §Security.
 
-The motivating constraint: target hardware (MikroTik RouterBOARD) runs **RouterOS**, whose
-wireless stack does not support real DPP/hostapd. By moving the *design* up to Layer 3, we
-get DPP's scan-a-code-and-trust UX **independent of the radio firmware**. We are provisioning
+The original motivating constraint was MikroTik RouterOS hardware whose wireless stack
+does not support real DPP/hostapd; that fleet is retired (2026-07-02, all-OpenWrt now),
+but the rationale stands: by moving the *design* up to Layer 3, we get DPP's
+scan-a-code-and-trust UX **independent of the radio firmware**. We are provisioning
 *mesh membership*, not Wi-Fi credentials.
 
 ---

@@ -1,12 +1,13 @@
 # P2P Resilience: Centralization Analysis & Plan
 
-mjolnir-mesh is an Iroh-based mesh VPN with distributed network coordination: DHCP,
-DNS, routing, and service discovery are all CRDT-synchronized across mesh nodes. This
-doc analyzes where centralization still exists, what the failure modes are, and what
-the roadmap looks like for improving resilience.
+mjolnir-mesh is an Iroh-based mesh with distributed network coordination. Today the
+CRDT coordinates **subnet claims** (wired and field-validated); DHCP-lease, DNS, and
+service-discovery CRDT lanes are designed but not yet wired (the `e21` service-mesh
+phase). This doc analyzes where centralization exists, what the failure modes are, and
+the roadmap — the Summary table at the bottom is the honest per-layer status.
 
-See [mesh-network-coordination.md](mesh-network-coordination.md) for the full
-architecture and [mesh-network-crdt.md](mesh-network-crdt.md) for the CRDT data model.
+See [network-architecture.md](network-architecture.md) for the full architecture and
+[gossip-and-crdt.md](gossip-and-crdt.md) for the CRDT data model.
 
 ---
 
@@ -35,36 +36,40 @@ topic independently.
 **Already good:** Multi-address tickets mean no single peer is a required bootstrap
 point. Any peer in the mesh can mint a valid ticket using its own `NodeAddr`.
 
-### DHCP coordination
+### DHCP coordination (planned — `e21`)
 
-Every router node runs dnsmasq and participates in DHCP lease assignment. CRDT
-conflict-free merge prevents duplicate address assignment across concurrent allocations.
-No single DHCP server — any router can hand out leases from its assigned subnet range.
+Shipped: each router's stock dnsmasq serves only that node's claimed /24 (subnet
+claims prevent range overlap; no lease-level coordination is needed or wired).
+Planned: CRDT lease replication so a device's `mac → ip` binding is mesh-wide.
 
-**Centralization:** None for ongoing operation. New subnet ranges require coordination
-(manual or future auto-assignment).
+**Centralization:** None either way — there is no single DHCP server today, and the
+planned lease CRDT keeps it that way.
 
-### DNS
+### DNS (planned — `e21`)
 
-DNS records are replicated via CRDT across all nodes. No single authoritative server.
-Each node answers DNS queries for the mesh domain using its local CRDT replica.
+Design: DNS records replicated via CRDT across all nodes, no single authoritative
+server, each node answering `.mesh` queries from its local replica. Not yet wired.
 
-**Centralization:** None structurally. Propagation lag means a freshly added record
-may not be visible on all nodes immediately (eventual consistency).
+**Centralization:** None structurally, once built. Propagation lag means a freshly
+added record may not be visible on all nodes immediately (eventual consistency).
 
-### Routing
+### Routing (shipped)
 
-Subnet ownership is CRDT-synced (`/subnets/{cidr}` claim ledger). Each router redistributes its own subnet via Babel (`babeld`), and Babel computes loop-free cross-site routes over per-peer Iroh tunnels. A node going offline causes Babel to withdraw its routes within seconds; other subnets are unaffected. See `babel-routing.md`.
+Subnet ownership is CRDT-synced (`/subnets/{cidr}` claim ledger). Each router
+redistributes its own subnet via Babel (`babeld`), which computes loop-free routes
+directly over the 802.11s L2 backhaul for same-island peers and over the `mjolnir0`
+iroh overlay for cross-site peers. A node going offline causes Babel to withdraw its
+routes within seconds; other subnets are unaffected. See `babel-routing.md`.
 
-**Centralization:** None. Routes are additive CRDTs — removal requires tombstoning,
-which is propagated on rejoin.
+**Centralization:** None. Routes live in Babel, not the CRDT; only the ownership
+ledger is CRDT state (tombstoned on graceful release).
 
-### Service discovery
+### Service discovery (planned — `e21`)
 
-Service registrations are CRDT-synced and tied to device leases. When a device's
-lease expires, its service entries are cleaned up.
+Design: service registrations CRDT-synced and tied to device leases; when a device's
+lease expires, its service entries are cleaned up. Not yet wired.
 
-**Centralization:** None. Any node can answer service discovery queries.
+**Centralization:** None, once built. Any node can answer service discovery queries.
 
 ### Gossip transport (iroh-gossip)
 
@@ -86,6 +91,8 @@ allows. Self-hosted relay is supported by Iroh.
 ---
 
 ## Failure Scenarios
+
+(For the planned lanes, "DHCP/DNS" below describes the design's behavior.)
 
 | Scenario | Effect |
 |----------|--------|
@@ -145,14 +152,15 @@ management) can be used independently of the VPN coordination layer. This enable
 embedding the mesh library in other Mjolnir components (e.g., guest agent peer
 communication) without taking the full VPN stack.
 
-### Phase 4: DHCP/DNS/routing coordination — PLANNED
+### Phase 4: subnet-claim coordination — DONE; lease/DNS/service lanes — PLANNED (`e21`)
 
-Full CRDT-based network coordination as described in mesh-network-coordination.md and
-mesh-network-crdt.md. Key work items:
-- CRDT merge on gossip message receive
-- Anti-entropy sync on peer reconnect
+Subnet-claim CRDT coordination shipped and is field-validated: merge on gossip receive,
+plus anti-entropy as a full-claim-map rebroadcast every 20s. The remaining lanes —
+lease replication, DNS, service discovery (see gossip-and-crdt.md and the archived
+dhcp-crdt.md design) — are the `e21` service-mesh phase:
 - Lease TTL expiry + tombstone propagation
-- dnsmasq config generation from CRDT state
+- Mesh-wide DNS from CRDT state
+- Service registration/discovery
 
 ### Phase 5: Route persistence & offline resilience — FUTURE
 
@@ -168,13 +176,14 @@ requirement entirely for well-known mesh names.
 | Layer | Centralization | Status |
 |-------|---------------|--------|
 | Ticket bootstrap | Any peer can mint; multi-addr fallback | Done |
-| DHCP coordination | CRDT, no single server | Planned |
-| DNS | CRDT-replicated | Planned |
-| Routing | Babel over per-peer Iroh tunnels; CRDT for subnet claims only | Planned |
-| Service discovery | CRDT, tied to leases | Planned |
+| Subnet claims | CRDT, first-writer-wins, no authority | Done (field-validated) |
+| Routing | Babel over 802.11s L2 + `mjolnir0` overlay; CRDT for subnet claims only | Done (field-validated) |
+| DHCP lease coordination | CRDT, no single server | Planned (`e21`) |
+| DNS | CRDT-replicated | Planned (`e21`) |
+| Service discovery | CRDT, tied to leases | Planned (`e21`) |
 | Gossip | iroh-gossip, fully P2P | Done |
 | NAT traversal | n0 relay (external dep) | Accepted / self-hostable |
 
-The CRDT coordination work (Phases 4-5) is the remaining gap between the current
-implementation and a fully resilient mesh. Phases 1-2 are complete; the gossip and
-connection layers are already P2P.
+The lease/DNS/service CRDT lanes (`e21`) are the remaining gap between the current
+implementation and the full design. The gossip, subnet-claim, and routing layers are
+deployed and P2P.

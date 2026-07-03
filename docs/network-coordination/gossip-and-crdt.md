@@ -1,10 +1,14 @@
 # The Gossip Control Plane & CRDTs — a primer
 
+**Status 2026-07-02:** subnet claims are wired and field-validated on the deployed
+4-router fleet; the lease / DNS / service lanes described below are the service-mesh
+phase (bead `e21`).
+
 **Who this is for:** anyone showing up to mjolnir-mesh who wants to understand how
 the nodes agree on shared facts (who owns which subnet, which device has which IP,
 what services exist) **without a central server, a leader, or a database anyone has
-to trust.** Read this before `dhcp-crdt.md` and `network-architecture.md`, which go
-deeper.
+to trust.** Read this before `network-architecture.md`, which goes deeper (the archived
+`../archive/network-coordination/dhcp-crdt.md` has the full original lease design).
 
 ---
 
@@ -202,7 +206,8 @@ CRDT machinery exists.
 enum), `sync.rs` (transport seam + dispatch loop). Roster/bootstrap: `roster.rs`. The
 iroh-gossip transport impl and apply loop live in `src/bin/mjolnir-meshd.rs`.
 
-**Deeper docs** (this directory): `dhcp-crdt.md` (the lease/DHCP design in full),
+**Deeper docs**: `../archive/network-coordination/dhcp-crdt.md` (the lease/DHCP design
+in full — archived; design reference for `e21`),
 `network-architecture.md` (how this sits under iroh + Babel), `babel-routing.md` (why
 routes are *not* in the CRDT), `radio-backhaul-and-discovery.md` (how nodes find each
 other so gossip can flow multi-hop), `collective-coordination-protocol.md` and

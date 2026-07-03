@@ -3,7 +3,7 @@
 # CURRENT default mode: offline LAN backhaul (`mesh --lan`, mjolnir-mesh-4pk).
 #
 # Prerequisites on each router (do these once, by hand — see
-# docs/deploy/mesh-bringup.md):
+# docs/archive/mikrotik-container/mesh-bringup.md):
 #   1. RouterOS 7.23.1 + container + wifi-qcom packages (deploy/mikrotik/fetch-firmware.sh)
 #   2. device-mode=container enabled (physical reset-button hold at boot)
 #   3. container-net-lan.rsc applied with $meshLink set to the shared-segment

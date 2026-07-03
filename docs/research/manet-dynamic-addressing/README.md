@@ -4,7 +4,7 @@
 Networks"*, VESIT Mumbai, 2016. arXiv:[1605.00398](https://arxiv.org/abs/1605.00398).
 
 **Reviewed:** 2026-06-16 · **Context:** our CRDT-replicated IP/subnet list across mesh nodes
-(`crates/mjolnir-mesh/src/crdt/`, `src/alloc.rs`, `docs/network-coordination/dhcp-crdt.md`).
+(`crates/mjolnir-mesh/src/crdt/`, `src/alloc.rs`, `docs/archive/network-coordination/dhcp-crdt.md`).
 
 ---
 

@@ -1,3 +1,5 @@
+> **ARCHIVED 2026-07-02.** The RouterOS-container MikroTik track is retired (beads ut9/ns1/ecd closed; AP/STA architecture retired). The live fleet is native OpenWrt — see deploy/openwrt/README.md. Kept as historical reference; the backing scripts remain in deploy/mikrotik/.
+
 # 4-Node LAN Mesh Bring-Up (wired switch) — mjolnir-mesh-2j6
 
 Prove the full mesh on the **known-good wired switch** before swapping in the

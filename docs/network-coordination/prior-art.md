@@ -117,7 +117,7 @@ Adopted from CeroWrt's lead. Same protocol, similar role — routing over wirele
 Mirrors AHCP's design: address management and routing are independent protocols. Our `dhcp-crdt` ↔ `babel-routing` split is the same pattern with different mechanics.
 
 ### 4.3 dnsmasq as the DHCP/DNS frontend
-Standard OpenWrt choice. We don't reinvent the local-protocol layer — we feed dnsmasq through its standard `dhcp-hostsfile` and `addn-hosts` integration points and signal SIGHUP for reloads.
+Standard OpenWrt choice. We don't reinvent the local-protocol layer. (Shipped integration is even lighter than this doc designed: the daemon reconciles UCI — `network.lan.ipaddr` — to the claimed /24 and restarts dnsmasq via init.d, never SIGHUP. The `dhcp-hostsfile`/`addn-hosts` feed is the planned `e21` lease/DNS lane.)
 
 ---
 
@@ -190,9 +190,9 @@ Addressing is the sharpest contrast. LibreMesh derives both a ULA `/64` and an I
 **Internal:**
 
 - [babel-routing.md](babel-routing.md) — our Babel integration spec
-- [dhcp-crdt.md](dhcp-crdt.md) — CRDT data model
+- [dhcp-crdt.md](../archive/network-coordination/dhcp-crdt.md) — CRDT data model (archived; subnet-claim lane shipped, lease/DHCP lane is bead `e21`)
 - [network-architecture.md](network-architecture.md) — cross-site topology
-- [mesh-network-coordination.md](mesh-network-coordination.md) — overall architecture
+- [mesh-network-coordination.md](../archive/network-coordination/mesh-network-coordination.md) — original overall architecture (archived, superseded)
 - [radio-backhaul-and-discovery.md](radio-backhaul-and-discovery.md) — radio L2 / multi-hop discovery
 - bead `mjolnir-mesh-0vc` — full LibreMesh routing / addressing / discovery interop breakdown (§6)
 
