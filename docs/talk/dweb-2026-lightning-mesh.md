@@ -328,6 +328,8 @@ Credibility with this audience comes from naming the limits plainly:
   middlemen — the identity layer already delivers. IP is just plumbing now."
 - "Ownership by key, not by physical access."
 - "Reachability shouldn't be a subscription."
+- "Front desk, not checkpoint: a captive portal treats you as a suspect;
+  `id.mesh` is where guests walk up when they choose."
 - "This is the shape you never have to migrate away from."
 
 ## Related documents
