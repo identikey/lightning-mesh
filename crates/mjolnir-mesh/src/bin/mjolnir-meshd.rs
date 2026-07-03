@@ -222,7 +222,14 @@ const MESH_IROH_PORT: u16 = 49737;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Colorize only when stderr is an interactive terminal. Under procd the logs
+    // go to syslog/logread, where the tracing-subscriber ANSI escapes are literal
+    // bytes that sit between a field name and its `=` — silently breaking naive
+    // `grep 'cidr='` fleet checks (a pt9 convergence check false-negatived to 0
+    // this way, mjolnir-mesh-3xb). Interactive runs keep colors.
+    use std::io::IsTerminal;
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -2770,7 +2777,29 @@ fn print_identity(endpoint: &Endpoint) -> Result<()> {
 /// logs for — is the backhaul addr assigned, is its interface dual-addressed,
 /// did routing install mesh routes and via what next-hop — in one command.
 async fn run_status(secret_file: Option<&std::path::Path>) -> Result<()> {
-    let secret = load_or_create_secret(secret_file)?;
+    // status is a diagnostic, never a provisioning step: resolve the SAME secret
+    // path the procd service runs with (CLI flag > UCI meshd.secret_file > the
+    // built-in default) and load it read-only. If no identity is persisted there,
+    // report UNKNOWN rather than deriving a plausible-looking address from a
+    // throwaway key — that garbage once read as a fleet-wide address regression
+    // during pt9 validation (mjolnir-mesh-dbv).
+    let path = resolve_status_secret_file(secret_file);
+    let secret = load_secret_readonly(&path)?;
+
+    println!("mjolnir-meshd status");
+    println!("  build:    {}", env!("MJOLNIR_BUILD"));
+    println!("  version:  {}", env!("CARGO_PKG_VERSION"));
+
+    let Some(secret) = secret else {
+        println!("  node id:  UNKNOWN (no secret at {})", path.display());
+        println!("  backhaul: UNKNOWN (no node identity)");
+        println!();
+        // Interfaces/routes are still worth showing, but we have no derived
+        // address to flag against.
+        print_system_status(None).await;
+        return Ok(());
+    };
+
     let id = secret.public().to_string();
     // Claim-aware (pt9): a node that lost a backhaul collision runs at a
     // re-derived address recorded in the persisted claim map — report THAT,
@@ -2780,9 +2809,6 @@ async fn run_status(secret_file: Option<&std::path::Path>) -> Result<()> {
     let derived = mjolnir_mesh::tun::backhaul_addr(&id);
     let prefix = mjolnir_mesh::tun::BACKHAUL_PREFIX_LEN;
 
-    println!("mjolnir-meshd status");
-    println!("  build:    {}", env!("MJOLNIR_BUILD"));
-    println!("  version:  {}", env!("CARGO_PKG_VERSION"));
     println!("  node id:  {id}");
     if backhaul == derived {
         println!("  backhaul: {backhaul}/{prefix}  (derived from node id)");
@@ -2790,8 +2816,59 @@ async fn run_status(secret_file: Option<&std::path::Path>) -> Result<()> {
         println!("  backhaul: {backhaul}/{prefix}  (RE-DERIVED after collision, pt9; naive derivation would be {derived})");
     }
     println!();
-    print_system_status(backhaul).await;
+    print_system_status(Some(backhaul)).await;
     Ok(())
+}
+
+/// The secret-file path `status` reads when `--secret-file` is omitted. Mirrors
+/// the init script's `config_get secret_file meshd secret_file
+/// '/etc/mjolnir/secret'` so a bare `mjolnir-meshd status` reports the deployed
+/// node's real identity instead of inventing one: explicit flag wins, else the
+/// UCI `meshd.secret_file` option, else the built-in default.
+fn resolve_status_secret_file(cli: Option<&std::path::Path>) -> PathBuf {
+    if let Some(p) = cli {
+        return p.to_path_buf();
+    }
+    uci_secret_file().unwrap_or_else(|| PathBuf::from("/etc/mjolnir/secret"))
+}
+
+/// Best-effort parse of `option secret_file '<path>'` from the `meshd` section of
+/// the UCI config (`/etc/config/mjolnir`). Any read/parse miss returns None and
+/// the caller falls back to the built-in default. Comment lines start with `#`
+/// so they never match the `option secret_file` prefix.
+fn uci_secret_file() -> Option<PathBuf> {
+    let text = std::fs::read_to_string("/etc/config/mjolnir").ok()?;
+    parse_uci_secret_file(&text)
+}
+
+/// Pure parse of the `option secret_file '<path>'` value out of UCI config text.
+/// Split from the file read so it's unit-testable.
+fn parse_uci_secret_file(text: &str) -> Option<PathBuf> {
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("option secret_file") {
+            let val = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+            if !val.is_empty() {
+                return Some(PathBuf::from(val));
+            }
+        }
+    }
+    None
+}
+
+/// Read-only secret load for `status`: never generates or writes a key (unlike
+/// `load_or_create_secret`, which provisions on miss). Returns None when neither
+/// the file nor `IROH_SECRET` yields an identity, so the caller reports UNKNOWN
+/// instead of deriving from a throwaway (mjolnir-mesh-dbv).
+fn load_secret_readonly(path: &Path) -> Result<Option<SecretKey>> {
+    if path.exists() {
+        let hex = std::fs::read_to_string(path)
+            .with_context(|| format!("reading secret file {}", path.display()))?;
+        return Ok(Some(parse_secret_hex(hex.trim())?));
+    }
+    if let Ok(env) = std::env::var("IROH_SECRET") {
+        return Ok(Some(env.parse::<SecretKey>().context("parsing IROH_SECRET")?));
+    }
+    Ok(None)
 }
 
 /// True for the mesh's reserved IPv4 spaces — client `10.42/16`, backhaul
@@ -2805,7 +2882,7 @@ fn is_mesh_v4(ip: Ipv4Addr) -> bool {
 /// Dump interfaces (IPv4) and mesh-space kernel routes via netlink. Flags the
 /// dual-addressed-backhaul trap (the auu root cause) and a missing backhaul addr.
 #[cfg(target_os = "linux")]
-async fn print_system_status(backhaul: Ipv4Addr) {
+async fn print_system_status(backhaul: Option<Ipv4Addr>) {
     use futures_util::stream::TryStreamExt;
     use rtnetlink::packet_route::address::AddressAttribute;
     use rtnetlink::packet_route::link::LinkAttribute;
@@ -2861,7 +2938,7 @@ async fn print_system_status(backhaul: Ipv4Addr) {
             continue;
         }
         let list = &addrs[&idx];
-        let has_backhaul = list.iter().any(|(a, _)| *a == backhaul);
+        let has_backhaul = backhaul.is_some_and(|b| list.iter().any(|(a, _)| *a == b));
         backhaul_seen |= has_backhaul;
         let shown = list
             .iter()
@@ -2877,11 +2954,13 @@ async fn print_system_status(backhaul: Ipv4Addr) {
         };
         println!("  {name:<12} {shown}{flag}");
     }
-    if !backhaul_seen {
-        println!(
-            "  WARNING: derived backhaul {backhaul} is not assigned on any interface \
-             (daemon not running, or the backhaul interface is down)"
-        );
+    if let Some(backhaul) = backhaul {
+        if !backhaul_seen {
+            println!(
+                "  WARNING: derived backhaul {backhaul} is not assigned on any interface \
+                 (daemon not running, or the backhaul interface is down)"
+            );
+        }
     }
     println!();
 
@@ -2925,7 +3004,7 @@ async fn print_system_status(backhaul: Ipv4Addr) {
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn print_system_status(_backhaul: Ipv4Addr) {
+async fn print_system_status(_backhaul: Option<Ipv4Addr>) {
     println!("(interface/route inspection is Linux-only; identity is shown above)");
 }
 
@@ -3075,6 +3154,29 @@ mod tests {
             .iter()
             .map(|c| (c.cidr.to_string(), c.clone()))
             .collect()
+    }
+
+    #[test]
+    fn uci_secret_file_parsed_from_meshd_section() {
+        // Mirrors deploy/openwrt/files/etc/config/mjolnir: status must read the
+        // same path the service runs with, and ignore the commented example line
+        // that mentions --secret-file (mjolnir-mesh-dbv).
+        let cfg = "\
+config meshd 'meshd'
+\toption enabled '1'
+\toption secret_file '/etc/mjolnir/secret'
+\toption babeld 'babeld'
+#   mjolnir-meshd id --secret-file /etc/mjolnir/other
+";
+        assert_eq!(
+            parse_uci_secret_file(cfg),
+            Some(PathBuf::from("/etc/mjolnir/secret"))
+        );
+    }
+
+    #[test]
+    fn uci_secret_file_absent_is_none() {
+        assert_eq!(parse_uci_secret_file("config meshd 'meshd'\n"), None);
     }
 
     #[test]

@@ -4,9 +4,12 @@
 # Read-only; safe to run any time. Pairs with update-fleet.sh.
 #
 # Lessons baked in (learned the hard way during the pt9 rollout):
-# - identity via `service mjolnir-meshd diag`, NEVER bare `mjolnir-meshd status`
-#   (without the service's --secret-file it invents an EPHEMERAL identity and
-#   prints a plausible-looking but wrong backhaul address — bead dbv).
+# - identity via `service mjolnir-meshd diag` (explicit --secret-file from UCI).
+#   Bare `mjolnir-meshd status` is now also safe: it resolves the UCI
+#   secret_file itself and prints `node id: UNKNOWN` when none is found, rather
+#   than inventing an EPHEMERAL identity with a plausible-but-wrong backhaul
+#   address (the pt9 friction that filed bead dbv, since fixed). diag stays the
+#   convention for consistency with the service.
 # - logread output carries ANSI escapes that break naive greps (bead 3xb);
 #   strip them before matching.
 # - the inventory is read on FD 3 — ssh inside the loop would otherwise eat
