@@ -11,7 +11,7 @@
 //!   listen             accept inbound connections, echo ping datagrams
 //!   connect <addr>     dial a peer by address blob, measure a datagram round-trip
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -47,7 +47,9 @@ use mjolnir_mesh::{
 };
 use mjolnir_mesh::GossipMessage;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// ALPN for the P0 mesh connectivity probe. Bumped per protocol revision.
@@ -911,7 +913,7 @@ async fn run_mesh(
             None
         }
     };
-    let (gossip_dispatch, claim_task, anti_entropy_task, rejoin_task) = match gossip
+    let (gossip_dispatch, claim_task, anti_entropy_task, rejoin_task, control_api_task) = match gossip
         .subscribe(mesh_topic_id(), bootstrap.clone())
         .await
     {
@@ -1163,11 +1165,52 @@ async fn run_mesh(
                 })
             };
 
-            (Some(dispatch), Some(claim), Some(anti_entropy), Some(rejoin))
+            // Control API (S3.1, bead e21.2.5): needs `sync` for the immediate
+            // publish/unpublish gossip broadcast (FR25), so — like the tasks
+            // above — it's only started once gossip subscribe succeeds. A
+            // bind failure (port already in use) is logged and non-fatal:
+            // the mesh runs fine without the control plane, same as a failed
+            // babeld reconcile.
+            let control_api = {
+                let sync = sync.clone();
+                let service_book_v2 = service_book_v2.clone();
+                let service_tombstones_v2 = service_tombstones_v2.clone();
+                let lost_names_v2 = lost_names_v2.clone();
+                let service_book_v2_file = service_book_v2_file.clone();
+                let self_id = self_id_str.clone();
+                let gateway = gateway_handle.clone();
+                let claims = claims.clone();
+                let addr_book = addr_book.clone();
+                let user_book = user_book.clone();
+                match control_api_start(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), CONTROL_API_PORT),
+                    sync,
+                    service_book_v2,
+                    service_tombstones_v2,
+                    lost_names_v2,
+                    service_book_v2_file,
+                    self_id,
+                    gateway,
+                    claims,
+                    addr_book,
+                    user_book,
+                    backhaul_ip,
+                )
+                .await
+                {
+                    Ok((_, handle)) => Some(handle),
+                    Err(e) => {
+                        warn!("control API failed to bind 127.0.0.1:{CONTROL_API_PORT}: {e}");
+                        None
+                    }
+                }
+            };
+
+            (Some(dispatch), Some(claim), Some(anti_entropy), Some(rejoin), control_api)
         }
         Err(e) => {
             warn!("gossip subscribe failed: {e}; continuing without CRDT overlay");
-            (None, None, None, None)
+            (None, None, None, None, None)
         }
     };
 
@@ -1285,6 +1328,9 @@ async fn run_mesh(
         t.abort();
     }
     if let Some(t) = &rejoin_task {
+        t.abort();
+    }
+    if let Some(t) = &control_api_task {
         t.abort();
     }
     dns_responder.abort();
@@ -2084,6 +2130,23 @@ struct DirectorySnapshot {
     neighbors: Vec<DirectoryNeighbor>,
     identities: Vec<DirectoryIdentity>,
     services: Vec<DirectoryService>,
+    /// Service names this node lost to a conflicting claim (bead e21.2.5,
+    /// FR32) — additive field, populated only by the control API's
+    /// `/v0/directory` handler ([`build_directory_snapshot_v2`]); the
+    /// file-based projection ([`build_directory_snapshot`]) always leaves
+    /// this empty (v1's `ServiceBook` has no conflict/loss concept). Additive
+    /// so `mjolnir-hello` reading the on-disk file sees no schema break.
+    #[serde(default)]
+    lost_names: Vec<DirectoryLostName>,
+}
+
+/// One service name this node attempted to claim but lost to an earlier
+/// conflicting claim (bead e21.2.4's [`LostName`], projected for the front
+/// desk / API consumer). See [`DirectorySnapshot::lost_names`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DirectoryLostName {
+    name: String,
+    winner_node_id: String,
 }
 
 /// "You are here": this node's own identity, claimed client subnet (if any),
@@ -2192,6 +2255,75 @@ fn build_directory_snapshot(
         neighbors,
         identities,
         services,
+        lost_names: Vec::new(),
+    }
+}
+
+/// Like [`build_directory_snapshot`], but for the control API's
+/// `GET /v0/directory` (bead e21.2.5): sources `services` from the v2 service
+/// book (what `/v0/publish`/`/v0/unpublish` actually mutate) rather than the
+/// legacy v1 [`ServiceBook`], and additively populates `lost_names`. `node`/
+/// `neighbors`/`identities` are projected identically to the file-based
+/// builder (same [`owned_client_subnet`] helper), so the two stay in the same
+/// shape apart from the `services`/`lost_names` source.
+fn build_directory_snapshot_v2(
+    claims: &HashMap<String, SubnetClaim>,
+    addr_book: &AddrBook,
+    user_book: &UserBook,
+    service_book_v2: &ServiceBookV2,
+    lost_names: &LostNameMap,
+    self_id: &str,
+    backhaul_ip: Ipv4Addr,
+) -> DirectorySnapshot {
+    let node = DirectoryNode {
+        node_id: self_id.to_string(),
+        subnet: owned_client_subnet(claims, self_id),
+        backhaul_addr: backhaul_ip.to_string(),
+    };
+
+    let neighbors = addr_book
+        .values()
+        .filter(|entry| entry.node_id != self_id)
+        .map(|entry| DirectoryNeighbor {
+            node_id: entry.node_id.clone(),
+            addrs: entry.direct_addrs.iter().map(ToString::to_string).collect(),
+            subnet: owned_client_subnet(claims, &entry.node_id),
+        })
+        .collect();
+
+    let identities = user_book
+        .values()
+        .map(|u| DirectoryIdentity {
+            username: u.username.clone(),
+            display_name: u.display_name.clone(),
+        })
+        .collect();
+
+    let services = service_book_v2
+        .iter()
+        .map(|(name, entry)| DirectoryService {
+            name: name.clone(),
+            ip: entry.ip.to_string(),
+            port: entry.port,
+            protocol: entry.protocol.clone(),
+        })
+        .collect();
+
+    let lost_names = lost_names
+        .iter()
+        .map(|(name, lost)| DirectoryLostName {
+            name: name.clone(),
+            winner_node_id: lost.winner_node_id.clone(),
+        })
+        .collect();
+
+    DirectorySnapshot {
+        version: DIRECTORY_SCHEMA_VERSION,
+        node,
+        neighbors,
+        identities,
+        services,
+        lost_names,
     }
 }
 
@@ -2836,14 +2968,14 @@ async fn announce_service_book_v2<T: GossipTransport>(
 }
 
 /// Daemon-facing local publish (bead e21.2.3 FR25, e21.2.4 FR34) — the seam
-/// S3.1's control API calls to claim/refresh a service name on behalf of
-/// THIS node. Delegates the reserved-name/lost-to-a-peer/conflict-tracking
-/// logic to [`publish_service_v2`] (lib-side, unit-tested there); on success
+/// S3.1's control API (`control_api_handle_publish`, below) calls to
+/// claim/refresh a service name on behalf of THIS node. Delegates the
+/// reserved-name/lost-to-a-peer/conflict-tracking logic to
+/// [`publish_service_v2`] (lib-side, unit-tested there); on success
 /// broadcasts the publish IMMEDIATELY (not deferred to the next anti-entropy
 /// tick — the whole point of FR25's demo-responsiveness requirement) and
-/// persists. No external IPC surface yet — S3.1 wires a control-API handler
-/// to this function.
-#[allow(dead_code, clippy::too_many_arguments)] // consumed by S3.1's control API; no caller yet in this story
+/// persists.
+#[allow(clippy::too_many_arguments)]
 async fn publish_service<T: GossipTransport>(
     sync: &GossipSync<T>,
     service_book_v2: &Arc<Mutex<ServiceBookV2>>,
@@ -2876,9 +3008,9 @@ async fn publish_service<T: GossipTransport>(
 
 /// Daemon-facing local unpublish, mirroring [`publish_service`]: applies the
 /// tombstone via [`apply_service_unpublish_v2`], broadcasts immediately, and
-/// persists. No external IPC surface yet — S3.1 wires a control-API handler
-/// to this function.
-#[allow(dead_code, clippy::too_many_arguments)] // consumed by S3.1's control API; no caller yet in this story
+/// persists. Called by S3.1's control API (`control_api_handle_unpublish`,
+/// below).
+#[allow(clippy::too_many_arguments)]
 async fn unpublish_service<T: GossipTransport>(
     sync: &GossipSync<T>,
     service_book_v2: &Arc<Mutex<ServiceBookV2>>,
@@ -2910,6 +3042,517 @@ async fn unpublish_service<T: GossipTransport>(
     }
     persist_service_state_v2(&snapshot, service_book_v2_file);
     outcome
+}
+
+// --- control API (S3.1, bead e21.2.5): localhost HTTP/JSON on 127.0.0.1:5380 ---
+//
+// D-002: a minimal hand-rolled HTTP/1.1 server (no framework — NFR1's size
+// budget rules out pulling in hyper/axum for three routes), bound to
+// 127.0.0.1 ONLY (never br-mesh/LAN — this is a local control plane, not a
+// mesh-facing one). `publish`/`unpublish` are thin wrappers over the
+// `publish_service`/`unpublish_service` seams above; `directory` reads the
+// same in-memory stores `write_directory_projection` does, via
+// `build_directory_snapshot_v2`.
+//
+// Request parsing is deliberately minimal: request-line + `Content-Length`
+// header only (no chunked transfer, no keep-alive — every response closes
+// the connection), which is all a same-host CLI client (S3.2) needs. Never
+// panics on malformed input — anything that doesn't parse or doesn't fit the
+// size caps gets a 4xx JSON body, same discipline as the `.mesh` responder.
+
+/// Fixed control-API port (bound to `127.0.0.1` only). Not configurable —
+/// keeping it fixed is what lets S3.2's CLI hard-code the endpoint.
+const CONTROL_API_PORT: u16 = 5380;
+
+/// Body size cap (NFR-style guard against a runaway/malicious local client;
+/// nothing this API accepts is legitimately anywhere near this large).
+const CONTROL_API_MAX_BODY: usize = 64 * 1024;
+
+/// Header-block size cap, independent of the body cap, so a client that never
+/// sends a blank line can't make the daemon buffer unboundedly.
+const CONTROL_API_MAX_HEADER: usize = 8 * 1024;
+
+/// A parsed request: method, path (no query-string handling needed — none of
+/// the three routes take one), and body bytes.
+struct ControlApiRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+/// Why [`control_api_read_request`] gave up before a router could see the
+/// request. Each variant maps to a 4xx JSON response in
+/// [`control_api_handle_conn`]; [`ControlApiReadError::Io`] means the
+/// connection is already gone, so there's nothing to write a response to.
+#[derive(Debug)]
+enum ControlApiReadError {
+    Malformed,
+    HeadersTooLarge,
+    BodyTooLarge,
+    Io(std::io::Error),
+}
+
+/// Read one HTTP/1.1 request off `reader`: request line, headers (only
+/// `Content-Length` is consulted — any other header is ignored, not
+/// rejected), then exactly that many body bytes. Never blocks past
+/// [`CONTROL_API_MAX_HEADER`]/[`CONTROL_API_MAX_BODY`] — an oversized request
+/// is rejected before the daemon buffers the whole thing.
+async fn control_api_read_request(
+    reader: &mut BufReader<&mut TcpStream>,
+) -> Result<ControlApiRequest, ControlApiReadError> {
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .await
+        .map_err(ControlApiReadError::Io)?;
+    if request_line.is_empty() {
+        return Err(ControlApiReadError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed before a request line",
+        )));
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().ok_or(ControlApiReadError::Malformed)?.to_string();
+    let path = parts.next().ok_or(ControlApiReadError::Malformed)?.to_string();
+
+    let mut content_length: usize = 0;
+    let mut header_bytes: usize = 0;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await.map_err(ControlApiReadError::Io)?;
+        if n == 0 {
+            break; // EOF mid-headers — treat what we have as the full header block.
+        }
+        header_bytes += n;
+        if header_bytes > CONTROL_API_MAX_HEADER {
+            return Err(ControlApiReadError::HeadersTooLarge);
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break; // blank line: end of headers.
+        }
+        if let Some((name, value)) = trimmed.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    if content_length > CONTROL_API_MAX_BODY {
+        return Err(ControlApiReadError::BodyTooLarge);
+    }
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body).await.map_err(ControlApiReadError::Io)?;
+    }
+    Ok(ControlApiRequest { method, path, body })
+}
+
+/// Write a JSON response and close the connection (no keep-alive — see the
+/// module doc above).
+async fn control_api_write_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        _ => "Internal Server Error",
+    };
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    if let Err(e) = stream.write_all(header.as_bytes()).await {
+        debug!("control API: failed writing response header: {e}");
+        return;
+    }
+    if let Err(e) = stream.write_all(body).await {
+        debug!("control API: failed writing response body: {e}");
+    }
+    let _ = stream.shutdown().await;
+}
+
+fn control_api_error_body(kind: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "error": kind })).unwrap_or_default()
+}
+
+fn control_api_owned_by_other_body(winner_node_id: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "error": "owned_by_other",
+        "winner_node_id": winner_node_id,
+    }))
+    .unwrap_or_default()
+}
+
+#[derive(Serialize)]
+struct ControlApiEntryResponse<'a> {
+    name: &'a str,
+    owner_node_id: &'a str,
+    ip: String,
+    port: u16,
+    protocol: &'a str,
+    txt: &'a BTreeMap<String, String>,
+}
+
+fn control_api_entry_body(name: &str, entry: &ServiceEntryV2) -> Vec<u8> {
+    let resp = ControlApiEntryResponse {
+        name,
+        owner_node_id: &entry.owner_node_id,
+        ip: entry.ip.to_string(),
+        port: entry.port,
+        protocol: &entry.protocol,
+        txt: &entry.txt,
+    };
+    serde_json::to_vec(&resp).unwrap_or_default()
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlApiPublishRequest {
+    name: String,
+    port: u16,
+    #[serde(default)]
+    txt: BTreeMap<String, String>,
+    /// Not in the story's spec'd request shape (`{name, port, txt?}`), but
+    /// every stored [`ServiceEntryV2`] needs one; defaults to `_tcp` since
+    /// the demo's services (wiki, printer shares) are all TCP. A future story
+    /// can widen the request shape if a UDP service ever needs publishing.
+    #[serde(default = "control_api_default_protocol")]
+    protocol: String,
+}
+
+fn control_api_default_protocol() -> String {
+    "_tcp".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlApiUnpublishRequest {
+    name: String,
+}
+
+/// `POST /v0/publish`: claim/refresh a service name on behalf of THIS node.
+///
+/// FR29 (ip = gateway pin): the published entry's `ip` is always this node's
+/// own client-gateway address — [`GatewayHandle`](mjolnir_mesh::dns_responder::GatewayHandle)'s
+/// claimed `.1`, or [`PRE_CLAIM_GATEWAY`](mjolnir_mesh::dns_responder::PRE_CLAIM_GATEWAY)
+/// before a claim has landed. Decision: publish is NOT rejected pre-claim —
+/// it succeeds against the same 192.168.1.1 fallback `hello.mesh`/`id.mesh`
+/// already answer (D-003), rather than adding a new "retry later" failure
+/// mode; a node that claims a subnet later re-publishes (S2.3's re-announce)
+/// with the corrected `ip` on its own anti-entropy cadence.
+#[allow(clippy::too_many_arguments)]
+async fn control_api_handle_publish<T: GossipTransport>(
+    body: &[u8],
+    sync: &GossipSync<T>,
+    service_book_v2: &Arc<Mutex<ServiceBookV2>>,
+    service_tombstones_v2: &Arc<Mutex<ServiceTombstoneBook>>,
+    lost_names_v2: &Arc<Mutex<LostNameMap>>,
+    service_book_v2_file: &Path,
+    self_id: &str,
+    gateway: &mjolnir_mesh::dns_responder::GatewayHandle,
+) -> (u16, Vec<u8>) {
+    let req: ControlApiPublishRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => return (400, control_api_error_body("malformed_body")),
+    };
+    if req.name.is_empty() {
+        return (400, control_api_error_body("malformed_body"));
+    }
+    let ip = {
+        let guard = gateway.read().expect("gateway handle poisoned");
+        guard.unwrap_or(mjolnir_mesh::dns_responder::PRE_CLAIM_GATEWAY)
+    };
+    let now = now_hlc(self_id);
+    let entry = ServiceEntryV2 {
+        owner_node_id: self_id.to_string(),
+        first_claimed_at: now.clone(),
+        updated_at: now,
+        ip: IpAddr::V4(ip),
+        port: req.port,
+        protocol: req.protocol,
+        txt: req.txt,
+        host_mac: None,
+    };
+    match publish_service(
+        sync,
+        service_book_v2,
+        service_tombstones_v2,
+        lost_names_v2,
+        service_book_v2_file,
+        self_id,
+        &req.name,
+        entry.clone(),
+    )
+    .await
+    {
+        Err(ServicePublishError::Reserved(_)) => (400, control_api_error_body("reserved")),
+        Err(ServicePublishError::LostToPeer { winner_node_id }) => {
+            (409, control_api_owned_by_other_body(&winner_node_id))
+        }
+        Ok(PublishOutcome::Merged(boxed)) => match *boxed {
+            MergeResult::Conflict { winner, loser } if loser.owner_node_id == self_id => {
+                (409, control_api_owned_by_other_body(&winner.owner_node_id))
+            }
+            // Not the local publisher's loss (or a same-owner LWW outcome):
+            // the store now holds our incoming entry (Inserted/Updated) or a
+            // strictly-newer same-owner entry (Unchanged) — report accordingly.
+            MergeResult::Conflict { winner, .. } => (200, control_api_entry_body(&req.name, &winner)),
+            MergeResult::Inserted | MergeResult::Updated | MergeResult::Unchanged => {
+                (200, control_api_entry_body(&req.name, &entry))
+            }
+        },
+        Ok(PublishOutcome::Revived) => (200, control_api_entry_body(&req.name, &entry)),
+        Ok(PublishOutcome::RejectedByTombstone) => {
+            let winner_node_id = service_tombstones_v2
+                .lock()
+                .expect("v2 service tombstones poisoned")
+                .get(&req.name)
+                .map(|t| t.owner_node_id.clone())
+                .unwrap_or_default();
+            (409, control_api_owned_by_other_body(&winner_node_id))
+        }
+    }
+}
+
+/// `POST /v0/unpublish`: release a service name THIS node owns. A name owned
+/// by a different node is left untouched — `IgnoredNotOwner` maps to a 409,
+/// not a silent success, so a caller doesn't mistake "not yours" for "done".
+async fn control_api_handle_unpublish<T: GossipTransport>(
+    body: &[u8],
+    sync: &GossipSync<T>,
+    service_book_v2: &Arc<Mutex<ServiceBookV2>>,
+    service_tombstones_v2: &Arc<Mutex<ServiceTombstoneBook>>,
+    lost_names_v2: &Arc<Mutex<LostNameMap>>,
+    service_book_v2_file: &Path,
+    self_id: &str,
+) -> (u16, Vec<u8>) {
+    let req: ControlApiUnpublishRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => return (400, control_api_error_body("malformed_body")),
+    };
+    if req.name.is_empty() {
+        return (400, control_api_error_body("malformed_body"));
+    }
+    let hlc = now_hlc(self_id);
+    let outcome = unpublish_service(
+        sync,
+        service_book_v2,
+        service_tombstones_v2,
+        lost_names_v2,
+        service_book_v2_file,
+        &req.name,
+        self_id,
+        hlc,
+    )
+    .await;
+    let status_json = |status: &str| serde_json::to_vec(&serde_json::json!({ "status": status })).unwrap_or_default();
+    match outcome {
+        UnpublishOutcome::Unpublished => (200, status_json("unpublished")),
+        UnpublishOutcome::TombstoneRecorded => (200, status_json("tombstone_recorded")),
+        UnpublishOutcome::Unchanged => (200, status_json("unchanged")),
+        UnpublishOutcome::IgnoredNotOwner => (409, control_api_error_body("not_owner")),
+    }
+}
+
+/// `GET /v0/directory`: the same versioned shape `directory.json` writes
+/// (bead avs), sourced from the v2 service book (see
+/// [`build_directory_snapshot_v2`]).
+#[allow(clippy::too_many_arguments)]
+fn control_api_handle_directory(
+    claims: &ClaimStore,
+    addr_book: &Arc<Mutex<AddrBook>>,
+    user_book: &Arc<Mutex<UserBook>>,
+    service_book_v2: &Arc<Mutex<ServiceBookV2>>,
+    lost_names_v2: &Arc<Mutex<LostNameMap>>,
+    self_id: &str,
+    backhaul_ip: Ipv4Addr,
+) -> (u16, Vec<u8>) {
+    let claims_snapshot = claims.lock().expect("claim store poisoned").clone();
+    let addr_snapshot = addr_book.lock().expect("address book poisoned").clone();
+    let user_snapshot = user_book.lock().expect("user directory poisoned").clone();
+    let service_snapshot = service_book_v2.lock().expect("v2 service book poisoned").clone();
+    let lost_snapshot = lost_names_v2.lock().expect("v2 service lost-names poisoned").clone();
+    let snapshot = build_directory_snapshot_v2(
+        &claims_snapshot,
+        &addr_snapshot,
+        &user_snapshot,
+        &service_snapshot,
+        &lost_snapshot,
+        self_id,
+        backhaul_ip,
+    );
+    match serde_json::to_vec(&snapshot) {
+        Ok(bytes) => (200, bytes),
+        Err(e) => {
+            warn!("control API: failed to encode directory snapshot: {e}");
+            (500, control_api_error_body("internal"))
+        }
+    }
+}
+
+/// Route one parsed request to its handler. Unknown path → 404; known path,
+/// wrong method → 405 (checked in that order, matching HTTP convention).
+#[allow(clippy::too_many_arguments)]
+async fn control_api_route<T: GossipTransport>(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    sync: &GossipSync<T>,
+    service_book_v2: &Arc<Mutex<ServiceBookV2>>,
+    service_tombstones_v2: &Arc<Mutex<ServiceTombstoneBook>>,
+    lost_names_v2: &Arc<Mutex<LostNameMap>>,
+    service_book_v2_file: &Path,
+    self_id: &str,
+    gateway: &mjolnir_mesh::dns_responder::GatewayHandle,
+    claims: &ClaimStore,
+    addr_book: &Arc<Mutex<AddrBook>>,
+    user_book: &Arc<Mutex<UserBook>>,
+    backhaul_ip: Ipv4Addr,
+) -> (u16, Vec<u8>) {
+    match path {
+        "/v0/publish" if method == "POST" => {
+            control_api_handle_publish(
+                body,
+                sync,
+                service_book_v2,
+                service_tombstones_v2,
+                lost_names_v2,
+                service_book_v2_file,
+                self_id,
+                gateway,
+            )
+            .await
+        }
+        "/v0/unpublish" if method == "POST" => {
+            control_api_handle_unpublish(
+                body,
+                sync,
+                service_book_v2,
+                service_tombstones_v2,
+                lost_names_v2,
+                service_book_v2_file,
+                self_id,
+            )
+            .await
+        }
+        "/v0/directory" if method == "GET" => control_api_handle_directory(
+            claims,
+            addr_book,
+            user_book,
+            service_book_v2,
+            lost_names_v2,
+            self_id,
+            backhaul_ip,
+        ),
+        "/v0/publish" | "/v0/unpublish" | "/v0/directory" => {
+            (405, control_api_error_body("method_not_allowed"))
+        }
+        _ => (404, control_api_error_body("not_found")),
+    }
+}
+
+/// Serve one accepted connection end-to-end: parse the request, route it,
+/// write the response. Never panics — a read/parse failure gets a 4xx (or,
+/// for a connection that's already gone, no response at all — there's no one
+/// to write to).
+#[allow(clippy::too_many_arguments)]
+async fn control_api_handle_conn<T: GossipTransport>(
+    mut stream: TcpStream,
+    sync: Arc<GossipSync<T>>,
+    service_book_v2: Arc<Mutex<ServiceBookV2>>,
+    service_tombstones_v2: Arc<Mutex<ServiceTombstoneBook>>,
+    lost_names_v2: Arc<Mutex<LostNameMap>>,
+    service_book_v2_file: PathBuf,
+    self_id: String,
+    gateway: mjolnir_mesh::dns_responder::GatewayHandle,
+    claims: ClaimStore,
+    addr_book: Arc<Mutex<AddrBook>>,
+    user_book: Arc<Mutex<UserBook>>,
+    backhaul_ip: Ipv4Addr,
+) {
+    let (status, resp_body) = {
+        let mut reader = BufReader::new(&mut stream);
+        match control_api_read_request(&mut reader).await {
+            Ok(req) => {
+                control_api_route(
+                    &req.method,
+                    &req.path,
+                    &req.body,
+                    &sync,
+                    &service_book_v2,
+                    &service_tombstones_v2,
+                    &lost_names_v2,
+                    &service_book_v2_file,
+                    &self_id,
+                    &gateway,
+                    &claims,
+                    &addr_book,
+                    &user_book,
+                    backhaul_ip,
+                )
+                .await
+            }
+            Err(ControlApiReadError::BodyTooLarge) => (413, control_api_error_body("body_too_large")),
+            Err(ControlApiReadError::HeadersTooLarge) => {
+                (400, control_api_error_body("headers_too_large"))
+            }
+            Err(ControlApiReadError::Malformed) => (400, control_api_error_body("malformed_request")),
+            Err(ControlApiReadError::Io(e)) => {
+                debug!("control API: connection closed before a full request: {e}");
+                return;
+            }
+        }
+    };
+    control_api_write_response(&mut stream, status, &resp_body).await;
+}
+
+/// Bind the control API at `addr` and spawn its accept loop. Returns the
+/// actual bound address (tests bind port `0` for an ephemeral one) and a
+/// handle the caller aborts on shutdown, mirroring `dns_responder::start`.
+#[allow(clippy::too_many_arguments)]
+async fn control_api_start<T: GossipTransport + 'static>(
+    addr: SocketAddr,
+    sync: Arc<GossipSync<T>>,
+    service_book_v2: Arc<Mutex<ServiceBookV2>>,
+    service_tombstones_v2: Arc<Mutex<ServiceTombstoneBook>>,
+    lost_names_v2: Arc<Mutex<LostNameMap>>,
+    service_book_v2_file: PathBuf,
+    self_id: String,
+    gateway: mjolnir_mesh::dns_responder::GatewayHandle,
+    claims: ClaimStore,
+    addr_book: Arc<Mutex<AddrBook>>,
+    user_book: Arc<Mutex<UserBook>>,
+    backhaul_ip: Ipv4Addr,
+) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    let listener = TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    info!(%bound, "control API listening (localhost only)");
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("control API: accept failed: {e}");
+                    continue;
+                }
+            };
+            tokio::spawn(control_api_handle_conn(
+                stream,
+                sync.clone(),
+                service_book_v2.clone(),
+                service_tombstones_v2.clone(),
+                lost_names_v2.clone(),
+                service_book_v2_file.clone(),
+                self_id.clone(),
+                gateway.clone(),
+                claims.clone(),
+                addr_book.clone(),
+                user_book.clone(),
+                backhaul_ip,
+            ));
+        }
+    });
+    Ok((bound, handle))
 }
 
 /// Assign this node's claimed /24 gateway address (`<net>.1/prefix`) to the local
@@ -4689,6 +5332,7 @@ fn parse_peer(arg: &str) -> Result<EndpointAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mjolnir_mesh::LostName;
 
     fn store_of(claims: &[SubnetClaim]) -> HashMap<String, SubnetClaim> {
         claims
@@ -5559,5 +6203,262 @@ config meshd 'meshd'
         // Must not panic even though the spool dir was never created.
         ingest_identity_spool(&missing, &user_book, "router-a");
         assert!(user_book.lock().unwrap().is_empty());
+    }
+
+    // --- control API (mjolnir-mesh-e21.2.5) ------------------------------------
+
+    /// Test-only [`GossipTransport`]: `broadcast` always succeeds and is
+    /// never inspected (these tests only exercise the local-store side of
+    /// publish/unpublish); `recv` never resolves since nothing here runs
+    /// `GossipSync::run`.
+    struct NullTransport;
+
+    #[async_trait::async_trait]
+    impl GossipTransport for NullTransport {
+        async fn broadcast(&self, _payload: Bytes) -> Result<(), GossipError> {
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Bytes, GossipError> {
+            std::future::pending().await
+        }
+    }
+
+    /// Everything a control-API test needs alive for the duration of the
+    /// test: the bound ephemeral address, the accept-loop handle (aborted on
+    /// drop... actually not automatically — callers must abort explicitly,
+    /// same as `run_mesh`'s own shutdown), the `lost_names` handle (tests
+    /// seed it directly to simulate a prior conflict), and the tempdir
+    /// backing `service_book_v2_file` (held so persistence writes during the
+    /// test don't fail against a deleted directory).
+    struct ControlApiTestFixture {
+        addr: SocketAddr,
+        handle: tokio::task::JoinHandle<()>,
+        lost_names_v2: Arc<Mutex<LostNameMap>>,
+        _tempdir: tempfile::TempDir,
+    }
+
+    async fn start_test_control_api(self_id: &str, gateway_ip: Option<Ipv4Addr>) -> ControlApiTestFixture {
+        let service_book_v2 = Arc::new(Mutex::new(ServiceBookV2::new()));
+        let service_tombstones_v2 = Arc::new(Mutex::new(ServiceTombstoneBook::new()));
+        let lost_names_v2: Arc<Mutex<LostNameMap>> = Arc::new(Mutex::new(LostNameMap::new()));
+        start_test_control_api_sharing(
+            self_id,
+            gateway_ip,
+            service_book_v2,
+            service_tombstones_v2,
+            lost_names_v2,
+        )
+        .await
+    }
+
+    /// Like [`start_test_control_api`], but the caller supplies the v2
+    /// service/tombstone/lost-names stores — used to run two "logical nodes"
+    /// (distinct `self_id`, distinct control-API port) against the SAME
+    /// shared service directory, the way two real daemons share it over
+    /// gossip. [`control_api_unpublish_not_owner_is_rejected`] uses this to
+    /// exercise the real not-owner path through HTTP.
+    async fn start_test_control_api_sharing(
+        self_id: &str,
+        gateway_ip: Option<Ipv4Addr>,
+        service_book_v2: Arc<Mutex<ServiceBookV2>>,
+        service_tombstones_v2: Arc<Mutex<ServiceTombstoneBook>>,
+        lost_names_v2: Arc<Mutex<LostNameMap>>,
+    ) -> ControlApiTestFixture {
+        let sync = Arc::new(GossipSync::new(NullTransport));
+        let tempdir = tempfile::tempdir().unwrap();
+        let service_book_v2_file = tempdir.path().join("services2.state");
+        let gateway: mjolnir_mesh::dns_responder::GatewayHandle = Arc::new(RwLock::new(gateway_ip));
+        let claims: ClaimStore = Arc::new(Mutex::new(HashMap::new()));
+        let addr_book = Arc::new(Mutex::new(AddrBook::new()));
+        let user_book = Arc::new(Mutex::new(UserBook::new()));
+
+        let (addr, handle) = control_api_start(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            sync,
+            service_book_v2,
+            service_tombstones_v2,
+            lost_names_v2.clone(),
+            service_book_v2_file,
+            self_id.to_string(),
+            gateway,
+            claims,
+            addr_book,
+            user_book,
+            "10.254.1.1".parse().unwrap(),
+        )
+        .await
+        .expect("bind ephemeral control API port");
+
+        ControlApiTestFixture { addr, handle, lost_names_v2, _tempdir: tempdir }
+    }
+
+    /// Issue one raw HTTP/1.1 request against a running control API and
+    /// return `(status, body)`. No keep-alive on either side, matching the
+    /// server's `Connection: close`.
+    async fn control_api_request(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let mut stream = TcpStream::connect(addr).await.expect("connect to control API");
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        let split_at = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response must have a header/body separator");
+        let head = String::from_utf8_lossy(&resp[..split_at]);
+        let status_line = head.lines().next().expect("response must have a status line");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .expect("status line must have a status code")
+            .parse()
+            .expect("status code must be numeric");
+        (status, resp[split_at + 4..].to_vec())
+    }
+
+    #[tokio::test]
+    async fn control_api_publish_then_directory_then_unpublish() {
+        let fixture = start_test_control_api("node-a", Some("10.42.5.1".parse().unwrap())).await;
+
+        let (status, body) =
+            control_api_request(fixture.addr, "POST", "/v0/publish", br#"{"name":"wiki","port":8080}"#).await;
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "wiki");
+        assert_eq!(json["owner_node_id"], "node-a");
+        assert_eq!(json["ip"], "10.42.5.1");
+        assert_eq!(json["port"], 8080);
+        assert_eq!(json["protocol"], "_tcp");
+
+        let (status, body) = control_api_request(fixture.addr, "GET", "/v0/directory", b"").await;
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["services"][0]["name"], "wiki");
+        assert_eq!(json["services"][0]["ip"], "10.42.5.1");
+        assert_eq!(json["services"][0]["port"], 8080);
+        assert!(json["lost_names"].as_array().unwrap().is_empty());
+
+        let (status, body) =
+            control_api_request(fixture.addr, "POST", "/v0/unpublish", br#"{"name":"wiki"}"#).await;
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "unpublished");
+
+        let (status, body) = control_api_request(fixture.addr, "GET", "/v0/directory", b"").await;
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["services"].as_array().unwrap().is_empty(), "unpublished name is gone");
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn control_api_publish_reserved_name_is_rejected() {
+        let fixture = start_test_control_api("node-a", None).await;
+
+        let (status, body) =
+            control_api_request(fixture.addr, "POST", "/v0/publish", br#"{"name":"hello","port":80}"#).await;
+        assert_eq!(status, 400);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "reserved");
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn control_api_publish_lost_name_is_rejected_with_winner() {
+        let fixture = start_test_control_api("node-a", None).await;
+        fixture.lost_names_v2.lock().unwrap().insert(
+            "taken".to_string(),
+            LostName { winner_node_id: "node-b".to_string(), hlc: now_hlc("node-b") },
+        );
+
+        let (status, body) =
+            control_api_request(fixture.addr, "POST", "/v0/publish", br#"{"name":"taken","port":80}"#).await;
+        assert_eq!(status, 409);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "owned_by_other");
+        assert_eq!(json["winner_node_id"], "node-b");
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn control_api_publish_malformed_body_is_rejected() {
+        let fixture = start_test_control_api("node-a", None).await;
+
+        let (status, body) = control_api_request(fixture.addr, "POST", "/v0/publish", b"not json").await;
+        assert_eq!(status, 400);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "malformed_body");
+
+        fixture.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn control_api_unpublish_not_owner_is_rejected() {
+        // Two "logical nodes" (distinct self_id, distinct API port) sharing
+        // one service directory, the way two real daemons share it over
+        // gossip — this is what lets the not-owner path be exercised for
+        // real over HTTP, rather than only at the lib level.
+        let service_book_v2 = Arc::new(Mutex::new(ServiceBookV2::new()));
+        let service_tombstones_v2 = Arc::new(Mutex::new(ServiceTombstoneBook::new()));
+        let lost_names_v2: Arc<Mutex<LostNameMap>> = Arc::new(Mutex::new(LostNameMap::new()));
+
+        let fixture_a = start_test_control_api_sharing(
+            "node-a",
+            Some("10.42.5.1".parse().unwrap()),
+            service_book_v2.clone(),
+            service_tombstones_v2.clone(),
+            lost_names_v2.clone(),
+        )
+        .await;
+        let fixture_b = start_test_control_api_sharing(
+            "node-b",
+            Some("10.42.9.1".parse().unwrap()),
+            service_book_v2,
+            service_tombstones_v2,
+            lost_names_v2,
+        )
+        .await;
+
+        let (status, _) =
+            control_api_request(fixture_a.addr, "POST", "/v0/publish", br#"{"name":"wiki","port":8080}"#).await;
+        assert_eq!(status, 200);
+
+        // node-b tries to unpublish node-a's "wiki" through its OWN local API.
+        let (status, body) =
+            control_api_request(fixture_b.addr, "POST", "/v0/unpublish", br#"{"name":"wiki"}"#).await;
+        assert_eq!(status, 409);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "not_owner");
+
+        // The name is untouched — node-a still owns it.
+        let (_, body) = control_api_request(fixture_a.addr, "GET", "/v0/directory", b"").await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["services"][0]["name"], "wiki");
+
+        fixture_a.handle.abort();
+        fixture_b.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn control_api_unknown_route_is_404_wrong_method_is_405() {
+        let fixture = start_test_control_api("node-a", None).await;
+
+        let (status, _) = control_api_request(fixture.addr, "GET", "/v0/nope", b"").await;
+        assert_eq!(status, 404);
+
+        let (status, _) = control_api_request(fixture.addr, "GET", "/v0/publish", b"").await;
+        assert_eq!(status, 405);
+
+        fixture.handle.abort();
     }
 }
