@@ -34,7 +34,10 @@ uci add_list dhcp.@dnsmasq[0].server='/mesh/127.0.0.1#5335'
 ```
 
 dnsmasq forwards every `*.mesh` query to the daemon and handles everything else
-normally. This preserves the existing discipline (**the daemon never edits dnsmasq
+normally. The same UCI reconcile also sets **DHCP option 114** (RFC 8910
+captive-portal API, used non-blockingly per rp9) to `http://hello.mesh` so
+client OSes surface the front-desk affordance — the contract
+`hello-mesh-service.md` §5 asks of this track. This preserves the existing discipline (**the daemon never edits dnsmasq
 files and never SIGHUPs it** — UCI + init.d restart only, same as
 `reconcile_client_uci`), avoids file-render/reload races, and gives us SRV/TXT
 records, which a hosts file cannot express. The responder is a **pure projection
