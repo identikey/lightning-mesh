@@ -28,6 +28,12 @@ mechanisms. Localhost-only bind; never exposed on br-mesh/LAN. Implementation ma
 HTTP dependency already accepted for bc7 (`tiny_http`) or hand-roll over tokio — implementer's call
 under the NFR1 size budget.
 
+*Landed-reality update (sprint-001 reconcile, 2026-07-04):* meshd now writes a **versioned**
+`directory.json` (avs) that `mjolnir-hello` reads, and hello serves LAN-gateway:80 under procd.
+`GET /v0/directory` must reuse that same versioned shape so hello's convergence is a transport
+swap (file→HTTP), not a schema migration. The `pending/` identity spool (p6u) also shipped;
+converging it to `POST` stays out of this sprint.
+
 ## D-003 [MEDIUM] [USER] `hello.mesh` pre-claim answer: `192.168.1.1`
 
 Before the node claims its /24, well-known names answer with the stock alias `192.168.1.1` (kept

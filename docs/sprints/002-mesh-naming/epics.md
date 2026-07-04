@@ -9,9 +9,12 @@ Dependency spine: E2 (lane substrate) ⊥ E1.1–1.3 (responder) can proceed in 
 > **BASELINE NOTE (2026-07-03, post-planning audit):** bead `7jb` (bc7 session) shipped a v1
 > service-gossip lane before this sprint starts: `ServiceUpdate` variant, LWW `merge_service`,
 > `ServiceBook` + anti-entropy + persist (commit 37befe0). E2 is therefore an **upgrade**, not
-> greenfield: S2.1 replaces LWW with owner-bound semantics, S2.2 appends v2 variants after the
-> now-fleet-decoded `ServiceUpdate` (never mutate it), S2.3 ports the existing wiring to the v2
-> book. Details in the bead notes.
+> greenfield: S2.1 replaces LWW with owner-bound semantics, S2.2 appends v2 variants at the
+> current enum tail (after `UserUpdate`; `ServiceUpdate` itself is fleet-decoded and frozen),
+> S2.3 ports the existing wiring — `services.state` already exists with v1 content — to the v2
+> book. Sprint-001 landing (2026-07-04) also shipped the versioned `directory.json` projection
+> and `mjolnir-hello` on gateway:80, which pins S3.1's response shape and confirms the
+> option-114 path. Details in the bead notes.
 
 Bead mapping: S1.1–S1.4 → `e21.1.1`–`e21.1.4` · S2.1–S2.4 → `e21.2.1`–`e21.2.4` ·
 S3.1–S3.3 → `e21.2.5`–`e21.2.7` · S4.1–S4.3 → `e21.6`–`e21.8`.
