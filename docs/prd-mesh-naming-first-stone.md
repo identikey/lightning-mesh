@@ -72,7 +72,7 @@ FR33. [MVP] On losing a name conflict, a node shall stop answering that name imm
 FR34. [MVP] A publish attempt on a name already lost to conflict shall fail with an error naming the current winning owner.
 FR35. [MVP] Old (pre-upgrade) nodes receiving the new `ServicePublishV2` gossip variant shall decode-skip it without crashing or corrupting existing state, verified by postcard round-trip tests.
 FR36. [Growth] The system shall support device names (e.g. `laptop.mesh`) derived from DHCP lease data via a `/dns/{hostname}` lane.
-FR37. [Growth] The system shall apply expiry/staleness handling to service records, unified with the address-book staleness design (bead `99f`).
+FR37. [Growth] The system shall apply expiry/staleness handling to service records, unified with the address-book staleness design (bead `e21.9`).
 FR38. [Growth] The system shall garbage-collect tombstoned service records rather than retaining them indefinitely.
 FR39. [Growth] The system shall notify the operator of a name conflict within 2 seconds of the local merge (target; finalize during Growth design), rather than requiring a manual `status` check.
 FR40. [Vision] The system shall reflect `/services/` entries into per-segment mDNS so AirPlay/Bonjour-class clients discover mesh services natively.
@@ -101,7 +101,7 @@ NFR7. [Determinism] Conflict resolution (FWW + node-id tiebreak) shall produce t
 
 ### Out of Scope
 - Device names / `laptop.mesh` via the lease lane (needs the lease lane; Growth).
-- Expiry/staleness handling for stale or offline-owner service records (bead `99f`; Growth).
+- Expiry/staleness handling for stale or offline-owner service records (bead `e21.9`; Growth).
 - Tombstone garbage collection (Growth).
 - Near-real-time (push) conflict notification beyond `status` (Growth).
 - mDNS reflection of `.mesh` services (Vision).
@@ -116,7 +116,7 @@ FR1–FR35 — the DNS responder, dnsmasq/UCI wiring, well-known names, `Service
 
 ### Growth
 FR36 — device names via the lease lane.
-FR37 — service record expiry/staleness (bead `99f`).
+FR37 — service record expiry/staleness (bead `e21.9`).
 FR38 — tombstone garbage collection.
 FR39 — conflict notification within 2 seconds of local merge.
 
@@ -141,7 +141,7 @@ FR42 — off-mesh dial-by-node-id.
 - **[Risk] Android Private DNS (DoT) bypasses the local resolver entirely; the DoH canary only covers Firefox.** Impact: some Android clients cannot resolve `.mesh` at all. Mitigation: document as a known limitation; instruct demo staff to disable Private DNS on demo devices if needed.
 - **[Assumption] 30s TTL is acceptable post-roam, and immediate-gossip-on-publish keeps the worst-case publish-to-resolve bound at anti-entropy interval plus TTL (~50s).** Impact if false: stale answers linger longer than expected. Mitigation: the immediate-broadcast requirement (FR25) exists specifically to avoid depending on the tick interval alone.
 - **[Assumption] The postcard appended-variant decode-skip pattern, proven by the `0yb` mixed-fleet rollout, holds for `ServicePublishV2` too.** Impact if false: old nodes could crash or corrupt state during rollout. Mitigation: dedicated mixed-version round-trip tests (FR35) before fleet rollout, not just unit tests of the new variant in isolation.
-- **[Risk] Offline-owner services resolve to a black hole until staleness (bead `99f`) lands.** Impact: a node that goes offline leaves its published names resolving to an unreachable IP with no expiry. Mitigation: documented as an accepted MVP limitation; not a demo blocker given the short demo window.
+- **[Risk] Offline-owner services resolve to a black hole until staleness (bead `e21.9`) lands.** Impact: a node that goes offline leaves its published names resolving to an unreachable IP with no expiry. Mitigation: documented as an accepted MVP limitation; not a demo blocker given the short demo window.
 - **[Risk] The write-path IPC mechanism (file-spool vs. unix socket) is undecided**, which could affect the publish command's responsiveness and daemon integration complexity. Impact: implementation churn if the wrong mechanism is picked first. Mitigation: default to the file-spool pattern already used elsewhere in the daemon unless a spike shows a unix socket is materially simpler for this near-synchronous use case.
 - **[Risk] `hello.mesh` before a `/24` is claimed has undefined behavior** (stock alias vs. refuse). Impact: early-boot or misconfigured-node front-desk requests could behave unexpectedly. Mitigation: pin the answer explicitly (see Open Questions) before implementation.
 

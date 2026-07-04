@@ -131,7 +131,7 @@ Merge rule (`merge.rs`, new `merge_service`): same-owner + newer HLC → `Update
 unknown gossip variants, so this is mixed-fleet safe like `PeerAddrUpdate` was.
 
 Expiry/TTL of stale services is **deferred to the same mechanism as address-book
-expiry (bead `99f`)** — one staleness design for all self-announced lanes, not
+expiry (bead `e21.9`)** — one staleness design for all self-announced lanes, not
 per-lane ad-hockery.
 
 ## Publishing

@@ -45,7 +45,7 @@ gateway automatically (TTL 30s bounds staleness).
 Matches the `SubnetClaimRelease` precedent: a new appended variant `{name, owner_node_id, hlc}`.
 Tombstones are retained in `services.state` (HLC-ordered) so a late re-announce from a stale peer
 loses to the tombstone; the same owner re-publishing with a newer HLC revives the name (FR31).
-GC deferred to bead 99f.
+GC deferred to bead e21.9 (self-announced-lane staleness; NOT 99f, which is subnet-claim reclamation).
 
 ## D-005 [LOW] [AUTO-DECIDED] SOA for negative answers
 
