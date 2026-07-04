@@ -38,8 +38,9 @@ use mjolnir_mesh::babel::{
     OverlayRtt,
 };
 use mjolnir_mesh::{
-    alloc, merge_peer_addr, merge_subnet_claim, AddrBook, GossipError, GossipSync, GossipTransport,
-    MergeResult, PeerAddrEntry, PeerEntry, PeerRoster, SubnetClaim, HLC,
+    alloc, merge_peer_addr, merge_subnet_claim, merge_user, AddrBook, GossipError, GossipSync,
+    GossipTransport, MergeResult, PeerAddrEntry, PeerEntry, PeerRoster, SubnetClaim, UserBook,
+    UserEntry, HLC,
 };
 use mjolnir_mesh::GossipMessage;
 use tracing::{error, info, warn};
@@ -700,6 +701,21 @@ async fn run_mesh(
     }
     let addr_book: Arc<Mutex<AddrBook>> = Arc::new(Mutex::new(restored_book));
 
+    // User directory (mjolnir-mesh-2xd / p6u): username → user identity record,
+    // the first hello.mesh front-desk record type. Same persistence pattern as
+    // the address book — a sibling `users.state`, tolerant load, tmp+rename
+    // write — plus a plaintext `users.seed` (sibling) that lets a node ORIGINATE
+    // user records with no control plane yet: each `username:Display Name` line
+    // is stamped with a fresh HLC and gossiped on the anti-entropy cadence. Empty
+    // by default (no seed file) so nodes only relay/persist what they receive.
+    let user_book_file = user_book_path(&claims_file);
+    let user_seed_file = user_seed_path(&claims_file);
+    let restored_users = load_user_book(&user_book_file);
+    if !restored_users.is_empty() {
+        info!(count = restored_users.len(), path = %user_book_file.display(), "restored user directory from disk");
+    }
+    let user_book: Arc<Mutex<UserBook>> = Arc::new(Mutex::new(restored_users));
+
     // CRDT gossip overlay (mjolnir-mesh-k8c): all mesh nodes join one fixed
     // topic and exchange CRDT updates best-effort, as a second protocol on the
     // same endpoint alongside the TUN data plane.
@@ -826,6 +842,8 @@ async fn run_mesh(
                 let book = addr_book.clone();
                 let book_path = addr_book_file.clone();
                 let lookup = addr_lookup.clone();
+                let user_book = user_book.clone();
+                let user_book_path = user_book_file.clone();
                 tokio::spawn(async move {
                     let result = sync
                         .run(move |msg| {
@@ -850,6 +868,25 @@ async fn run_mesh(
                                     }
                                     info!(peer = %entry.node_id, addrs = entry.direct_addrs.len(),
                                         relay = ?entry.relay_url, "addrbook: learned peer address");
+                                }
+                                return;
+                            }
+                            // User directory (2xd/p6u): learn a user record from a
+                            // peer, persist it, and log for field validation.
+                            // Handled with an early return so it never takes the
+                            // claim-store lock below. LWW/duplicate drops happen in
+                            // apply_user_message.
+                            if matches!(msg, GossipMessage::UserUpdate { .. }) {
+                                let learned = {
+                                    let mut u = user_book.lock().expect("user directory poisoned");
+                                    apply_user_message(&mut u, &msg)
+                                };
+                                if let Some(entry) = learned {
+                                    let snapshot =
+                                        user_book.lock().expect("user directory poisoned").clone();
+                                    persist_user_book(&snapshot, &user_book_path);
+                                    info!(user = %entry.username, display = %entry.display_name,
+                                        by = %entry.registered_by, "gossip: received user record");
                                 }
                                 return;
                             }
@@ -917,6 +954,9 @@ async fn run_mesh(
                 let path = claims_file.clone();
                 let book = addr_book.clone();
                 let book_path = addr_book_file.clone();
+                let users = user_book.clone();
+                let users_path = user_book_file.clone();
+                let users_seed = user_seed_file.clone();
                 let announce = SelfAnnounce {
                     endpoint: endpoint.clone(),
                     self_id: self_id_str.clone(),
@@ -924,7 +964,10 @@ async fn run_mesh(
                     no_relay,
                 };
                 tokio::spawn(async move {
-                    anti_entropy_loop(sync, store, path, book, book_path, announce).await
+                    anti_entropy_loop(
+                        sync, store, path, book, book_path, users, users_path, users_seed, announce,
+                    )
+                    .await
                 })
             };
 
@@ -1623,6 +1666,120 @@ fn persist_addr_book(snapshot: &AddrBook, path: &Path) {
     }
 }
 
+/// The user-directory state file path (2xd/p6u): a sibling of the claims file
+/// (default `/etc/mjolnir/users.state`). Derived, not a new CLI flag, so the
+/// fleet picks it up with no config change. Mirrors [`addr_book_path`].
+fn user_book_path(claims_file: &Path) -> PathBuf {
+    claims_file.with_file_name("users.state")
+}
+
+/// The user-directory SEED file path (2xd/p6u): a sibling of the claims file
+/// (default `/etc/mjolnir/users.seed`). Plaintext `username:Display Name` lines,
+/// one per record this node ORIGINATES. Absent by default — the normal case —
+/// so nodes only relay/persist what they receive over gossip. This is the
+/// stand-in for the real identity-submission control plane (p6u) so a new
+/// record type can be injected and observed on the fleet today.
+fn user_seed_path(claims_file: &Path) -> PathBuf {
+    claims_file.with_file_name("users.seed")
+}
+
+/// Load the persisted user directory from `path`. Empty (not an error) if the
+/// file is absent (first boot) or fails to decode — the book is best-effort and
+/// relearns over gossip. Mirrors [`load_addr_book`].
+fn load_user_book(path: &Path) -> UserBook {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return UserBook::new(),
+        Err(e) => {
+            warn!(path = %path.display(), "failed to read persisted user directory: {e}");
+            return UserBook::new();
+        }
+    };
+    match postcard::from_bytes(&bytes) {
+        Ok(book) => book,
+        Err(e) => {
+            warn!(path = %path.display(), "failed to decode persisted user directory: {e}");
+            UserBook::new()
+        }
+    }
+}
+
+/// Persist a user-directory snapshot via tmp+rename (crash-safe). Best effort:
+/// failures are logged, not fatal. Mirrors [`persist_addr_book`].
+fn persist_user_book(snapshot: &UserBook, path: &Path) {
+    let bytes = match postcard::to_allocvec(snapshot) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to encode user directory for persistence: {e}");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        warn!(path = %parent.display(), "failed to create user directory dir: {e}");
+        return;
+    }
+    let tmp_path = path.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+        warn!(path = %tmp_path.display(), "failed to write user directory tmp file: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        warn!(path = %path.display(), "failed to rename user directory tmp file into place: {e}");
+    }
+}
+
+/// Parse the seed file into user records this node originates. Each non-empty,
+/// non-`#` line is `username:Display Name` (display defaults to username if the
+/// colon is omitted). Every record is stamped with a fresh HLC and
+/// `registered_by = self_id`. A missing file yields an empty vec (the default).
+fn load_user_seed(path: &Path, self_id: &str) -> Vec<UserEntry> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            warn!(path = %path.display(), "failed to read user seed: {e}");
+            return Vec::new();
+        }
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|line| {
+            let (username, display) = match line.split_once(':') {
+                Some((u, d)) => (u.trim(), d.trim()),
+                None => (line, line),
+            };
+            UserEntry {
+                username: username.to_string(),
+                display_name: display.to_string(),
+                registered_by: self_id.to_string(),
+                attrs: std::collections::BTreeMap::new(),
+                updated_at: now_hlc(self_id),
+            }
+        })
+        .collect()
+}
+
+/// Apply an inbound user CRDT message to the directory. Returns the entry newly
+/// inserted or updated (so the caller can persist and log), or `None` for
+/// another CRDT type or an LWW-stale/duplicate update. Pure over the map (no
+/// I/O) so it's unit-tested below — mirrors [`apply_peer_addr_message`].
+fn apply_user_message(book: &mut UserBook, msg: &GossipMessage) -> Option<UserEntry> {
+    let GossipMessage::UserUpdate { username, entry } = msg else {
+        return None;
+    };
+    match merge_user(book.get(username), entry) {
+        MergeResult::Inserted | MergeResult::Updated => {
+            book.insert(username.clone(), entry.clone());
+            Some(entry.clone())
+        }
+        // merge_user is pure LWW — never Conflict.
+        MergeResult::Unchanged | MergeResult::Conflict { .. } => None,
+    }
+}
+
 /// Apply an inbound peer-address CRDT message to the address book. Returns the
 /// entry that was newly inserted or updated (so the caller can feed iroh,
 /// persist, and log), or `None` if the message was for another CRDT type, was
@@ -1688,12 +1845,16 @@ fn feed_addr_lookup(lookup: &MemoryLookup, entry: &PeerAddrEntry) {
 /// already does) is what lets a late joiner, a node that missed a gossip
 /// packet, or a node that just rebooted converge without any pull-based
 /// reconciliation protocol.
+#[allow(clippy::too_many_arguments)]
 async fn anti_entropy_loop<T: GossipTransport>(
     sync: Arc<GossipSync<T>>,
     store: ClaimStore,
     claims_file: PathBuf,
     addr_book: Arc<Mutex<AddrBook>>,
     addr_book_file: PathBuf,
+    user_book: Arc<Mutex<UserBook>>,
+    user_book_file: PathBuf,
+    user_seed_file: PathBuf,
     self_announce: SelfAnnounce,
 ) {
     // Self-announce our address once up front (0yb): unlike the claim map, whose
@@ -1701,6 +1862,15 @@ async fn anti_entropy_loop<T: GossipTransport>(
     // separate warmup publisher, so the first broadcast happens here before the
     // ticker's immediately-consumed first tick.
     announce_addr_book(&sync, &addr_book, &addr_book_file, &self_announce).await;
+    // Likewise seed+announce the user directory up front (2xd/p6u).
+    announce_user_book(
+        &sync,
+        &user_book,
+        &user_book_file,
+        &user_seed_file,
+        &self_announce.self_id,
+    )
+    .await;
     let mut ticker = tokio::time::interval(ANTI_ENTROPY_INTERVAL);
     ticker.tick().await; // first tick fires immediately; the warmup claim publish already covered this
     loop {
@@ -1722,6 +1892,16 @@ async fn anti_entropy_loop<T: GossipTransport>(
         // Re-announce our own address and re-broadcast the full address book
         // alongside the claim map, on the same cadence (0yb).
         announce_addr_book(&sync, &addr_book, &addr_book_file, &self_announce).await;
+        // Re-read the seed, re-stamp our originated records, and re-broadcast the
+        // full user directory on the same cadence (2xd/p6u).
+        announce_user_book(
+            &sync,
+            &user_book,
+            &user_book_file,
+            &user_seed_file,
+            &self_announce.self_id,
+        )
+        .await;
     }
 }
 
@@ -1787,6 +1967,49 @@ async fn announce_addr_book<T: GossipTransport>(
     }
     info!(count = snapshot.len(), "addrbook anti-entropy: re-broadcast full address book");
     persist_addr_book(&snapshot, addr_book_file);
+}
+
+/// Re-read the seed file, merge our originated records (fresh HLC each tick, so
+/// LWW always carries this node's latest edit — mirroring how the address book
+/// re-stamps its self entry), then re-broadcast the FULL user directory and
+/// rewrite the on-disk book. Full-map anti-entropy so a late joiner or a node
+/// that missed a packet still converges without a pull protocol (2xd/p6u). The
+/// lock is only held to merge-and-clone the snapshot, never across an `.await`.
+async fn announce_user_book<T: GossipTransport>(
+    sync: &GossipSync<T>,
+    user_book: &Arc<Mutex<UserBook>>,
+    user_book_file: &Path,
+    user_seed_file: &Path,
+    self_id: &str,
+) {
+    let snapshot = {
+        let seeded = load_user_seed(user_seed_file, self_id);
+        let mut book = user_book.lock().expect("user directory poisoned");
+        for entry in seeded {
+            // Merge so a peer's newer record for the same username isn't clobbered
+            // by our (older) seed; our fresh HLC normally wins for records we own.
+            if matches!(
+                merge_user(book.get(&entry.username), &entry),
+                MergeResult::Inserted | MergeResult::Updated
+            ) {
+                book.insert(entry.username.clone(), entry);
+            }
+        }
+        book.clone()
+    };
+    for (username, entry) in &snapshot {
+        if let Err(e) = sync
+            .publish(GossipMessage::UserUpdate {
+                username: username.clone(),
+                entry: entry.clone(),
+            })
+            .await
+        {
+            warn!(%username, "user anti-entropy: re-broadcast failed: {e}");
+        }
+    }
+    info!(count = snapshot.len(), "user anti-entropy: re-broadcast full user directory");
+    persist_user_book(&snapshot, user_book_file);
 }
 
 /// Assign this node's claimed /24 gateway address (`<net>.1/prefix`) to the local
