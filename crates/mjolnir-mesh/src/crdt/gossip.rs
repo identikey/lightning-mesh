@@ -7,6 +7,7 @@ use crate::crdt::{
     peer_addr::PeerAddrEntry,
     service::ServiceEntry,
     subnet::SubnetClaim,
+    users::UserEntry,
 };
 
 /// Wire message enum for CRDT gossip replication.
@@ -44,6 +45,13 @@ pub enum GossipMessage {
     PeerAddrUpdate {
         node_id: String,
         entry: PeerAddrEntry,
+    },
+    /// User identity record update, keyed by username (hello.mesh front desk,
+    /// bead `2xd`). Appended last so existing discriminants are undisturbed;
+    /// nodes that predate this variant decode-skip it.
+    UserUpdate {
+        username: String,
+        entry: UserEntry,
     },
 }
 
@@ -167,6 +175,26 @@ mod tests {
                 ],
                 relay_url: Some("https://relay.example.com".to_string()),
                 announced_at: make_hlc(1_700_000_004_000, 0, "abcd1234abcd1234"),
+            },
+        };
+        let bytes = postcard::to_allocvec(&msg).unwrap();
+        let decoded: GossipMessage = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(bytes, postcard::to_allocvec(&decoded).unwrap());
+    }
+
+    #[test]
+    fn postcard_roundtrip_user_update() {
+        use crate::crdt::users::UserEntry;
+        let mut attrs = BTreeMap::new();
+        attrs.insert("role".to_string(), "guest".to_string());
+        let msg = GossipMessage::UserUpdate {
+            username: "ada".to_string(),
+            entry: UserEntry {
+                username: "ada".to_string(),
+                display_name: "Ada Lovelace".to_string(),
+                registered_by: "router-a".to_string(),
+                attrs,
+                updated_at: make_hlc(1_700_000_006_000, 0, "router-a"),
             },
         };
         let bytes = postcard::to_allocvec(&msg).unwrap();

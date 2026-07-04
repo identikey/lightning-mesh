@@ -7,3 +7,4 @@ pub mod peer_addr;
 pub mod service;
 pub mod subnet;
 pub mod sync;
+pub mod users;

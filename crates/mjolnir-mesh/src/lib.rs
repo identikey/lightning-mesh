@@ -26,10 +26,11 @@ pub use crdt::{
     gossip::GossipMessage,
     hlc::HLC,
     lease::LeaseEntry,
-    merge::{merge_peer_addr, merge_subnet_claim, resolve_subnet_conflict, MergeResult},
+    merge::{merge_peer_addr, merge_subnet_claim, merge_user, resolve_subnet_conflict, MergeResult},
     peer_addr::{AddrBook, PeerAddrEntry},
     service::ServiceEntry,
     subnet::SubnetClaim,
     sync::{GossipError, GossipSync, GossipTransport},
+    users::{UserBook, UserEntry},
 };
 pub use roster::{PeerEntry, PeerRoster, RosterError};

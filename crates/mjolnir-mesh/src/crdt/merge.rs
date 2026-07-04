@@ -1,5 +1,6 @@
 use crate::crdt::peer_addr::PeerAddrEntry;
 use crate::crdt::subnet::SubnetClaim;
+use crate::crdt::users::UserEntry;
 use std::cmp::Ordering;
 
 /// Result of merging an incoming entry into a CRDT store.
@@ -92,8 +93,29 @@ pub fn merge_peer_addr(
     }
 }
 
+/// Last-writer-wins merge for user identity records (bead `2xd`).
+///
+/// A user record has no single authoritative announcer — any node that ingests
+/// an identity submission may write it — so there is no conflict arm: the entry
+/// with the newer `updated_at` HLC wins outright. HLC tie-break (wall_clock →
+/// counter → node_id) makes the verdict deterministic across nodes, so two
+/// peers seeing the same pair converge on the same record.
+///
+/// Note: this function does not enforce that the map key matches
+/// `incoming.username` — the caller must look up local by `username` first.
+pub fn merge_user(local: Option<&UserEntry>, incoming: &UserEntry) -> MergeResult<UserEntry> {
+    match local {
+        None => MergeResult::Inserted,
+        Some(existing) => match incoming.updated_at.cmp(&existing.updated_at) {
+            Ordering::Greater => MergeResult::Updated,
+            _ => MergeResult::Unchanged,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::str::FromStr;
 
     use ipnet::IpNet;
@@ -294,5 +316,55 @@ mod tests {
             merge_peer_addr(Some(&local), &incoming),
             MergeResult::Updated
         ));
+    }
+
+    // --- merge_user tests (bead 2xd) ---
+
+    fn user(username: &str, display: &str, wall_clock: u64, counter: u32, node_id: &str) -> UserEntry {
+        UserEntry {
+            username: username.to_string(),
+            display_name: display.to_string(),
+            registered_by: node_id.to_string(),
+            attrs: BTreeMap::new(),
+            updated_at: HLC {
+                wall_clock,
+                counter,
+                node_id: node_id.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn user_inserted_when_no_local() {
+        let incoming = user("ada", "Ada", 1_000, 0, "router-a");
+        assert!(matches!(merge_user(None, &incoming), MergeResult::Inserted));
+    }
+
+    #[test]
+    fn user_updated_on_newer() {
+        let local = user("ada", "Ada", 1_000, 0, "router-a");
+        let incoming = user("ada", "Ada Lovelace", 2_000, 0, "router-b");
+        assert!(matches!(merge_user(Some(&local), &incoming), MergeResult::Updated));
+    }
+
+    #[test]
+    fn user_unchanged_on_older() {
+        let local = user("ada", "Ada Lovelace", 2_000, 0, "router-b");
+        let incoming = user("ada", "Ada", 1_000, 0, "router-a");
+        assert!(matches!(merge_user(Some(&local), &incoming), MergeResult::Unchanged));
+    }
+
+    #[test]
+    fn user_unchanged_on_duplicate() {
+        let entry = user("ada", "Ada", 5_000, 2, "router-a");
+        assert!(matches!(merge_user(Some(&entry), &entry), MergeResult::Unchanged));
+    }
+
+    #[test]
+    fn user_counter_breaks_wall_clock_tie() {
+        // Equal wall_clock, higher counter → newer.
+        let local = user("ada", "Ada", 1_000, 0, "router-a");
+        let incoming = user("ada", "Ada2", 1_000, 1, "router-a");
+        assert!(matches!(merge_user(Some(&local), &incoming), MergeResult::Updated));
     }
 }
