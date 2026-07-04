@@ -1,1 +1,2 @@
-static/_app/
+static/*
+!static/index.html
