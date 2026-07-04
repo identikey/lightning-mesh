@@ -38,9 +38,12 @@ use mjolnir_mesh::babel::{
     OverlayRtt,
 };
 use mjolnir_mesh::{
-    alloc, merge_peer_addr, merge_service, merge_subnet_claim, merge_user, AddrBook, GossipError,
-    GossipSync, GossipTransport, MergeResult, PeerAddrEntry, PeerEntry, PeerRoster, ServiceBook,
-    ServiceEntry, SubnetClaim, UserBook, UserEntry, HLC,
+    alloc, apply_service_publish_v2_tracking_loss, apply_service_unpublish_v2, merge_peer_addr,
+    merge_service, merge_subnet_claim, merge_user, publish_service_v2, AddrBook, GossipError,
+    GossipSync, GossipTransport, LostNameMap, MergeResult, PeerAddrEntry, PeerEntry, PeerRoster,
+    PublishOutcome, ServiceBook, ServiceBookV2, ServiceEntry, ServiceEntryV2, ServicePublishError,
+    ServiceTombstone, ServiceTombstoneBook, SubnetClaim, UnpublishOutcome, UserBook, UserEntry,
+    HLC,
 };
 use mjolnir_mesh::GossipMessage;
 use serde::{Deserialize, Serialize};
@@ -633,16 +636,43 @@ async fn run_mesh(
     // table only ever reads it, so the claim can land at any point after
     // `run_mesh` starts without re-plumbing the table.
     let gateway_handle: mjolnir_mesh::dns_responder::GatewayHandle = Arc::new(RwLock::new(None));
+
+    // Service directory v2 (e21.2.3, owner-bound TOFU model — e21.2.1/e21.2.2):
+    // book, tombstones, and local lost-names bookkeeping each get their own
+    // lock, same convention as the other CRDT stores below. Restored from a
+    // sibling `services2.state` — distinct from the pre-existing v1
+    // `services.state` (7jb) restored further down, which is left untouched
+    // for fleet compat until it's retired. Created here, ahead of `self_id`,
+    // so the book can be handed to the DNS responder's `ServiceTable`
+    // (e21.1.3) before the responder binds; nothing in this restore needs
+    // `self_id` (that's only needed later for the own-vs-learned split in
+    // gossip dispatch and anti-entropy re-announce).
+    let service_book_v2_file = service_book_v2_path(&claims_file);
+    let restored_v2 = load_service_state_v2(&service_book_v2_file);
+    if !restored_v2.book.is_empty() || !restored_v2.tombstones.is_empty() {
+        info!(
+            services = restored_v2.book.len(),
+            tombstones = restored_v2.tombstones.len(),
+            path = %service_book_v2_file.display(),
+            "restored v2 service directory from disk"
+        );
+    }
+    let service_book_v2: Arc<Mutex<ServiceBookV2>> = Arc::new(Mutex::new(restored_v2.book));
+    let service_tombstones_v2: Arc<Mutex<ServiceTombstoneBook>> =
+        Arc::new(Mutex::new(restored_v2.tombstones));
+    let lost_names_v2: Arc<Mutex<LostNameMap>> = Arc::new(Mutex::new(restored_v2.lost_names));
+
     // .mesh DNS responder (e21.1.1): bind BEFORE any UCI/dnsmasq reconcile
     // (FR14) — first thing in `run_mesh` so dnsmasq's `.mesh` upstream
     // (`server=/mesh/127.0.0.1#5335`) is answerable the instant it's
-    // configured, however early that reconcile step lands. The table is a
-    // `CompositeTable` (e21.1.2) so the future CRDT-projected service table
-    // (e21.1.3) can be appended to the chain without touching this call site.
+    // configured, however early that reconcile step lands. `CompositeTable`
+    // (e21.1.2) stacks the well-known table ahead of the CRDT-projected v2
+    // service table (e21.1.3), which reads straight from `service_book_v2`.
     let dns_table: Arc<dyn mjolnir_mesh::dns_responder::NameTable> =
-        Arc::new(mjolnir_mesh::dns_responder::CompositeTable::new(vec![Arc::new(
-            mjolnir_mesh::dns_responder::WellKnownTable::new(gateway_handle.clone()),
-        )]));
+        Arc::new(mjolnir_mesh::dns_responder::CompositeTable::new(vec![
+            Arc::new(mjolnir_mesh::dns_responder::WellKnownTable::new(gateway_handle.clone())),
+            Arc::new(mjolnir_mesh::dns_responder::ServiceTable::new(service_book_v2.clone())),
+        ]));
     let dns_responder = mjolnir_mesh::dns_responder::start(
         SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -911,6 +941,10 @@ async fn run_mesh(
                 let user_book_path = user_book_file.clone();
                 let service_book = service_book.clone();
                 let service_book_path = service_book_file.clone();
+                let service_book_v2 = service_book_v2.clone();
+                let service_tombstones_v2 = service_tombstones_v2.clone();
+                let lost_names_v2 = lost_names_v2.clone();
+                let service_book_v2_persist_path = service_book_v2_file.clone();
                 tokio::spawn(async move {
                     let result = sync
                         .run(move |msg| {
@@ -973,6 +1007,59 @@ async fn run_mesh(
                                     persist_service_book(&snapshot, &service_book_path);
                                     info!(service = %name, host = %entry.hostname,
                                         ip = %entry.ip, port = entry.port, "gossip: received service record");
+                                }
+                                return;
+                            }
+                            // Service directory v2 publish (e21.2.2/e21.2.3):
+                            // apply the owner-bound merge, tracking a
+                            // conflict loss against `lost_names` (e21.2.4)
+                            // when it makes US the loser for this name.
+                            // Early return so it never touches the v1
+                            // service book or the claim-store lock below.
+                            if matches!(msg, GossipMessage::ServicePublishV2 { .. }) {
+                                if let GossipMessage::ServicePublishV2 { name, entry } = &msg {
+                                    let outcome = {
+                                        let mut b = service_book_v2.lock().expect("v2 service book poisoned");
+                                        let tombstones =
+                                            service_tombstones_v2.lock().expect("v2 service tombstones poisoned");
+                                        let mut lost = lost_names_v2.lock().expect("v2 service lost-names poisoned");
+                                        apply_service_publish_v2_tracking_loss(
+                                            &mut b, &tombstones, &mut lost, &me, name, entry.clone(),
+                                        )
+                                    };
+                                    match outcome {
+                                        Ok(outcome) => {
+                                            info!(service = %name, owner = %entry.owner_node_id, ?outcome,
+                                                "gossip: received v2 service publish");
+                                        }
+                                        Err(e) => {
+                                            warn!(service = %name, "gossip: rejected v2 service publish: {e}");
+                                        }
+                                    }
+                                    let snapshot = snapshot_service_state_v2(
+                                        &service_book_v2, &service_tombstones_v2, &lost_names_v2,
+                                    );
+                                    persist_service_state_v2(&snapshot, &service_book_v2_persist_path);
+                                }
+                                return;
+                            }
+                            // Service directory v2 unpublish (e21.2.2/e21.2.3):
+                            // apply the tombstone-vs-publish rules. Early
+                            // return, same reasoning as the publish arm above.
+                            if matches!(msg, GossipMessage::ServiceUnpublishV2 { .. }) {
+                                if let GossipMessage::ServiceUnpublishV2 { name, owner_node_id, hlc } = &msg {
+                                    let outcome = {
+                                        let mut b = service_book_v2.lock().expect("v2 service book poisoned");
+                                        let mut tombstones =
+                                            service_tombstones_v2.lock().expect("v2 service tombstones poisoned");
+                                        apply_service_unpublish_v2(&mut b, &mut tombstones, name, owner_node_id, hlc.clone())
+                                    };
+                                    info!(service = %name, owner = %owner_node_id, ?outcome,
+                                        "gossip: received v2 service unpublish");
+                                    let snapshot = snapshot_service_state_v2(
+                                        &service_book_v2, &service_tombstones_v2, &lost_names_v2,
+                                    );
+                                    persist_service_state_v2(&snapshot, &service_book_v2_persist_path);
                                 }
                                 return;
                             }
@@ -1047,6 +1134,10 @@ async fn run_mesh(
                 let users_seed = user_seed_file.clone();
                 let services = service_book.clone();
                 let services_path = service_book_file.clone();
+                let services_v2 = service_book_v2.clone();
+                let tombstones_v2 = service_tombstones_v2.clone();
+                let lost_names_v2 = lost_names_v2.clone();
+                let services_v2_path = service_book_v2_file.clone();
                 let directory_path = directory_file.clone();
                 let spool_path = spool_dir.clone();
                 let announce = SelfAnnounce {
@@ -1058,7 +1149,8 @@ async fn run_mesh(
                 tokio::spawn(async move {
                     anti_entropy_loop(
                         sync, store, path, book, book_path, users, users_path, users_seed,
-                        services, services_path, directory_path, spool_path, announce,
+                        services, services_path, services_v2, tombstones_v2, lost_names_v2,
+                        services_v2_path, directory_path, spool_path, announce,
                     )
                     .await
                 })
@@ -1887,6 +1979,88 @@ fn persist_service_book(snapshot: &ServiceBook, path: &Path) {
     }
 }
 
+/// Combined v2 service persistence shape (bead e21.2.3): the owner-bound
+/// book, its tombstones, and this node's local lost-names bookkeeping
+/// (e21.2.4) travel together in one sibling file, `services2.state` —
+/// distinct from the pre-existing v1 `services.state` (7jb), which holds a
+/// different wire type (`ServiceEntry`, not `ServiceEntryV2`) and is left
+/// untouched: the v1 lane stays live for fleet compat until it's retired.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ServiceStateV2 {
+    book: ServiceBookV2,
+    tombstones: ServiceTombstoneBook,
+    lost_names: LostNameMap,
+}
+
+/// The v2 service-state file path (e21.2.3): a sibling of the claims file
+/// (default `/etc/mjolnir/services2.state`). Derived, not a new CLI flag, so
+/// the fleet picks it up with no config change. Mirrors [`service_book_path`].
+fn service_book_v2_path(claims_file: &Path) -> PathBuf {
+    claims_file.with_file_name("services2.state")
+}
+
+/// Load the persisted v2 service state from `path`. Empty (not an error) if
+/// the file is absent (first boot, or a v1-only fleet member) or fails to
+/// decode — best-effort, same tolerant-load discipline as every other CRDT
+/// state file here. Mirrors [`load_service_book`].
+fn load_service_state_v2(path: &Path) -> ServiceStateV2 {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ServiceStateV2::default(),
+        Err(e) => {
+            warn!(path = %path.display(), "failed to read persisted v2 service state: {e}");
+            return ServiceStateV2::default();
+        }
+    };
+    match postcard::from_bytes(&bytes) {
+        Ok(state) => state,
+        Err(e) => {
+            warn!(path = %path.display(), "failed to decode persisted v2 service state: {e}");
+            ServiceStateV2::default()
+        }
+    }
+}
+
+/// Persist a v2 service-state snapshot via tmp+rename (crash-safe). Best
+/// effort: failures are logged, not fatal. Mirrors [`persist_service_book`].
+fn persist_service_state_v2(snapshot: &ServiceStateV2, path: &Path) {
+    let bytes = match postcard::to_allocvec(snapshot) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to encode v2 service state for persistence: {e}");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        warn!(path = %parent.display(), "failed to create v2 service state dir: {e}");
+        return;
+    }
+    let tmp_path = path.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+        warn!(path = %tmp_path.display(), "failed to write v2 service state tmp file: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        warn!(path = %path.display(), "failed to rename v2 service state tmp file into place: {e}");
+    }
+}
+
+/// Snapshot the three v2 service-state locks into one [`ServiceStateV2`] for
+/// persistence. Locks in the fixed order book → tombstones → lost_names
+/// everywhere in this daemon, to avoid any lock-ordering deadlock risk.
+fn snapshot_service_state_v2(
+    book: &Arc<Mutex<ServiceBookV2>>,
+    tombstones: &Arc<Mutex<ServiceTombstoneBook>>,
+    lost_names: &Arc<Mutex<LostNameMap>>,
+) -> ServiceStateV2 {
+    let book = book.lock().expect("v2 service book poisoned").clone();
+    let tombstones = tombstones.lock().expect("v2 service tombstones poisoned").clone();
+    let lost_names = lost_names.lock().expect("v2 service lost-names poisoned").clone();
+    ServiceStateV2 { book, tombstones, lost_names }
+}
+
 /// Schema version for the `directory.json` projection (bead avs). Bump this
 /// whenever the on-disk shape changes in a way `mjolnir-hello` needs to know
 /// about, so the daemon and the hello server can evolve independently.
@@ -2339,6 +2513,10 @@ async fn anti_entropy_loop<T: GossipTransport>(
     user_seed_file: PathBuf,
     service_book: Arc<Mutex<ServiceBook>>,
     service_book_file: PathBuf,
+    service_book_v2: Arc<Mutex<ServiceBookV2>>,
+    service_tombstones_v2: Arc<Mutex<ServiceTombstoneBook>>,
+    lost_names_v2: Arc<Mutex<LostNameMap>>,
+    service_book_v2_file: PathBuf,
     directory_file: PathBuf,
     spool_dir: PathBuf,
     self_announce: SelfAnnounce,
@@ -2363,6 +2541,17 @@ async fn anti_entropy_loop<T: GossipTransport>(
     .await;
     // Likewise re-broadcast the service directory up front (7jb).
     announce_service_book(&sync, &service_book, &service_book_file).await;
+    // Likewise re-announce this node's own v2 service entries up front
+    // (e21.2.3, D-006) — learned entries are served but never re-announced.
+    announce_service_book_v2(
+        &sync,
+        &service_book_v2,
+        &service_tombstones_v2,
+        &lost_names_v2,
+        &service_book_v2_file,
+        &self_announce.self_id,
+    )
+    .await;
     // Write the initial directory.json projection up front too (avs), so
     // mjolnir-hello has a snapshot to read before the first anti-entropy tick.
     write_directory_projection(
@@ -2412,6 +2601,17 @@ async fn anti_entropy_loop<T: GossipTransport>(
         .await;
         // Re-broadcast the full service directory on the same cadence (7jb).
         announce_service_book(&sync, &service_book, &service_book_file).await;
+        // Re-announce this node's own v2 service entries on the same cadence
+        // (e21.2.3, D-006).
+        announce_service_book_v2(
+            &sync,
+            &service_book_v2,
+            &service_tombstones_v2,
+            &lost_names_v2,
+            &service_book_v2_file,
+            &self_announce.self_id,
+        )
+        .await;
         // Re-project the read-only directory.json snapshot on the same cadence
         // (avs), after the books above have been refreshed for this tick.
         write_directory_projection(
@@ -2558,6 +2758,151 @@ async fn announce_service_book<T: GossipTransport>(
     }
     info!(count = snapshot.len(), "service anti-entropy: re-broadcast full service directory");
     persist_service_book(&snapshot, service_book_file);
+}
+
+/// Re-announce THIS node's own v2 service entries and unpublish tombstones,
+/// and rewrite the on-disk v2 service state (bead e21.2.3, decision D-006).
+///
+/// Unlike [`announce_service_book`]'s v1 full-map re-broadcast, only entries
+/// (and tombstones) `owner_node_id == self_id` are re-published here — a
+/// LEARNED entry (owned by a different node) is served by the DNS projection
+/// but never re-announced: the owning node alone is responsible for keeping
+/// its own entry alive over gossip, exactly like [`announce_addr_book`]'s
+/// self-only re-announce discipline. Own tombstones are re-announced for the
+/// same reason (a learned tombstone came from its owner; re-announcing it
+/// here would be speaking for a node that isn't us).
+///
+/// The locks are only held to clone what's needed for the broadcast/persist
+/// below, never across an `.await`.
+async fn announce_service_book_v2<T: GossipTransport>(
+    sync: &GossipSync<T>,
+    service_book_v2: &Arc<Mutex<ServiceBookV2>>,
+    service_tombstones_v2: &Arc<Mutex<ServiceTombstoneBook>>,
+    lost_names_v2: &Arc<Mutex<LostNameMap>>,
+    service_book_v2_file: &Path,
+    self_id: &str,
+) {
+    let (own_entries, own_tombstones, snapshot) = {
+        let book = service_book_v2.lock().expect("v2 service book poisoned");
+        let tombstones = service_tombstones_v2.lock().expect("v2 service tombstones poisoned");
+        let lost_names = lost_names_v2.lock().expect("v2 service lost-names poisoned");
+        let own_entries: Vec<(String, ServiceEntryV2)> = book
+            .iter()
+            .filter(|(_, entry)| entry.owner_node_id == self_id)
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect();
+        let own_tombstones: Vec<(String, ServiceTombstone)> = tombstones
+            .iter()
+            .filter(|(_, tombstone)| tombstone.owner_node_id == self_id)
+            .map(|(name, tombstone)| (name.clone(), tombstone.clone()))
+            .collect();
+        let snapshot =
+            ServiceStateV2 { book: book.clone(), tombstones: tombstones.clone(), lost_names: lost_names.clone() };
+        (own_entries, own_tombstones, snapshot)
+    };
+    for (name, entry) in &own_entries {
+        if let Err(e) = sync
+            .publish(GossipMessage::ServicePublishV2 { name: name.clone(), entry: entry.clone() })
+            .await
+        {
+            warn!(%name, "v2 service anti-entropy: re-broadcast publish failed: {e}");
+        }
+    }
+    for (name, tombstone) in &own_tombstones {
+        if let Err(e) = sync
+            .publish(GossipMessage::ServiceUnpublishV2 {
+                name: name.clone(),
+                owner_node_id: tombstone.owner_node_id.clone(),
+                hlc: tombstone.hlc.clone(),
+            })
+            .await
+        {
+            warn!(%name, "v2 service anti-entropy: re-broadcast unpublish failed: {e}");
+        }
+    }
+    info!(
+        own = own_entries.len(),
+        tombstones = own_tombstones.len(),
+        "v2 service anti-entropy: re-broadcast own entries"
+    );
+    persist_service_state_v2(&snapshot, service_book_v2_file);
+}
+
+/// Daemon-facing local publish (bead e21.2.3 FR25, e21.2.4 FR34) — the seam
+/// S3.1's control API calls to claim/refresh a service name on behalf of
+/// THIS node. Delegates the reserved-name/lost-to-a-peer/conflict-tracking
+/// logic to [`publish_service_v2`] (lib-side, unit-tested there); on success
+/// broadcasts the publish IMMEDIATELY (not deferred to the next anti-entropy
+/// tick — the whole point of FR25's demo-responsiveness requirement) and
+/// persists. No external IPC surface yet — S3.1 wires a control-API handler
+/// to this function.
+#[allow(dead_code, clippy::too_many_arguments)] // consumed by S3.1's control API; no caller yet in this story
+async fn publish_service<T: GossipTransport>(
+    sync: &GossipSync<T>,
+    service_book_v2: &Arc<Mutex<ServiceBookV2>>,
+    service_tombstones_v2: &Arc<Mutex<ServiceTombstoneBook>>,
+    lost_names_v2: &Arc<Mutex<LostNameMap>>,
+    service_book_v2_file: &Path,
+    self_id: &str,
+    name: &str,
+    entry: ServiceEntryV2,
+) -> Result<PublishOutcome, ServicePublishError> {
+    let (outcome, snapshot) = {
+        let mut book = service_book_v2.lock().expect("v2 service book poisoned");
+        let tombstones = service_tombstones_v2.lock().expect("v2 service tombstones poisoned");
+        let mut lost_names = lost_names_v2.lock().expect("v2 service lost-names poisoned");
+        let outcome =
+            publish_service_v2(&mut book, &tombstones, &mut lost_names, self_id, name, entry.clone())?;
+        let snapshot =
+            ServiceStateV2 { book: book.clone(), tombstones: tombstones.clone(), lost_names: lost_names.clone() };
+        (outcome, snapshot)
+    };
+    if let Err(e) = sync
+        .publish(GossipMessage::ServicePublishV2 { name: name.to_string(), entry })
+        .await
+    {
+        warn!(%name, "local service publish: immediate broadcast failed: {e}");
+    }
+    persist_service_state_v2(&snapshot, service_book_v2_file);
+    Ok(outcome)
+}
+
+/// Daemon-facing local unpublish, mirroring [`publish_service`]: applies the
+/// tombstone via [`apply_service_unpublish_v2`], broadcasts immediately, and
+/// persists. No external IPC surface yet — S3.1 wires a control-API handler
+/// to this function.
+#[allow(dead_code, clippy::too_many_arguments)] // consumed by S3.1's control API; no caller yet in this story
+async fn unpublish_service<T: GossipTransport>(
+    sync: &GossipSync<T>,
+    service_book_v2: &Arc<Mutex<ServiceBookV2>>,
+    service_tombstones_v2: &Arc<Mutex<ServiceTombstoneBook>>,
+    lost_names_v2: &Arc<Mutex<LostNameMap>>,
+    service_book_v2_file: &Path,
+    name: &str,
+    owner_node_id: &str,
+    hlc: HLC,
+) -> UnpublishOutcome {
+    let (outcome, snapshot) = {
+        let mut book = service_book_v2.lock().expect("v2 service book poisoned");
+        let mut tombstones = service_tombstones_v2.lock().expect("v2 service tombstones poisoned");
+        let outcome = apply_service_unpublish_v2(&mut book, &mut tombstones, name, owner_node_id, hlc.clone());
+        let lost_names = lost_names_v2.lock().expect("v2 service lost-names poisoned");
+        let snapshot =
+            ServiceStateV2 { book: book.clone(), tombstones: tombstones.clone(), lost_names: lost_names.clone() };
+        (outcome, snapshot)
+    };
+    if let Err(e) = sync
+        .publish(GossipMessage::ServiceUnpublishV2 {
+            name: name.to_string(),
+            owner_node_id: owner_node_id.to_string(),
+            hlc,
+        })
+        .await
+    {
+        warn!(%name, "local service unpublish: immediate broadcast failed: {e}");
+    }
+    persist_service_state_v2(&snapshot, service_book_v2_file);
+    outcome
 }
 
 /// Assign this node's claimed /24 gateway address (`<net>.1/prefix`) to the local
