@@ -12,7 +12,7 @@
 # MESH_CHANNEL_2G on EVERY node or they won't form one island.
 #
 # Decisions (mjolnir-mesh-w1l): 2.4 GHz backhaul (range/foliage), 5 GHz clients.
-# Override any value via env, e.g.:  MESH_KEY='s3cret' CLIENT_KEY='hunter2' sh setup-wireless.sh
+# Override any value via env, e.g.:  MESH_KEY='<mesh-passphrase>' CLIENT_KEY='<client-passphrase>' sh setup-wireless.sh
 set -e
 
 MESH_ID="${MESH_ID:-mjolnir-mesh}"
