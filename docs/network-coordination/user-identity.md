@@ -95,7 +95,7 @@ that is invariant (§1.4).
 | **1 · Browser key** | The user's browser, at the `hello.mesh` origin (pure-JS Ed25519; key bytes in IndexedDB) | **Soft self-custody** | One tap at `hello.mesh`: "create an identity" — instant, no install | The legacy fallback: a real key on a device with no app/extension. Low-value, disposable. |
 | **1e · Extension key** | A browser extension the user installed (WebCrypto non-extractable, secure context) | **Hard self-custody** | Install once; the extension mediates signing for every `.mesh` site | The good laptop/desktop path: real non-extractable keys *and* one cross-origin keystore. |
 | **3 · Custodial** | A key manager the user *consciously chose to trust*, authenticated OAuth/OIDC-style. Runs as a **service on the mesh** (§5). | Delegated | Ordinary web login (redirect from `hello.mesh` or any `.mesh` service) | "Identity for free" without self-custody burden. Hosted `identikey-core` is *one such custodian* — never a protocol dependency; its outage degrades *its* users' signing, not the mesh. |
-| **4 · Self-custodied** | The user's own app / hardware key (Secure Enclave / TPM per SP-02) | **Hard self-custody** | Scan a QR at `hello.mesh`, or the app just speaks mesh natively; biometric-gated signing | Full sovereignty: endorse others, publish services, own `.mesh` names, multi-device via HD derivation. |
+| **4 · Self-custodied** | The user's own app / hardware key (Secure Enclave / TPM per SP-02) | **Hard self-custody** | Link via an on-screen QR / ticket / NFC, or the app just speaks mesh natively; biometric-gated signing | Full sovereignty: endorse others, publish services, own `.mesh` names, multi-device via HD derivation. |
 
 *(Rung numbering keeps 1/3/4 to avoid churning references; the former rung 2,
 "node-custodied session key," is retired — it was the only rung that made a
@@ -180,15 +180,20 @@ key). That origin is `hello.mesh`. Consequences:
 
 ### 4.3 How users find it
 
-- **`hello.mesh`** resolves on every node — the stable, memorable front-desk
-  address. Signage-friendly, sayable out loud at a venue.
+Discovery needs no printed artifacts. Two mechanisms cover it:
+
 - **RFC 8910 + RFC 8908** (DHCP option 114 / RA option + Captive Portal API):
-  the network *advertises* the front desk's URL at lease time, so the OS can
-  show a **non-blocking affordance** — "this network has a page" — without a
-  single packet ever being intercepted. Discovery without gating; the
-  standards world's own correction of the captive-portal mechanism.
-- **Printed QR on the router** and operator signage encoding
-  `http://hello.mesh` — the physical front desk.
+  the network *advertises* the front desk's URL at lease time, so the OS shows
+  a **non-blocking affordance** — "this network has a page" — without a single
+  packet ever being intercepted. This is the primary path and the standards
+  world's own correction of the captive-portal mechanism.
+- **`hello.mesh`** resolves on every node — the stable, memorable front-desk
+  address. Signage-friendly, sayable out loud, typeable where the affordance
+  isn't rendered. A sign that just says "`hello.mesh`" is enough.
+
+QR codes are an **optional convenience, never a dependency** (§4.4): handy for
+one-scan AP join or for out-of-band trust-anchor bootstrap, but nothing about
+finding or using the front desk requires printing anything.
 
 ### 4.4 What's on offer (any device, any time — not just at join)
 
@@ -201,20 +206,47 @@ key). That origin is `hello.mesh`. Consequences:
   custodian (rung 3); the custodian returns an attestation binding this
   session/device to the user's identity key. `.mesh` services may redirect
   here or straight to the custodian.
-- **"Scan with IdentiKey"** → the page shows a QR carrying a challenge + the
+- **"Link my IdentiKey"** → the front desk shows an **on-screen** QR (or an
+  equally-valid copy-paste ticket string / NFC tap) carrying a challenge + the
   node's `EndpointId`; the app signs with the user's real key and delivers the
   attestation over the mesh (mirrors the `met` enrollment handshake, roles
-  reversed) (rung 4). Rung-4 users never *need* the front desk — the app
-  speaks mesh natively — but the QR upgrades any browser session to hard
-  custody.
-- **Operator guest QRs** (venue mode): pre-minted, scoped, expiring guest
-  identities printed on paper — scan to join as that guest.
+  reversed) (rung 4). Rung-4 users never *need* the front desk — the app speaks
+  mesh natively — this just upgrades a browser session to hard custody. The QR
+  here is rendered live on a screen, not printed.
+
+There is no separate "printed guest QR" flow: guest access at a venue *is* the
+open net plus one-tap rung-1 identity above. If an operator ever wants scannable
+badges, that's an optional add-on (§4.4a), not a mechanism anything depends on.
 
 The node relays the resulting attestation into `/users/…` (or holds a
 lease-scoped ephemeral record for rung 1) so the identity appears in the
 directory and to services. Because the front desk is a real site and not a
 join-time sheet, enrollment, upgrades, and identity management stay available
 for the whole session — the desk doesn't close after check-in.
+
+### 4.4a Optional QR add-ons (nice-to-haves, never load-bearing)
+
+QR codes buy exactly two things you can't get *as cheaply* elsewhere, and
+nothing else depends on them:
+
+- **One-scan AP join** — a standard `WIFI:` QR (SSID + credential) that phones
+  parse natively, so a guest joins the radio without typing a password. Pure
+  convenience; equivalent to the sticker on a home router.
+- **Out-of-band trust-anchor bootstrap** — a QR carrying a node's `EndpointId`
+  (or a signed endorsement) so a client can seed a *trusted* anchor into its
+  reputation graph (§4.7). This is the one case with real security value: over
+  the air, a rogue node can present its own `EndpointId` (the default
+  first-contact path is therefore trust-on-first-use, which is acceptable
+  because at first contact you have no key and nothing to steal — see the
+  graduated-stakes rule in §4.7). A QR at a **physically trusted location** —
+  taped to a known info desk, on a conference lanyard — resists that
+  substitution, because you trust the paper as far as you trust the venue. So
+  printed QRs are *optional high-assurance hardening* for anchor bootstrap, not
+  a step in the normal flow.
+
+Neither is required. Discovery is RFC 8910 + the `hello.mesh` name (§4.3);
+enrollment is the on-screen options (§4.4); trust bootstraps over the air with
+TOFU by default. Printing is a thing an operator *may* do, never must.
 
 ### 4.5 Gated mode — the one honest captive portal
 
@@ -233,7 +265,7 @@ A fully P2P mesh has no authority to issue certificates, so an initial
 is what iroh already does node-to-node: an iroh QUIC connection uses the node's
 Ed25519 key *as* its TLS identity, and the handshake proves possession. The
 ceremony that stands in for a CA is simply *learning a node's `EndpointId` out
-of band* (the ticket, the printed QR) — after which the channel is
+of band* (a ticket string, an on-screen or physically-posted QR, NFC) — after which the channel is
 cryptographically authenticated, no authority involved. **Node authentication
 is solved, CA-free, for mesh-native clients today.**
 
@@ -348,7 +380,9 @@ secure storage) as a dependency.
 4. Lease↔identity binding lifetime and re-auth cadence; roaming a rung-1 key's
    *session* across nodes within an island (the key itself already roams via
    the stable origin; dovetails with the 802.11r/FT key-management spike).
-5. Guest-QR minting UX and scoping vocabulary (time, bandwidth, service set).
+5. Guest access scoping vocabulary (time, bandwidth, service set) — surfaced
+   through the front desk; optional scannable-badge add-on (§4.4a) only if an
+   operator asks for it, not a default deliverable.
 6. Privacy: ephemeral identities must not be linkable across visits unless the
    user upgrades them deliberately; rung-1 ephemeral records are island-local,
    never gossiped mesh-wide.
