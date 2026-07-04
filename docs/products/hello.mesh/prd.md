@@ -148,7 +148,7 @@ NFR8. [Portability] The server builds and runs as a standalone workspace binary 
 - What is the daemon's write cadence for `directory.json` (on-change vs. fixed interval), and does the server stat-poll the file or does the daemon signal freshness?
 - What is the actual binary-size cost of `rust-embed` plus the chosen HTTP library on the target, and does it fit NFR5?
 - For the spool-ingest write path (Growth), does the daemon watch the directory (inotify) or sweep on a timer, and what are the validation and de-duplication rules?
-- **Decided (2026-07-04):** cross-mesh propagation is required — node-local is out. Open sub-question: does the demo commit to cross-*site* (over-iroh, FR29) or hold it as a stretch? Current call: stretch.
+- **Decided (2026-07-04):** cross-mesh propagation is required (node-local is out), and the demo is scoped to the **802.11s island first** — cross-*site* over iroh (FR29) is Growth/stretch, not a demo gate. No longer open.
 - What is the smallest spike that proves one new gossip record type (`/users`) propagating end-to-end across two nodes, to de-risk the critical path first?
 - Is the 50-concurrent-client target (NFR3) realistic on the target router hardware, or should it be recalibrated after a first measurement?
 
