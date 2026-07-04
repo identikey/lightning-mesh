@@ -5113,6 +5113,8 @@ async fn run_status(secret_file: Option<&std::path::Path>) -> Result<()> {
         print_system_status(None).await;
         println!();
         print_addr_book_status(&addr_book_path(Path::new("/etc/mjolnir/claims.state")));
+        println!();
+        print_services_status(&service_book_v2_path(Path::new("/etc/mjolnir/claims.state")));
         return Ok(());
     };
 
@@ -5135,6 +5137,8 @@ async fn run_status(secret_file: Option<&std::path::Path>) -> Result<()> {
     print_system_status(Some(backhaul)).await;
     println!();
     print_addr_book_status(&addr_book_path(Path::new("/etc/mjolnir/claims.state")));
+    println!();
+    print_services_status(&service_book_v2_path(Path::new("/etc/mjolnir/claims.state")));
     Ok(())
 }
 
@@ -5168,6 +5172,68 @@ fn print_addr_book_status(path: &Path) {
             "    announced_at: wall={} counter={}",
             entry.announced_at.wall_clock, entry.announced_at.counter
         );
+    }
+}
+
+/// Pure formatter for the `/services/` v2 section of `status` (bead e21.2.7,
+/// FR32): every claimed name with its owner, tombstoned (unpublished) names,
+/// and names this node lost to an earlier conflicting claim. Separated from
+/// I/O so it is unit-testable over a synthetic [`ServiceStateV2`] — unlike
+/// [`print_addr_book_status`], which prints directly. dbv discipline: an
+/// explicit `(none...)` marker for every empty subsection, never silence.
+///
+/// "Active conflicts" (per the bead's ask) means the lost-names subsection:
+/// this node's own view of names it tried to claim but lost to an earlier
+/// claimant. The winner's own `status` shows the same name under `services`,
+/// not under lost names — there is no separate winner/loser pair to render,
+/// since [`LostNameMap`] is local-only bookkeeping (bead e21.2.4), never
+/// gossiped.
+fn format_services_status(state: &ServiceStateV2) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    lines.push("services:".to_string());
+    if state.book.is_empty() {
+        lines.push("  (none — no services claimed yet)".to_string());
+    } else {
+        for (name, entry) in &state.book {
+            lines.push(format!("  {name}"));
+            lines.push(format!("    owner: {}", entry.owner_node_id));
+            lines.push(format!("    address: {}:{}/{}", entry.ip, entry.port, entry.protocol));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("tombstoned names (unpublished):".to_string());
+    if state.tombstones.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for (name, tombstone) in &state.tombstones {
+            lines.push(format!("  {name}  last owner: {}", tombstone.owner_node_id));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("lost names (active conflicts — claimed by another node first):".to_string());
+    if state.lost_names.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for (name, lost) in &state.lost_names {
+            lines.push(format!("  {name}  winner: {}", lost.winner_node_id));
+        }
+    }
+
+    lines
+}
+
+/// Print the `/services/` v2 section for `status` (bead e21.2.7): reads the
+/// persisted `services2.state` file directly (same discipline as
+/// [`print_addr_book_status`] reading the address book) — no running daemon
+/// required, and no dependency on the control API being up.
+fn print_services_status(path: &Path) {
+    let state = load_service_state_v2(path);
+    println!("services (/services/, v2): {}", path.display());
+    for line in format_services_status(&state) {
+        println!("{line}");
     }
 }
 
@@ -5548,6 +5614,59 @@ mod tests {
         let msg = control_api_connection_error_message(&e);
         assert!(msg.contains("127.0.0.1:5380"), "got: {msg}");
         assert!(msg.contains("daemon running"), "got: {msg}");
+    }
+
+    #[test]
+    fn format_services_status_reports_owner_tombstone_and_lost_name() {
+        let hlc = |wall_clock: u64| HLC { wall_clock, counter: 0, node_id: "x".to_string() };
+        let mut book = ServiceBookV2::new();
+        book.insert(
+            "wiki.mesh".to_string(),
+            ServiceEntryV2 {
+                owner_node_id: "node-a".to_string(),
+                first_claimed_at: hlc(1),
+                updated_at: hlc(1),
+                ip: "10.42.1.1".parse().unwrap(),
+                port: 8080,
+                protocol: "_tcp".to_string(),
+                txt: BTreeMap::new(),
+                host_mac: None,
+            },
+        );
+        let mut tombstones = ServiceTombstoneBook::new();
+        tombstones.insert(
+            "printer.mesh".to_string(),
+            ServiceTombstone { owner_node_id: "node-b".to_string(), hlc: hlc(2) },
+        );
+        let mut lost_names = LostNameMap::new();
+        lost_names.insert(
+            "shared.mesh".to_string(),
+            LostName { winner_node_id: "node-c".to_string(), hlc: hlc(3) },
+        );
+        let state = ServiceStateV2 { book, tombstones, lost_names };
+
+        let text = format_services_status(&state).join("\n");
+        assert!(text.contains("wiki.mesh"), "got: {text}");
+        assert!(text.contains("owner: node-a"), "got: {text}");
+        assert!(text.contains("10.42.1.1:8080/_tcp"), "got: {text}");
+        assert!(text.contains("printer.mesh"), "got: {text}");
+        assert!(text.contains("last owner: node-b"), "got: {text}");
+        assert!(text.contains("shared.mesh"), "got: {text}");
+        assert!(text.contains("winner: node-c"), "got: {text}");
+    }
+
+    #[test]
+    fn format_services_status_marks_empty_sections_explicitly() {
+        // dbv discipline (FR32): every empty subsection reports an explicit
+        // absence marker, never silent omission.
+        let state = ServiceStateV2::default();
+        let text = format_services_status(&state).join("\n");
+        assert!(text.contains("(none — no services claimed yet)"), "got: {text}");
+        assert_eq!(
+            text.matches("(none)").count(),
+            2,
+            "expected one '(none)' each for tombstones and lost names: {text}"
+        );
     }
 
     #[test]
