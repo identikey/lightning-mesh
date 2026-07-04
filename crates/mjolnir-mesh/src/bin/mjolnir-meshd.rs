@@ -683,6 +683,13 @@ async fn run_mesh(
     .await
     .context("binding .mesh DNS responder")?;
 
+    // dnsmasq/UCI wiring (e21.1.4, FR9-FR14): the responder above is bound
+    // and answering now, so it's safe to point dnsmasq's `.mesh` forward at
+    // it (FR14 ordering). Doesn't depend on the client subnet claim (unlike
+    // `reconcile_client_uci`, called later from `claim_and_publish`), so it
+    // runs unconditionally right here.
+    reconcile_dnsmasq_uci().await;
+
     let self_id = endpoint.id();
     let self_id_str = self_id.to_string();
     // NB: the effective IPv4 backhaul address (`backhaul_ip`, claim-aware per
@@ -3101,6 +3108,121 @@ async fn reconcile_client_uci(subnet: Ipv4Net) {
 #[cfg(not(target_os = "linux"))]
 async fn reconcile_client_uci(_subnet: Ipv4Net) {}
 
+/// dnsmasq `server=` line that forwards the `.mesh` zone to the local
+/// responder (FR9/FR14, bc7 seam contract).
+const MESH_DNS_SERVER_LINE: &str = "/mesh/127.0.0.1#5335";
+/// Firefox/DoH-canary domain: an app that gets NXDOMAIN for this name treats
+/// the network as "DoH not wanted here" and stays on the system resolver, so
+/// `.mesh` names keep working through client-side DoH (FR11).
+const DOH_CANARY_SERVER_LINE: &str = "/use-application-dns.net/";
+/// RFC 8910 DHCP option 114 (`default-url`): points clients at the
+/// hello.mesh front desk (bc7) without any manual URL entry (FR12).
+const DHCP_OPTION_114: &str = "114,http://hello.mesh";
+
+/// True when dnsmasq's config already carries the `.mesh` forward line, the
+/// DoH canary NXDOMAIN, and DHCP option 114 — the idempotence check for
+/// [`reconcile_dnsmasq_uci`]. Pure so it's unit-tested below. Both arguments
+/// are `uci get` output for list-typed options: space-joined entries (same
+/// shape as `lan_uci_is_current`'s `ipaddr`), independent of how many other,
+/// unrelated entries (upstream DNS servers, other DHCP options) are present —
+/// this only checks that ours are among them, never that they're the only
+/// ones.
+fn dnsmasq_uci_is_current(current_server_list: &str, current_dhcp_options: &str) -> bool {
+    let servers: Vec<&str> = current_server_list.split_whitespace().collect();
+    let options: Vec<&str> = current_dhcp_options.split_whitespace().collect();
+    servers.contains(&MESH_DNS_SERVER_LINE)
+        && servers.contains(&DOH_CANARY_SERVER_LINE)
+        && options.contains(&DHCP_OPTION_114)
+}
+
+/// Wire dnsmasq to forward `.mesh` to the local responder, refuse client-side
+/// DoH, and hand out the front-desk URL via DHCP option 114 (FR9-FR14,
+/// NFR6). Called once, right after the `.mesh` responder binds in
+/// `run_mesh` — never before (FR14): a `server=/mesh/...` line pointing at a
+/// port nothing is listening on yet would SERVFAIL every `.mesh` lookup
+/// (and, on some dnsmasq builds, poison the negative-cache) until the next
+/// reconcile. Does not depend on the client subnet claim, so it runs
+/// unconditionally rather than being folded into [`reconcile_client_uci`].
+///
+/// UCI + `/etc/init.d/dnsmasq restart` ONLY — never edits dnsmasq's config
+/// files directly, never SIGHUPs the daemon (NFR6): this is fleet-wide
+/// client DNS, and `mjolnir-apply`'s health-gated rollback is the only
+/// blast-radius control we trust for it. Best-effort and OpenWrt-only: skips
+/// silently when `uci` or `dhcp.@dnsmasq[0]` is absent (RouterOS containers,
+/// desktops). Idempotent: no restart-churn when the desired lines are
+/// already present, so a re-run (anti-entropy, restart) triggers zero
+/// disruption to client DNS.
+#[cfg(target_os = "linux")]
+async fn reconcile_dnsmasq_uci() {
+    use tokio::process::Command;
+    // No uci binary / no dnsmasq section → not OpenWrt; nothing to own.
+    let dnsmasq_exists = Command::new("uci")
+        .args(["-q", "get", "dhcp.@dnsmasq[0]"])
+        .output()
+        .await;
+    match dnsmasq_exists {
+        Err(_) => return,
+        Ok(out) if !out.status.success() => return,
+        Ok(_) => {}
+    }
+    let current_server_list = Command::new("uci")
+        .args(["-q", "get", "dhcp.@dnsmasq[0].server"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let current_dhcp_options = Command::new("uci")
+        .args(["-q", "get", "dhcp.lan.dhcp_option"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if dnsmasq_uci_is_current(&current_server_list, &current_dhcp_options) {
+        return;
+    }
+    info!("reconciling dnsmasq UCI: .mesh forward, DoH canary, option 114 (FR9-FR14)");
+    let servers: Vec<&str> = current_server_list.split_whitespace().collect();
+    let options: Vec<&str> = current_dhcp_options.split_whitespace().collect();
+    let mut script = String::new();
+    if !servers.contains(&MESH_DNS_SERVER_LINE) {
+        script.push_str(&format!(
+            "uci add_list dhcp.@dnsmasq[0].server='{MESH_DNS_SERVER_LINE}'; "
+        ));
+    }
+    if !servers.contains(&DOH_CANARY_SERVER_LINE) {
+        script.push_str(&format!(
+            "uci add_list dhcp.@dnsmasq[0].server='{DOH_CANARY_SERVER_LINE}'; "
+        ));
+    }
+    if !options.contains(&DHCP_OPTION_114) {
+        script.push_str(&format!(
+            "uci add_list dhcp.lan.dhcp_option='{DHCP_OPTION_114}'; "
+        ));
+    }
+    script.push_str("uci commit dhcp && /etc/init.d/dnsmasq restart");
+    // Same lesson as babeld_service/reconcile_client_uci: a procd call can
+    // wedge — never let one stall the daemon's startup path.
+    let run = Command::new("sh").args(["-c", &script]).output();
+    match tokio::time::timeout(Duration::from_secs(30), run).await {
+        Ok(Ok(out)) if out.status.success() => {
+            info!("dnsmasq UCI reconciled — .mesh forward + DoH canary + option 114 live")
+        }
+        Ok(Ok(out)) => warn!(
+            "dnsmasq UCI reconcile failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Ok(Err(e)) => warn!("dnsmasq UCI reconcile could not run: {e}"),
+        Err(_) => warn!("dnsmasq UCI reconcile timed out after 30s"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn reconcile_dnsmasq_uci() {}
+
 /// Self-assign this node's derived IPv4 backhaul address (`10.254.0.0/16`, host
 /// from the node id) to the shared-segment interface, so every node has a stable,
 /// collision-free, DHCP-free underlay address in one shared /16. Peers are then
@@ -4852,6 +4974,63 @@ config meshd 'meshd'
         assert!(!lan_uci_is_current(
             "10.42.242.1/24 192.168.1.1/24",
             "10.42.243.1/24"
+        ));
+    }
+
+    #[test]
+    fn stock_dnsmasq_config_needs_reconcile() {
+        // Fresh-from-flash: no server list, no option 114 at all.
+        assert!(!dnsmasq_uci_is_current("", ""));
+    }
+
+    #[test]
+    fn partial_dnsmasq_config_needs_reconcile() {
+        // Only the .mesh forward present — DoH canary and option 114 missing.
+        assert!(!dnsmasq_uci_is_current("/mesh/127.0.0.1#5335", ""));
+        // .mesh forward + DoH canary present, option 114 missing.
+        assert!(!dnsmasq_uci_is_current(
+            "/mesh/127.0.0.1#5335 /use-application-dns.net/",
+            ""
+        ));
+        // Only option 114 present, DNS lines missing.
+        assert!(!dnsmasq_uci_is_current("", "114,http://hello.mesh"));
+    }
+
+    #[test]
+    fn preexisting_unrelated_dnsmasq_entries_alone_still_need_reconcile() {
+        // A node with its own upstream DNS server / other DHCP options
+        // configured, but none of ours yet, still reconciles.
+        assert!(!dnsmasq_uci_is_current(
+            "8.8.8.8 /corp.example/10.1.1.1",
+            "6,10.0.0.53"
+        ));
+    }
+
+    #[test]
+    fn reconciled_dnsmasq_config_is_idempotent() {
+        assert!(dnsmasq_uci_is_current(
+            "/mesh/127.0.0.1#5335 /use-application-dns.net/",
+            "114,http://hello.mesh"
+        ));
+    }
+
+    #[test]
+    fn reconciled_dnsmasq_config_coexists_with_unrelated_entries() {
+        // Ours plus pre-existing unrelated entries, any order — still current.
+        assert!(dnsmasq_uci_is_current(
+            "8.8.8.8 /use-application-dns.net/ /corp.example/10.1.1.1 /mesh/127.0.0.1#5335",
+            "6,10.0.0.53 114,http://hello.mesh"
+        ));
+    }
+
+    #[test]
+    fn duplicated_dnsmasq_entries_are_current() {
+        // add_list appended twice by an old/buggy run — still detected as
+        // current (idempotence check only requires presence, not exclusivity
+        // or count, matching `uci add_list`'s own dedup-on-repeat behavior).
+        assert!(dnsmasq_uci_is_current(
+            "/mesh/127.0.0.1#5335 /mesh/127.0.0.1#5335 /use-application-dns.net/",
+            "114,http://hello.mesh 114,http://hello.mesh"
         ));
     }
 
