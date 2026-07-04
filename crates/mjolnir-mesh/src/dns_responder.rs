@@ -11,15 +11,16 @@
 //! that fails to serialize) is logged at debug/warn and dropped — this
 //! responder must never take its recv loop down over a bad client.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex, RwLock};
 
-use simple_dns::rdata::{RData, A, SOA};
+use simple_dns::rdata::{RData, A, SOA, SRV, TXT};
 use simple_dns::{Name, Packet, PacketFlag, ResourceRecord, CLASS, QTYPE, RCODE, TYPE};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-use crate::crdt::service::is_reserved_service_name;
+use crate::crdt::service::{is_reserved_service_name, ServiceBookV2};
 
 /// Default bind port for the `.mesh` responder (loopback-only — dnsmasq is
 /// the only client). Configurable so tests can bind an ephemeral port
@@ -54,6 +55,25 @@ pub trait NameTable: Send + Sync {
     /// (e.g. the future SRV/TXT service table) overrides this.
     fn exists(&self, name: &str) -> bool {
         self.lookup_a(name).is_some()
+    }
+
+    /// SRV answer for `name` (e21.1.3): this data model has exactly one SRV
+    /// record per service name (one `port`/`protocol` per service entry), so
+    /// this returns just the port rather than a list — priority and weight
+    /// are always `0`, and the record's target is `name` itself (the same
+    /// composite table's `A` answer resolves it; there is no separate SRV
+    /// target hostname in this model, e.g. no `_http._tcp.NAME` label).
+    /// Defaults to "no SRV data here", correct for any table that only
+    /// serves `A` (like [`WellKnownTable`]).
+    fn lookup_srv(&self, _name: &str) -> Option<u16> {
+        None
+    }
+
+    /// TXT answer for `name` (e21.1.3): the service's key/value map, encoded
+    /// on the wire as one `"key=value"` character-string per pair (see
+    /// [`handle_query`]). Defaults to "no TXT data here".
+    fn lookup_txt(&self, _name: &str) -> Option<BTreeMap<String, String>> {
+        None
     }
 }
 
@@ -154,6 +174,82 @@ impl NameTable for CompositeTable {
     fn exists(&self, name: &str) -> bool {
         self.tables.iter().any(|t| t.exists(name))
     }
+
+    fn lookup_srv(&self, name: &str) -> Option<u16> {
+        self.tables.iter().find_map(|t| t.lookup_srv(name))
+    }
+
+    fn lookup_txt(&self, name: &str) -> Option<BTreeMap<String, String>> {
+        self.tables.iter().find_map(|t| t.lookup_txt(name))
+    }
+}
+
+/// Pure CRDT projection over the daemon's shared v2 service store (S1.3,
+/// bead e21.1.3): serves `A`/`SRV`/`TXT` answers straight from the live
+/// [`ServiceBookV2`], no cache (FR8) — every query takes the lock, reads the
+/// current map, and releases it immediately, so a store mutation is visible
+/// on the very next query.
+///
+/// Wire mapping (documented here since the PRD leaves the exact SRV/TXT
+/// shape to this story — see [`NameTable::lookup_srv`]/[`NameTable::lookup_txt`]
+/// for the rationale): `A` -> `entry.ip` (IPv4 only; a v6-only entry has no
+/// `A` answer, which the qtype dispatch turns into NODATA via `exists`);
+/// `SRV` -> `SRV 0 0 <port> <name>`; `TXT` -> one `"key=value"`
+/// character-string per `entry.txt` pair. A tombstoned or never-published
+/// name is absent from the book, so `exists` returns `false` and the
+/// composite dispatch falls through to NXDOMAIN.
+#[derive(Clone)]
+pub struct ServiceTable {
+    store: Arc<Mutex<ServiceBookV2>>,
+}
+
+impl ServiceTable {
+    /// Build a table reading from `store`. The caller (mjolnir-meshd) owns
+    /// the daemon-side write path (gossip dispatch, local publish/unpublish);
+    /// this table only ever reads.
+    pub fn new(store: Arc<Mutex<ServiceBookV2>>) -> Self {
+        Self { store }
+    }
+
+    /// `name` is a wire-format qname (e.g. `"printer.mesh."`); the service
+    /// book keys on the bare service name (e.g. `"printer"`) with no zone
+    /// suffix, so strip the trailing `.mesh.`/`.mesh` before looking it up.
+    /// Returns `None` for a qname outside the `.mesh` apex entirely.
+    fn book_key<'a>(&self, name: &'a str) -> Option<&'a str> {
+        name.trim_end_matches('.').strip_suffix(".mesh")
+    }
+}
+
+impl NameTable for ServiceTable {
+    fn lookup_a(&self, name: &str) -> Option<Vec<Ipv4Addr>> {
+        let key = self.book_key(name)?;
+        let book = self.store.lock().ok()?;
+        match book.get(key)?.ip {
+            IpAddr::V4(v4) => Some(vec![v4]),
+            // No AAAA support in this story's scope; an A query against a
+            // v6-only entry is NODATA (the name still `exists`), not NXDOMAIN.
+            IpAddr::V6(_) => None,
+        }
+    }
+
+    fn exists(&self, name: &str) -> bool {
+        match self.book_key(name) {
+            Some(key) => self.store.lock().map(|b| b.contains_key(key)).unwrap_or(false),
+            None => false,
+        }
+    }
+
+    fn lookup_srv(&self, name: &str) -> Option<u16> {
+        let key = self.book_key(name)?;
+        let book = self.store.lock().ok()?;
+        Some(book.get(key)?.port)
+    }
+
+    fn lookup_txt(&self, name: &str) -> Option<BTreeMap<String, String>> {
+        let key = self.book_key(name)?;
+        let book = self.store.lock().ok()?;
+        Some(book.get(key)?.txt.clone())
+    }
 }
 
 /// A bound, running responder. Dropping this does not stop the background
@@ -235,16 +331,22 @@ fn handle_query(query_bytes: &[u8], table: &dyn NameTable) -> Option<Vec<u8>> {
     let mut reply = Packet::new_reply(query.id());
     reply.set_flags(PacketFlag::AUTHORITATIVE_ANSWER);
 
+    // Scratch storage for TXT character-strings: `TXT::add_string` borrows,
+    // so the formatted "key=value" strings must outlive `reply` itself (which
+    // is serialized well after the match arm below returns) — declared here,
+    // at the outermost function scope, rather than inside the match arm.
+    let mut txt_scratch: Vec<String> = Vec::new();
+
     match query.questions.into_iter().next() {
         Some(question) => {
             let qname = question.qname.to_string();
-            let is_a_query = matches!(question.qtype, QTYPE::TYPE(TYPE::A));
 
-            // Only an A query can produce A answers; any other qtype falls
-            // through to the NODATA/NXDOMAIN dispatch below untouched, per
-            // this story's "NODATA, never NXDOMAIN for a known name" rule.
-            let answers = if is_a_query {
-                table.lookup_a(&qname).filter(|a| !a.is_empty()).map(|addrs| {
+            // Only a matching qtype produces answers here; any other qtype
+            // (or a qtype this table has no answer for) falls through to the
+            // NODATA/NXDOMAIN dispatch below untouched, per this story's
+            // "NODATA, never NXDOMAIN for a known name" rule (e21.1.1/e21.1.3).
+            let answers: Option<Vec<ResourceRecord>> = match question.qtype {
+                QTYPE::TYPE(TYPE::A) => table.lookup_a(&qname).filter(|a| !a.is_empty()).map(|addrs| {
                     addrs
                         .into_iter()
                         .map(|addr| {
@@ -256,9 +358,28 @@ fn handle_query(query_bytes: &[u8], table: &dyn NameTable) -> Option<Vec<u8>> {
                             )
                         })
                         .collect::<Vec<_>>()
-                })
-            } else {
-                None
+                }),
+                QTYPE::TYPE(TYPE::SRV) => table.lookup_srv(&qname).map(|port| {
+                    vec![ResourceRecord::new(
+                        question.qname.clone(),
+                        CLASS::IN,
+                        30,
+                        RData::SRV(SRV { priority: 0, weight: 0, port, target: question.qname.clone() }),
+                    )]
+                }),
+                QTYPE::TYPE(TYPE::TXT) => table.lookup_txt(&qname).filter(|m| !m.is_empty()).map(|map| {
+                    let mut rec = TXT::new();
+                    for (k, v) in &map {
+                        txt_scratch.push(format!("{k}={v}"));
+                    }
+                    for s in &txt_scratch {
+                        if let Err(e) = rec.add_string(s) {
+                            warn!("mesh DNS responder: TXT character-string too long, dropping: {e}");
+                        }
+                    }
+                    vec![ResourceRecord::new(question.qname.clone(), CLASS::IN, 30, RData::TXT(rec))]
+                }),
+                _ => None,
             };
 
             // Independent of qtype: does the table know this name at all?
@@ -460,6 +581,130 @@ mod tests {
         let unknown_reply_bytes = handle_query(&unknown, &composite).unwrap();
         let reply = Packet::parse(&unknown_reply_bytes).unwrap();
         assert_eq!(reply.rcode(), RCODE::NameError);
+    }
+
+    // --- ServiceTable (bead e21.1.3) ---
+
+    fn v2_entry(ip: Ipv4Addr, port: u16, protocol: &str, txt: &[(&str, &str)]) -> crate::crdt::service::ServiceEntryV2 {
+        use crate::crdt::hlc::HLC;
+        crate::crdt::service::ServiceEntryV2 {
+            owner_node_id: "router-a".to_string(),
+            first_claimed_at: HLC { wall_clock: 1, counter: 0, node_id: "router-a".to_string() },
+            updated_at: HLC { wall_clock: 1, counter: 0, node_id: "router-a".to_string() },
+            ip: IpAddr::V4(ip),
+            port,
+            protocol: protocol.to_string(),
+            txt: txt.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            host_mac: None,
+        }
+    }
+
+    #[test]
+    fn service_table_a_srv_txt_from_store() {
+        let store: Arc<Mutex<ServiceBookV2>> = Arc::new(Mutex::new(ServiceBookV2::new()));
+        store.lock().unwrap().insert(
+            "wiki".to_string(),
+            v2_entry("10.42.1.50".parse().unwrap(), 8080, "_http._tcp", &[("path", "/wiki")]),
+        );
+        let table = ServiceTable::new(store);
+
+        let a_reply = handle_query(&build_query("wiki.mesh.", TYPE::A), &table).unwrap();
+        let reply = Packet::parse(&a_reply).unwrap();
+        assert_eq!(reply.rcode(), RCODE::NoError);
+        match &reply.answers[0].rdata {
+            RData::A(a) => assert_eq!(Ipv4Addr::from(a.address), "10.42.1.50".parse::<Ipv4Addr>().unwrap()),
+            other => panic!("expected A, got {other:?}"),
+        }
+
+        let srv_reply = handle_query(&build_query("wiki.mesh.", TYPE::SRV), &table).unwrap();
+        let reply = Packet::parse(&srv_reply).unwrap();
+        assert_eq!(reply.rcode(), RCODE::NoError);
+        match &reply.answers[0].rdata {
+            RData::SRV(srv) => {
+                assert_eq!(srv.priority, 0);
+                assert_eq!(srv.weight, 0);
+                assert_eq!(srv.port, 8080);
+                assert_eq!(srv.target.to_string(), "wiki.mesh");
+            }
+            other => panic!("expected SRV, got {other:?}"),
+        }
+
+        let txt_reply = handle_query(&build_query("wiki.mesh.", TYPE::TXT), &table).unwrap();
+        let reply = Packet::parse(&txt_reply).unwrap();
+        assert_eq!(reply.rcode(), RCODE::NoError);
+        match &reply.answers[0].rdata {
+            RData::TXT(txt) => {
+                let attrs = txt.attributes();
+                assert_eq!(attrs.get("path").and_then(|v| v.clone()), Some("/wiki".to_string()));
+            }
+            other => panic!("expected TXT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_table_store_mutation_visible_on_next_query() {
+        let store: Arc<Mutex<ServiceBookV2>> = Arc::new(Mutex::new(ServiceBookV2::new()));
+        let table = ServiceTable::new(store.clone());
+
+        let before = handle_query(&build_query("printer.mesh.", TYPE::A), &table).unwrap();
+        assert_eq!(Packet::parse(&before).unwrap().rcode(), RCODE::NameError);
+
+        store.lock().unwrap().insert(
+            "printer".to_string(),
+            v2_entry("10.42.1.60".parse().unwrap(), 631, "_ipp._tcp", &[]),
+        );
+
+        let after = handle_query(&build_query("printer.mesh.", TYPE::A), &table).unwrap();
+        let reply = Packet::parse(&after).unwrap();
+        assert_eq!(reply.rcode(), RCODE::NoError);
+        assert_eq!(reply.answers.len(), 1);
+    }
+
+    #[test]
+    fn service_table_absent_name_is_nxdomain() {
+        let store: Arc<Mutex<ServiceBookV2>> = Arc::new(Mutex::new(ServiceBookV2::new()));
+        let table = ServiceTable::new(store);
+        let bytes = handle_query(&build_query("ghost.mesh.", TYPE::A), &table).unwrap();
+        let reply = Packet::parse(&bytes).unwrap();
+        assert_eq!(reply.rcode(), RCODE::NameError);
+        assert_eq!(reply.name_servers.len(), 1);
+    }
+
+    #[test]
+    fn service_table_txt_query_with_no_txt_data_is_nodata() {
+        let store: Arc<Mutex<ServiceBookV2>> = Arc::new(Mutex::new(ServiceBookV2::new()));
+        store.lock().unwrap().insert(
+            "printer".to_string(),
+            v2_entry("10.42.1.60".parse().unwrap(), 631, "_ipp._tcp", &[]),
+        );
+        let table = ServiceTable::new(store);
+        let bytes = handle_query(&build_query("printer.mesh.", TYPE::TXT), &table).unwrap();
+        let reply = Packet::parse(&bytes).unwrap();
+        assert_eq!(reply.rcode(), RCODE::NoError, "NODATA, not NXDOMAIN, for an existing name with no TXT data");
+        assert_eq!(reply.answers.len(), 0);
+    }
+
+    #[test]
+    fn service_table_composed_after_well_known_table() {
+        let gateway = Arc::new(RwLock::new(Some("10.42.7.1".parse().unwrap())));
+        let store: Arc<Mutex<ServiceBookV2>> = Arc::new(Mutex::new(ServiceBookV2::new()));
+        store.lock().unwrap().insert(
+            "wiki".to_string(),
+            v2_entry("10.42.1.50".parse().unwrap(), 8080, "_http._tcp", &[]),
+        );
+        let composite = CompositeTable::new(vec![
+            Arc::new(WellKnownTable::new(gateway)),
+            Arc::new(ServiceTable::new(store)),
+        ]);
+
+        let hello = handle_query(&build_query("hello.mesh.", TYPE::A), &composite).unwrap();
+        assert_eq!(Packet::parse(&hello).unwrap().rcode(), RCODE::NoError);
+
+        let wiki = handle_query(&build_query("wiki.mesh.", TYPE::A), &composite).unwrap();
+        assert_eq!(Packet::parse(&wiki).unwrap().rcode(), RCODE::NoError);
+
+        let ghost = handle_query(&build_query("ghost.mesh.", TYPE::A), &composite).unwrap();
+        assert_eq!(Packet::parse(&ghost).unwrap().rcode(), RCODE::NameError);
     }
 
     #[test]
