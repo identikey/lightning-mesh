@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use data_encoding::HEXLOWER;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -28,6 +28,53 @@ pub type ChallengeStore = Mutex<HashMap<String, Instant>>;
 
 pub fn new_challenge_store() -> ChallengeStore {
     Mutex::new(HashMap::new())
+}
+
+/// Empty directory projection, served whenever `directory.json` is missing
+/// or unreadable and no last-good copy exists yet.
+const EMPTY_DIRECTORY: &str =
+    r#"{"version":1,"node":null,"neighbors":[],"identities":[],"services":[]}"#;
+
+/// Cached last-good read of the daemon-written `directory.json`, keyed off
+/// the file's mtime so a request only re-reads the file when it changed.
+/// Falls back to (and remembers) [`EMPTY_DIRECTORY`] when the file is
+/// missing/unreadable and there is no prior last-good snapshot.
+#[derive(Debug, Default)]
+pub struct DirectoryCache {
+    inner: Mutex<CachedDirectory>,
+}
+
+#[derive(Debug, Default)]
+struct CachedDirectory {
+    mtime: Option<SystemTime>,
+    body: Option<String>,
+}
+
+impl DirectoryCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read (or serve cached) directory.json contents as a raw JSON string.
+    fn read(&self, path: &Path) -> String {
+        let mtime = std::fs::metadata(path).and_then(|meta| meta.modified()).ok();
+
+        let mut cached = self.inner.lock().expect("directory cache poisoned");
+
+        // Re-read only if the mtime is unknown or has changed since the last
+        // successful read. On read failure, fall through and serve the
+        // last-good body (or the empty directory if there isn't one) without
+        // clobbering the cached mtime — a transient stat/read race shouldn't
+        // drop a known-good snapshot.
+        if (mtime.is_none() || mtime != cached.mtime)
+            && let Ok(contents) = std::fs::read_to_string(path)
+        {
+            cached.mtime = mtime;
+            cached.body = Some(contents);
+        }
+
+        cached.body.clone().unwrap_or_else(|| EMPTY_DIRECTORY.to_string())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +114,25 @@ impl RouteResponse {
 /// `GET /api/health` — liveness for the deploy health-gate.
 fn health() -> RouteResponse {
     RouteResponse::json(200, r#"{"status":"ok"}"#)
+}
+
+/// `GET /api/directory` — serve `directory.json` verbatim (cached, last-good
+/// on read failure, empty-but-valid directory if there's no last-good copy).
+fn directory(cache: &DirectoryCache, directory_file: &Path) -> RouteResponse {
+    RouteResponse::json(200, cache.read(directory_file))
+}
+
+/// `GET /api/node` — extract just the `node` section of the directory, for
+/// the "you are here" header. Missing/null node -> `{}`.
+fn node(cache: &DirectoryCache, directory_file: &Path) -> RouteResponse {
+    let body = cache.read(directory_file);
+    let value: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => return RouteResponse::json(200, "{}"),
+    };
+    let node = value.get("node").cloned().unwrap_or(serde_json::Value::Null);
+    let node = if node.is_null() { serde_json::json!({}) } else { node };
+    RouteResponse::json(200, node.to_string())
 }
 
 /// Serve the static bundle (embedded, or `--static-root` override for dev),
@@ -195,6 +261,9 @@ fn submit_identity(body: &[u8], challenges: &ChallengeStore, spool_dir: &Path) -
 /// on-disk override of the embedded bundle (`--static-root`, dev only).
 /// `body` is the raw request body (only consulted for `POST` handlers).
 /// `challenges` and `spool_dir` are the S4 identity-ceremony seams.
+/// `directory_cache` and `directory_file` are the S3 read-only mesh-state
+/// seams.
+#[allow(clippy::too_many_arguments)]
 pub fn route(
     method: &str,
     path: &str,
@@ -202,13 +271,15 @@ pub fn route(
     body: &[u8],
     challenges: &ChallengeStore,
     spool_dir: &Path,
+    directory_cache: &DirectoryCache,
+    directory_file: &Path,
 ) -> RouteResponse {
     match (method, path) {
         ("GET", "/api/health") => health(),
 
         // --- S3 (mjolnir-mesh-11l): read-only mesh state ---------------
-        // ("GET", "/api/directory") => ...,  // AddrBook + ServiceEntry projection from directory_file
-        // ("GET", "/api/node") => ...,       // this node's own identity/summary
+        ("GET", "/api/directory") => directory(directory_cache, directory_file),
+        ("GET", "/api/node") => node(directory_cache, directory_file),
 
         // --- S4 (mjolnir-mesh-5zn): identity ceremony -------------------
         ("GET", "/api/challenge") => issue_challenge(challenges),
@@ -230,6 +301,12 @@ mod tests {
         (new_challenge_store(), tempfile::tempdir().unwrap())
     }
 
+    /// Fresh directory cache + a path to a (not-yet-existing) directory file
+    /// under a throwaway dir, for tests that don't exercise S3 endpoints.
+    fn no_directory() -> (DirectoryCache, tempfile::TempDir) {
+        (DirectoryCache::new(), tempfile::tempdir().unwrap())
+    }
+
     fn test_keypair() -> SigningKey {
         let mut seed = [0u8; 32];
         rand::rng().fill_bytes(&mut seed);
@@ -239,7 +316,7 @@ mod tests {
     #[test]
     fn health_returns_ok_json() {
         let (challenges, spool) = no_state();
-        let resp = route("GET", "/api/health", None, b"", &challenges, spool.path());
+        let resp = route("GET", "/api/health", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
         assert_eq!(resp.status, 200);
         assert_eq!(resp.content_type, "application/json");
         assert_eq!(resp.body, br#"{"status":"ok"}"#.to_vec());
@@ -248,7 +325,7 @@ mod tests {
     #[test]
     fn root_serves_embedded_index() {
         let (challenges, spool) = no_state();
-        let resp = route("GET", "/", None, b"", &challenges, spool.path());
+        let resp = route("GET", "/", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
         assert_eq!(resp.status, 200);
         assert_eq!(resp.content_type, "text/html; charset=utf-8");
         let body = String::from_utf8(resp.body).unwrap();
@@ -259,7 +336,7 @@ mod tests {
     #[test]
     fn unknown_path_falls_back_to_index_spa_style() {
         let (challenges, spool) = no_state();
-        let resp = route("GET", "/some/client/route", None, b"", &challenges, spool.path());
+        let resp = route("GET", "/some/client/route", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
         assert_eq!(resp.status, 200);
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("Lightning Mesh"));
@@ -268,7 +345,7 @@ mod tests {
     #[test]
     fn unknown_method_is_not_found() {
         let (challenges, spool) = no_state();
-        let resp = route("DELETE", "/api/health", None, b"", &challenges, spool.path());
+        let resp = route("DELETE", "/api/health", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
         assert_eq!(resp.status, 404);
     }
 
@@ -277,7 +354,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<html>dev override</html>").unwrap();
         let (challenges, spool) = no_state();
-        let resp = route("GET", "/", Some(dir.path()), b"", &challenges, spool.path());
+        let resp = route("GET", "/", Some(dir.path()), b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
         assert_eq!(resp.status, 200);
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("dev override"));
@@ -290,7 +367,7 @@ mod tests {
         let pubkey_hex = HEXLOWER.encode(signing_key.verifying_key().as_bytes());
 
         let challenge_resp =
-            route("GET", "/api/challenge", None, b"", &challenges, spool.path());
+            route("GET", "/api/challenge", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
         assert_eq!(challenge_resp.status, 200);
         let challenge_json: serde_json::Value =
             serde_json::from_slice(&challenge_resp.body).unwrap();
@@ -310,6 +387,8 @@ mod tests {
             body.as_bytes(),
             &challenges,
             spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
         );
         assert_eq!(resp.status, 200);
 
@@ -324,6 +403,8 @@ mod tests {
             body.as_bytes(),
             &challenges,
             spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
         );
         assert_eq!(replay.status, 400);
     }
@@ -336,7 +417,7 @@ mod tests {
         let pubkey_hex = HEXLOWER.encode(signing_key.verifying_key().as_bytes());
 
         let challenge_resp =
-            route("GET", "/api/challenge", None, b"", &challenges, spool.path());
+            route("GET", "/api/challenge", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
         let challenge_json: serde_json::Value =
             serde_json::from_slice(&challenge_resp.body).unwrap();
         let challenge_hex = challenge_json["challenge"].as_str().unwrap().to_string();
@@ -356,6 +437,8 @@ mod tests {
             body.as_bytes(),
             &challenges,
             spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
         );
         assert_eq!(resp.status, 400);
         assert!(std::fs::read_dir(spool.path()).unwrap().next().is_none(), "spool should be empty");
@@ -368,7 +451,7 @@ mod tests {
         let pubkey_hex = HEXLOWER.encode(signing_key.verifying_key().as_bytes());
 
         let challenge_resp =
-            route("GET", "/api/challenge", None, b"", &challenges, spool.path());
+            route("GET", "/api/challenge", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
         let challenge_json: serde_json::Value =
             serde_json::from_slice(&challenge_resp.body).unwrap();
         let challenge_hex = challenge_json["challenge"].as_str().unwrap().to_string();
@@ -380,10 +463,10 @@ mod tests {
             r#"{{"pubkey":"{pubkey_hex}","sig":"{sig_hex}","challenge":"{challenge_hex}"}}"#
         );
 
-        let first = route("POST", "/api/identity", None, body.as_bytes(), &challenges, spool.path());
+        let first = route("POST", "/api/identity", None, body.as_bytes(), &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
         assert_eq!(first.status, 200);
 
-        let second = route("POST", "/api/identity", None, body.as_bytes(), &challenges, spool.path());
+        let second = route("POST", "/api/identity", None, body.as_bytes(), &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
         assert_eq!(second.status, 400);
     }
 
@@ -401,8 +484,108 @@ mod tests {
             r#"{{"pubkey":"{pubkey_hex}","sig":"{sig_hex}","challenge":"{fake_challenge}"}}"#
         );
 
-        let resp = route("POST", "/api/identity", None, body.as_bytes(), &challenges, spool.path());
+        let resp = route("POST", "/api/identity", None, body.as_bytes(), &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
         assert_eq!(resp.status, 400);
         assert!(std::fs::read_dir(spool.path()).unwrap().next().is_none());
+    }
+
+    const SAMPLE_DIRECTORY: &str = r#"{
+        "version": 1,
+        "node": { "node_id": "n1", "subnet": "10.42.1.0/24", "backhaul_addr": "10.254.1.1" },
+        "neighbors": [ { "node_id": "n2", "addrs": ["10.254.1.2"], "subnet": null } ],
+        "identities": [ { "username": "alice", "display_name": "Alice" } ],
+        "services": [ { "name": "grafana", "ip": "10.42.1.5", "port": 3000, "protocol": "http" } ]
+    }"#;
+
+    #[test]
+    fn directory_endpoint_serves_file_contents() {
+        let (challenges, spool) = no_state();
+        let (cache, dir) = no_directory();
+        let directory_path = dir.path().join("directory.json");
+        std::fs::write(&directory_path, SAMPLE_DIRECTORY).unwrap();
+
+        let resp = route(
+            "GET",
+            "/api/directory",
+            None,
+            b"",
+            &challenges,
+            spool.path(),
+            &cache,
+            &directory_path,
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.content_type, "application/json");
+        let value: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(value["node"]["node_id"], "n1");
+        assert_eq!(value["neighbors"][0]["node_id"], "n2");
+        assert_eq!(value["identities"][0]["username"], "alice");
+        assert_eq!(value["services"][0]["name"], "grafana");
+    }
+
+    #[test]
+    fn directory_endpoint_returns_empty_directory_when_file_missing() {
+        let (challenges, spool) = no_state();
+        let (cache, dir) = no_directory();
+        let missing_path = dir.path().join("does-not-exist.json");
+
+        let resp = route(
+            "GET",
+            "/api/directory",
+            None,
+            b"",
+            &challenges,
+            spool.path(),
+            &cache,
+            &missing_path,
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.body,
+            br#"{"version":1,"node":null,"neighbors":[],"identities":[],"services":[]}"#.to_vec()
+        );
+    }
+
+    #[test]
+    fn node_endpoint_extracts_node_section() {
+        let (challenges, spool) = no_state();
+        let (cache, dir) = no_directory();
+        let directory_path = dir.path().join("directory.json");
+        std::fs::write(&directory_path, SAMPLE_DIRECTORY).unwrap();
+
+        let resp = route(
+            "GET",
+            "/api/node",
+            None,
+            b"",
+            &challenges,
+            spool.path(),
+            &cache,
+            &directory_path,
+        );
+        assert_eq!(resp.status, 200);
+        let value: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(value["node_id"], "n1");
+        assert_eq!(value["backhaul_addr"], "10.254.1.1");
+    }
+
+    #[test]
+    fn node_endpoint_returns_empty_object_when_node_missing() {
+        let (challenges, spool) = no_state();
+        let (cache, dir) = no_directory();
+        let missing_path = dir.path().join("does-not-exist.json");
+
+        let resp = route(
+            "GET",
+            "/api/node",
+            None,
+            b"",
+            &challenges,
+            spool.path(),
+            &cache,
+            &missing_path,
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"{}".to_vec());
     }
 }

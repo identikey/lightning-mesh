@@ -43,6 +43,7 @@ use mjolnir_mesh::{
     ServiceEntry, SubnetClaim, UserBook, UserEntry, HLC,
 };
 use mjolnir_mesh::GossipMessage;
+use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -195,6 +196,23 @@ enum Command {
         /// missing.
         #[arg(long, default_value = "/etc/mjolnir/claims.state")]
         claims_file: PathBuf,
+        /// Where to write the read-only `directory.json` projection (bead avs):
+        /// a snapshot of this node's identity, neighbors (AddrBook + subnet
+        /// claims), identities (/users), and services, for `mjolnir-hello` to
+        /// read directly — it does NOT re-derive state. Rewritten on the
+        /// anti-entropy cadence via tmp+rename (same discipline as
+        /// `claims_file`). Default MUST match `mjolnir-hello --directory-file`'s
+        /// default and the deploy UCI config — do not diverge.
+        #[arg(long, default_value = "/var/run/mjolnir/directory.json")]
+        directory_file: PathBuf,
+        /// Identity-submission spool dir (p6u): `mjolnir-hello` writes one
+        /// `{pubkey}.json` file per accepted (Ed25519-verified) identity
+        /// submission here; meshd sweeps it on the anti-entropy cadence, turns
+        /// each into a `/users` record, gossips it mesh-wide, and deletes the
+        /// file. Default MUST match `mjolnir-hello --spool-dir`'s default and
+        /// the deploy UCI config — do not diverge.
+        #[arg(long, default_value = "/var/run/mjolnir/pending")]
+        spool_dir: PathBuf,
         /// buw single-overlay-TUN data plane (mjolnir-mesh-buw): bring up ONE
         /// `mjolnir0` multiplexing every peer, so babeld sees one static
         /// interface instead of N churning per-peer tunnels. Off by default —
@@ -356,6 +374,8 @@ async fn main() -> Result<()> {
             backhaul_iface: _,
             lan_tunnels,
             claims_file,
+            directory_file,
+            spool_dir,
             overlay,
             gateway,
         } => {
@@ -374,6 +394,8 @@ async fn main() -> Result<()> {
                 lan_tunnels,
                 l2,
                 claims_file,
+                directory_file,
+                spool_dir,
                 overlay,
                 gateway,
                 backhaul_ip,
@@ -598,6 +620,8 @@ async fn run_mesh(
     lan_tunnels: bool,
     l2_backhaul: Option<String>,
     claims_file: PathBuf,
+    directory_file: PathBuf,
+    spool_dir: PathBuf,
     overlay: bool,
     gateway: bool,
     backhaul_ip: Ipv4Addr,
@@ -995,6 +1019,8 @@ async fn run_mesh(
                 let users_seed = user_seed_file.clone();
                 let services = service_book.clone();
                 let services_path = service_book_file.clone();
+                let directory_path = directory_file.clone();
+                let spool_path = spool_dir.clone();
                 let announce = SelfAnnounce {
                     endpoint: endpoint.clone(),
                     self_id: self_id_str.clone(),
@@ -1004,7 +1030,7 @@ async fn run_mesh(
                 tokio::spawn(async move {
                     anti_entropy_loop(
                         sync, store, path, book, book_path, users, users_path, users_seed,
-                        services, services_path, announce,
+                        services, services_path, directory_path, spool_path, announce,
                     )
                     .await
                 })
@@ -1823,6 +1849,192 @@ fn persist_service_book(snapshot: &ServiceBook, path: &Path) {
     }
 }
 
+/// Schema version for the `directory.json` projection (bead avs). Bump this
+/// whenever the on-disk shape changes in a way `mjolnir-hello` needs to know
+/// about, so the daemon and the hello server can evolve independently.
+const DIRECTORY_SCHEMA_VERSION: u32 = 1;
+
+/// Read-only snapshot of mesh state that `mjolnir-hello` reads directly (it
+/// does NOT re-derive state from the CRDT stores itself). Written atomically
+/// (tmp+rename) by [`persist_directory`] on the anti-entropy cadence. See bead
+/// mjolnir-mesh-avs.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DirectorySnapshot {
+    version: u32,
+    node: DirectoryNode,
+    neighbors: Vec<DirectoryNeighbor>,
+    identities: Vec<DirectoryIdentity>,
+    services: Vec<DirectoryService>,
+}
+
+/// "You are here": this node's own identity, claimed client subnet (if any),
+/// and derived overlay backhaul address.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DirectoryNode {
+    node_id: String,
+    /// This node's claimed client `/24` (e.g. `10.42.1.0/24`), if it has
+    /// claimed one yet. `None` during the post-boot warmup window.
+    subnet: Option<String>,
+    backhaul_addr: String,
+}
+
+/// One other mesh node, joining its [`AddrBook`] entry with any subnet claim
+/// it owns.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DirectoryNeighbor {
+    node_id: String,
+    addrs: Vec<String>,
+    subnet: Option<String>,
+}
+
+/// One `/users` record, projected for the front desk.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DirectoryIdentity {
+    username: String,
+    display_name: String,
+}
+
+/// One service-directory record, projected for the front desk. `name` is the
+/// `ServiceBook` map key (the fully-qualified service name), not
+/// [`ServiceEntry::hostname`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DirectoryService {
+    name: String,
+    ip: String,
+    port: u16,
+    protocol: String,
+}
+
+/// Find the client `/24` (if any) owned by `node_id` in the claim map, e.g.
+/// `10.42.1.0/24`. Excludes backhaul `/32` claims (mjolnir-mesh-pt9) — those
+/// are overlay addressing, not a client subnet. Pure; shared by
+/// [`build_directory_snapshot`] for both the "you are here" node section and
+/// each neighbor.
+fn owned_client_subnet(claims: &HashMap<String, SubnetClaim>, node_id: &str) -> Option<String> {
+    claims
+        .values()
+        .filter(|c| c.owner_node_id == node_id)
+        .find_map(|c| match c.cidr {
+            IpNet::V4(n) if !mjolnir_mesh::tun::in_backhaul_block(&n) => Some(n.to_string()),
+            _ => None,
+        })
+}
+
+/// Project the daemon's four in-memory CRDT stores into the read-only
+/// `directory.json` shape `mjolnir-hello` reads (bead avs). Pure over plain
+/// snapshots (no locks, no I/O) so it's natively unit-testable without the
+/// `daemon` feature's Linux-only dependencies — the timer/write wiring that
+/// calls this is exercised by [`write_directory_projection`] instead.
+fn build_directory_snapshot(
+    claims: &HashMap<String, SubnetClaim>,
+    addr_book: &AddrBook,
+    user_book: &UserBook,
+    service_book: &ServiceBook,
+    self_id: &str,
+    backhaul_ip: Ipv4Addr,
+) -> DirectorySnapshot {
+    let node = DirectoryNode {
+        node_id: self_id.to_string(),
+        subnet: owned_client_subnet(claims, self_id),
+        backhaul_addr: backhaul_ip.to_string(),
+    };
+
+    let neighbors = addr_book
+        .values()
+        .filter(|entry| entry.node_id != self_id)
+        .map(|entry| DirectoryNeighbor {
+            node_id: entry.node_id.clone(),
+            addrs: entry.direct_addrs.iter().map(ToString::to_string).collect(),
+            subnet: owned_client_subnet(claims, &entry.node_id),
+        })
+        .collect();
+
+    let identities = user_book
+        .values()
+        .map(|u| DirectoryIdentity {
+            username: u.username.clone(),
+            display_name: u.display_name.clone(),
+        })
+        .collect();
+
+    let services = service_book
+        .iter()
+        .map(|(name, entry)| DirectoryService {
+            name: name.clone(),
+            ip: entry.ip.to_string(),
+            port: entry.port,
+            protocol: entry.protocol.clone(),
+        })
+        .collect();
+
+    DirectorySnapshot {
+        version: DIRECTORY_SCHEMA_VERSION,
+        node,
+        neighbors,
+        identities,
+        services,
+    }
+}
+
+/// Persist a directory-projection snapshot to `path` as pretty JSON, writing
+/// to a sibling temp file and renaming over the target so a crash or power
+/// loss mid-write can't leave `mjolnir-hello` reading a torn file. Best
+/// effort: a failure is logged, not fatal. Mirrors [`persist_service_book`],
+/// but JSON (via `serde_json`) rather than postcard, since this file is read
+/// by another process rather than round-tripped by this daemon.
+fn persist_directory(snapshot: &DirectorySnapshot, path: &Path) {
+    let bytes = match serde_json::to_vec_pretty(snapshot) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to encode directory projection for persistence: {e}");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        warn!(path = %parent.display(), "failed to create directory projection dir: {e}");
+        return;
+    }
+    let tmp_path = path.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+        warn!(path = %tmp_path.display(), "failed to write directory projection tmp file: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        warn!(path = %path.display(), "failed to rename directory projection tmp file into place: {e}");
+    }
+}
+
+/// Briefly lock each of the four CRDT stores to clone a cheap snapshot,
+/// release the locks, then build and persist the `directory.json` projection
+/// (bead avs). Called once up front and once per anti-entropy tick from
+/// [`anti_entropy_loop`], mirroring how the other books re-persist on the same
+/// cadence.
+fn write_directory_projection(
+    claims: &ClaimStore,
+    addr_book: &Arc<Mutex<AddrBook>>,
+    user_book: &Arc<Mutex<UserBook>>,
+    service_book: &Arc<Mutex<ServiceBook>>,
+    self_id: &str,
+    backhaul_ip: Ipv4Addr,
+    directory_file: &Path,
+) {
+    let claims_snapshot = claims.lock().expect("claim store poisoned").clone();
+    let addr_snapshot = addr_book.lock().expect("address book poisoned").clone();
+    let user_snapshot = user_book.lock().expect("user directory poisoned").clone();
+    let service_snapshot = service_book.lock().expect("service directory poisoned").clone();
+    let snapshot = build_directory_snapshot(
+        &claims_snapshot,
+        &addr_snapshot,
+        &user_snapshot,
+        &service_snapshot,
+        self_id,
+        backhaul_ip,
+    );
+    persist_directory(&snapshot, directory_file);
+}
+
 /// Apply an inbound service CRDT message to the directory. Returns the
 /// `(name, entry)` newly inserted or updated (so the caller can persist and
 /// log), or `None` for another CRDT type or an LWW-stale/duplicate update. Pure
@@ -1874,6 +2086,124 @@ fn load_user_seed(path: &Path, self_id: &str) -> Vec<UserEntry> {
             }
         })
         .collect()
+}
+
+/// A pending identity submission written by `mjolnir-hello` into the spool dir
+/// (story 5zn): `pending/{pubkey}.json`. `mjolnir-hello` has already
+/// Ed25519-verified `sig` over `challenge` before spooling it, so meshd's job
+/// is purely to turn an accepted submission into a `/users` record and gossip
+/// it mesh-wide — this is the real p6u identity-submission control plane that
+/// replaces the `users.seed` plaintext stand-in.
+#[derive(Debug, Clone, Deserialize)]
+struct SpoolSubmission {
+    pubkey: String,
+    #[allow(dead_code)] // not re-verified here; see spool_submission_to_user_entry doc
+    sig: String,
+    #[allow(dead_code)]
+    challenge: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// A short, human-scannable form of a hex pubkey for use as a default display
+/// name when a submission carries no `label` (first 8 hex chars + ellipsis).
+fn short_pubkey(pubkey: &str) -> String {
+    let n = pubkey.len().min(8);
+    format!("{}…", &pubkey[..n])
+}
+
+/// Map a parsed spool submission into a `/users` CRDT record (p6u). The pubkey
+/// is the stable identity key (`username`, mirroring how [`load_user_seed`]
+/// uses a stable handle as the key); `display_name` is the caller-chosen
+/// `label` if present, else [`short_pubkey`]. `registered_by` is this node's
+/// id — the node that ingested the submission, not necessarily the node the
+/// user connected to — and the record is stamped with a fresh HLC, same as a
+/// freshly-read seed line. The pubkey is duplicated into `attrs` so it survives
+/// alongside the record even though it's already the key. Re-verifying the
+/// Ed25519 signature here was left out: `mjolnir-hello` already verified it
+/// before spooling, and the daemon build (`--features daemon`) has no ed25519
+/// dependency wired in today — see the p6u Dev Agent Record for the tradeoff.
+fn spool_submission_to_user_entry(sub: &SpoolSubmission, self_id: &str) -> UserEntry {
+    let display_name = sub
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| short_pubkey(&sub.pubkey));
+    let mut attrs = std::collections::BTreeMap::new();
+    attrs.insert("pubkey".to_string(), sub.pubkey.clone());
+    UserEntry {
+        username: sub.pubkey.clone(),
+        display_name,
+        registered_by: self_id.to_string(),
+        attrs,
+        updated_at: now_hlc(self_id),
+    }
+}
+
+/// Sweep the identity spool dir for `*.json` submissions and merge each into
+/// the user directory (p6u). Called from [`anti_entropy_loop`] right before
+/// [`announce_user_book`], which re-broadcasts the FULL book — so a newly
+/// merged entry rides that same tick's gossip, exactly like a freshly-read
+/// `users.seed` line. Idempotent: `merge_user` is LWW, so re-ingesting the same
+/// file (should the delete below ever fail) is harmless. Malformed JSON is
+/// logged and the file is quarantined to a `.bad` sidecar rather than deleted,
+/// so a human can inspect what `mjolnir-hello` wrote; any I/O error is logged
+/// and skipped. Neither ever aborts the sweep — one bad file must never wedge
+/// the anti-entropy loop.
+fn ingest_identity_spool(spool_dir: &Path, user_book: &Arc<Mutex<UserBook>>, self_id: &str) {
+    let entries = match std::fs::read_dir(spool_dir) {
+        Ok(e) => e,
+        // No spool dir yet (nothing submitted, or mjolnir-hello hasn't run) —
+        // not an error, mirrors the tolerant load of the other books.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(path = %spool_dir.display(), "identity spool: failed to read dir: {e}");
+            return;
+        }
+    };
+    for dir_entry in entries.flatten() {
+        let path = dir_entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(path = %path.display(), "identity spool: failed to read file: {e}");
+                continue;
+            }
+        };
+        let sub: SpoolSubmission = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(path = %path.display(), "identity spool: malformed submission, quarantining: {e}");
+                let bad = path.with_extension("json.bad");
+                if let Err(e) = std::fs::rename(&path, &bad) {
+                    warn!(path = %path.display(), "identity spool: failed to quarantine malformed file: {e}");
+                }
+                continue;
+            }
+        };
+        let entry = spool_submission_to_user_entry(&sub, self_id);
+        {
+            let mut book = user_book.lock().expect("user directory poisoned");
+            match merge_user(book.get(&entry.username), &entry) {
+                MergeResult::Inserted | MergeResult::Updated => {
+                    info!(pubkey = %entry.username, display = %entry.display_name,
+                        "identity spool: ingested submission into /users");
+                    book.insert(entry.username.clone(), entry);
+                }
+                // Stale/duplicate (already ingested by us or a peer, LWW) — still
+                // remove the spool file below, same as a successful ingest.
+                MergeResult::Unchanged | MergeResult::Conflict { .. } => {}
+            }
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            warn!(path = %path.display(), "identity spool: failed to remove ingested file: {e}");
+        }
+    }
 }
 
 /// Apply an inbound user CRDT message to the directory. Returns the entry newly
@@ -1971,6 +2301,8 @@ async fn anti_entropy_loop<T: GossipTransport>(
     user_seed_file: PathBuf,
     service_book: Arc<Mutex<ServiceBook>>,
     service_book_file: PathBuf,
+    directory_file: PathBuf,
+    spool_dir: PathBuf,
     self_announce: SelfAnnounce,
 ) {
     // Self-announce our address once up front (0yb): unlike the claim map, whose
@@ -1978,6 +2310,10 @@ async fn anti_entropy_loop<T: GossipTransport>(
     // separate warmup publisher, so the first broadcast happens here before the
     // ticker's immediately-consumed first tick.
     announce_addr_book(&sync, &addr_book, &addr_book_file, &self_announce).await;
+    // Ingest any identity submissions already waiting in the spool (p6u) before
+    // the first announce, so a pending submission from before this boot isn't
+    // stuck an extra tick.
+    ingest_identity_spool(&spool_dir, &user_book, &self_announce.self_id);
     // Likewise seed+announce the user directory up front (2xd/p6u).
     announce_user_book(
         &sync,
@@ -1989,6 +2325,17 @@ async fn anti_entropy_loop<T: GossipTransport>(
     .await;
     // Likewise re-broadcast the service directory up front (7jb).
     announce_service_book(&sync, &service_book, &service_book_file).await;
+    // Write the initial directory.json projection up front too (avs), so
+    // mjolnir-hello has a snapshot to read before the first anti-entropy tick.
+    write_directory_projection(
+        &store,
+        &addr_book,
+        &user_book,
+        &service_book,
+        &self_announce.self_id,
+        self_announce.backhaul_ip,
+        &directory_file,
+    );
     let mut ticker = tokio::time::interval(ANTI_ENTROPY_INTERVAL);
     ticker.tick().await; // first tick fires immediately; the warmup claim publish already covered this
     loop {
@@ -2010,6 +2357,11 @@ async fn anti_entropy_loop<T: GossipTransport>(
         // Re-announce our own address and re-broadcast the full address book
         // alongside the claim map, on the same cadence (0yb).
         announce_addr_book(&sync, &addr_book, &addr_book_file, &self_announce).await;
+        // Sweep the identity spool (p6u): each accepted submission `mjolnir-hello`
+        // wrote becomes a `/users` record here, merged into the book so the
+        // announce call right below picks it up in its full-book re-broadcast —
+        // exactly the model the `users.seed` stand-in used for injecting records.
+        ingest_identity_spool(&spool_dir, &user_book, &self_announce.self_id);
         // Re-read the seed, re-stamp our originated records, and re-broadcast the
         // full user directory on the same cadence (2xd/p6u).
         announce_user_book(
@@ -2022,6 +2374,17 @@ async fn anti_entropy_loop<T: GossipTransport>(
         .await;
         // Re-broadcast the full service directory on the same cadence (7jb).
         announce_service_book(&sync, &service_book, &service_book_file).await;
+        // Re-project the read-only directory.json snapshot on the same cadence
+        // (avs), after the books above have been refreshed for this tick.
+        write_directory_projection(
+            &store,
+            &addr_book,
+            &user_book,
+            &service_book,
+            &self_announce.self_id,
+            self_announce.backhaul_ip,
+            &directory_file,
+        );
     }
 }
 
@@ -4374,5 +4737,257 @@ config meshd 'meshd'
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded["printer._ipp._tcp"].port, 631);
         assert_eq!(loaded["nas._smb._tcp"].updated_at.wall_clock, 200);
+    }
+
+    // --- directory.json projection (mjolnir-mesh-avs) -------------------------
+
+    fn user_entry(username: &str, display_name: &str, wall_clock: u64) -> UserEntry {
+        UserEntry {
+            username: username.to_string(),
+            display_name: display_name.to_string(),
+            registered_by: "self".to_string(),
+            attrs: std::collections::BTreeMap::new(),
+            updated_at: HLC { wall_clock, counter: 0, node_id: "self".to_string() },
+        }
+    }
+
+    #[test]
+    fn build_directory_snapshot_has_version_and_node_identity() {
+        let claims = HashMap::new();
+        let addr_book = AddrBook::new();
+        let user_book = UserBook::new();
+        let service_book = ServiceBook::new();
+
+        let snapshot = build_directory_snapshot(
+            &claims,
+            &addr_book,
+            &user_book,
+            &service_book,
+            "self",
+            "10.254.1.1".parse().unwrap(),
+        );
+
+        assert_eq!(snapshot.version, DIRECTORY_SCHEMA_VERSION);
+        assert_eq!(snapshot.node.node_id, "self");
+        assert_eq!(snapshot.node.backhaul_addr, "10.254.1.1");
+        // No claim recorded yet for "self" — subnet is unknown during warmup.
+        assert_eq!(snapshot.node.subnet, None);
+        assert!(snapshot.neighbors.is_empty());
+        assert!(snapshot.identities.is_empty());
+        assert!(snapshot.services.is_empty());
+    }
+
+    #[test]
+    fn build_directory_snapshot_projects_neighbors_identities_and_services() {
+        let mut claims = HashMap::new();
+        claims.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "self", 100));
+        claims.insert("10.42.2.0/24".to_string(), claim("10.42.2.0/24", "peer-a", 100));
+
+        let mut addr_book = AddrBook::new();
+        addr_book.insert("self".to_string(), addr_entry("self", 100, "10.254.1.1:49737"));
+        addr_book.insert("peer-a".to_string(), addr_entry("peer-a", 100, "10.254.2.2:49737"));
+
+        let mut user_book = UserBook::new();
+        user_book.insert("ada".to_string(), user_entry("ada", "Ada Lovelace", 100));
+
+        let mut service_book = ServiceBook::new();
+        service_book.insert(
+            "printer._ipp._tcp".to_string(),
+            svc_entry("printer", 631, 100, "peer-a"),
+        );
+
+        let snapshot = build_directory_snapshot(
+            &claims,
+            &addr_book,
+            &user_book,
+            &service_book,
+            "self",
+            "10.254.1.1".parse().unwrap(),
+        );
+
+        // Valid JSON with the schema version field (AC).
+        let json = serde_json::to_string(&snapshot).expect("snapshot must serialize as JSON");
+        assert!(json.contains("\"version\":1"));
+
+        // "You are here": self's own claimed /24, not a peer's.
+        assert_eq!(snapshot.node.subnet.as_deref(), Some("10.42.1.0/24"));
+
+        // Neighbors exclude self and join AddrBook with the neighbor's own claim.
+        assert_eq!(snapshot.neighbors.len(), 1);
+        let neighbor = &snapshot.neighbors[0];
+        assert_eq!(neighbor.node_id, "peer-a");
+        assert_eq!(neighbor.addrs, vec!["10.254.2.2:49737".to_string()]);
+        assert_eq!(neighbor.subnet.as_deref(), Some("10.42.2.0/24"));
+
+        // Identities come straight from the user book.
+        assert_eq!(snapshot.identities.len(), 1);
+        assert_eq!(snapshot.identities[0].username, "ada");
+        assert_eq!(snapshot.identities[0].display_name, "Ada Lovelace");
+
+        // Services are keyed by the ServiceBook map key, not entry.hostname.
+        assert_eq!(snapshot.services.len(), 1);
+        assert_eq!(snapshot.services[0].name, "printer._ipp._tcp");
+        assert_eq!(snapshot.services[0].port, 631);
+        assert_eq!(snapshot.services[0].protocol, "_ipp._tcp");
+    }
+
+    #[test]
+    fn persist_directory_writes_valid_json_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("directory.json");
+        // A stray .tmp sibling from a previous crash must not break a fresh write.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path.with_extension("tmp"), b"leftover garbage").unwrap();
+
+        let snapshot = build_directory_snapshot(
+            &HashMap::new(),
+            &AddrBook::new(),
+            &UserBook::new(),
+            &ServiceBook::new(),
+            "self",
+            "10.254.1.1".parse().unwrap(),
+        );
+        persist_directory(&snapshot, &path);
+
+        assert!(path.exists(), "parent dir is created and file written");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(decoded["version"], 1);
+        assert_eq!(decoded["node"]["node_id"], "self");
+    }
+
+    // --- identity-submission spool ingest (mjolnir-mesh-p6u) -------------------
+
+    #[test]
+    fn spool_submission_maps_to_user_entry_with_label() {
+        let sub = SpoolSubmission {
+            pubkey: "abcdef0123456789".to_string(),
+            sig: "deadbeef".to_string(),
+            challenge: "cafef00d".to_string(),
+            label: Some("Ada".to_string()),
+        };
+        let entry = spool_submission_to_user_entry(&sub, "router-a");
+
+        assert_eq!(entry.username, "abcdef0123456789", "pubkey is the stable identity key");
+        assert_eq!(entry.display_name, "Ada", "label wins over the derived short form");
+        assert_eq!(entry.registered_by, "router-a");
+        assert_eq!(entry.attrs.get("pubkey"), Some(&"abcdef0123456789".to_string()));
+        assert_eq!(entry.updated_at.node_id, "router-a", "stamped with a fresh HLC");
+    }
+
+    #[test]
+    fn spool_submission_without_label_uses_short_pubkey() {
+        let sub = SpoolSubmission {
+            pubkey: "abcdef0123456789".to_string(),
+            sig: "deadbeef".to_string(),
+            challenge: "cafef00d".to_string(),
+            label: None,
+        };
+        let entry = spool_submission_to_user_entry(&sub, "router-a");
+        assert_eq!(entry.display_name, "abcdef01…");
+    }
+
+    #[test]
+    fn spool_submission_blank_label_falls_back_to_short_pubkey() {
+        let sub = SpoolSubmission {
+            pubkey: "abcdef0123456789".to_string(),
+            sig: "deadbeef".to_string(),
+            challenge: "cafef00d".to_string(),
+            label: Some("   ".to_string()),
+        };
+        let entry = spool_submission_to_user_entry(&sub, "router-a");
+        assert_eq!(entry.display_name, "abcdef01…");
+    }
+
+    #[test]
+    fn spool_json_parses_into_expected_submission() {
+        let json = r#"{"pubkey":"abcdef0123456789","sig":"deadbeef","challenge":"cafef00d","label":"Ada"}"#;
+        let sub: SpoolSubmission = serde_json::from_str(json).expect("valid submission JSON");
+        assert_eq!(sub.pubkey, "abcdef0123456789");
+        assert_eq!(sub.label.as_deref(), Some("Ada"));
+
+        let entry = spool_submission_to_user_entry(&sub, "router-a");
+        assert_eq!(entry.username, "abcdef0123456789");
+        assert_eq!(entry.display_name, "Ada");
+        assert_eq!(entry.registered_by, "router-a");
+    }
+
+    #[test]
+    fn spool_json_without_label_field_parses_via_serde_default() {
+        // mjolnir-hello's `label` field is optional in the wire format.
+        let json = r#"{"pubkey":"abcdef0123456789","sig":"deadbeef","challenge":"cafef00d"}"#;
+        let sub: SpoolSubmission = serde_json::from_str(json).expect("label is optional");
+        assert_eq!(sub.label, None);
+    }
+
+    #[test]
+    fn ingest_identity_spool_merges_and_deletes_valid_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abcdef0123456789.json");
+        std::fs::write(
+            &path,
+            r#"{"pubkey":"abcdef0123456789","sig":"deadbeef","challenge":"cafef00d","label":"Ada"}"#,
+        )
+        .unwrap();
+
+        let user_book: Arc<Mutex<UserBook>> = Arc::new(Mutex::new(UserBook::new()));
+        ingest_identity_spool(dir.path(), &user_book, "router-a");
+
+        let book = user_book.lock().unwrap();
+        assert_eq!(book.len(), 1);
+        let entry = &book["abcdef0123456789"];
+        assert_eq!(entry.display_name, "Ada");
+        assert_eq!(entry.registered_by, "router-a");
+        drop(book);
+
+        assert!(!path.exists(), "ingested spool file must be removed");
+    }
+
+    #[test]
+    fn ingest_identity_spool_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abcdef0123456789.json");
+        let write_submission = || {
+            std::fs::write(
+                &path,
+                r#"{"pubkey":"abcdef0123456789","sig":"deadbeef","challenge":"cafef00d"}"#,
+            )
+            .unwrap();
+        };
+        let user_book: Arc<Mutex<UserBook>> = Arc::new(Mutex::new(UserBook::new()));
+
+        write_submission();
+        ingest_identity_spool(dir.path(), &user_book, "router-a");
+        // Re-ingesting the same submission (as if the delete had raced or the
+        // file were resubmitted) must not error or duplicate the record.
+        write_submission();
+        ingest_identity_spool(dir.path(), &user_book, "router-a");
+
+        let book = user_book.lock().unwrap();
+        assert_eq!(book.len(), 1, "merge_user LWW keeps this idempotent");
+    }
+
+    #[test]
+    fn ingest_identity_spool_quarantines_malformed_file_without_crashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, b"not valid json").unwrap();
+
+        let user_book: Arc<Mutex<UserBook>> = Arc::new(Mutex::new(UserBook::new()));
+        ingest_identity_spool(dir.path(), &user_book, "router-a");
+
+        assert!(user_book.lock().unwrap().is_empty());
+        assert!(!path.exists(), "malformed file is moved, not left in place");
+        assert!(dir.path().join("bad.json.bad").exists(), "quarantined to a .bad sidecar");
+    }
+
+    #[test]
+    fn ingest_identity_spool_missing_dir_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let user_book: Arc<Mutex<UserBook>> = Arc::new(Mutex::new(UserBook::new()));
+        // Must not panic even though the spool dir was never created.
+        ingest_identity_spool(&missing, &user_book, "router-a");
+        assert!(user_book.lock().unwrap().is_empty());
     }
 }

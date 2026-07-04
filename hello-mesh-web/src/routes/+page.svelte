@@ -3,6 +3,7 @@
      No external hosts — must run fully offline. -->
 <script lang="ts">
 	import IdentityPanel from '$lib/components/IdentityPanel.svelte';
+	import DirectoryPanel from '$lib/components/DirectoryPanel.svelte';
 </script>
 
 <main class="mx-auto flex max-w-2xl flex-col gap-6 p-6 text-slate-100">
@@ -13,5 +14,5 @@
 
 	<IdentityPanel />
 
-	<!-- S5 directory section slots in here. -->
+	<DirectoryPanel />
 </main>

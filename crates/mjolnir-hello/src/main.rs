@@ -18,17 +18,14 @@ use tiny_http::{Header, Response, Server};
 use tracing::info;
 
 use config::Config;
-use routes::{new_challenge_store, route};
+use routes::{new_challenge_store, route, DirectoryCache};
 
 fn main() {
     tracing_subscriber::fmt::init();
     let config = Config::parse();
 
-    // Referenced by the S3 handlers landing in mjolnir-mesh-11l; unused in
-    // this scaffold story beyond validating the flags parse.
-    let _ = &config.directory_file;
-
     let challenges = new_challenge_store();
+    let directory_cache = DirectoryCache::new();
 
     let server = Server::http(&config.bind).unwrap_or_else(|err| {
         panic!("failed to bind {}: {err}", config.bind);
@@ -51,6 +48,8 @@ fn main() {
             &body,
             &challenges,
             &config.spool_dir,
+            &directory_cache,
+            &config.directory_file,
         );
 
         let content_type = Header::from_bytes(
