@@ -146,6 +146,34 @@ synchronization protocol" to design and build.
 This is squarely the kind of non-authoritative, eventually-consistent, symmetric
 mechanism the project is about — a good problem, not a blocker.
 
+### Shipped & field-validated 2026-07-03 (`0yb`) — and the three roles of discovery
+
+The gossip address book shipped and was validated on the 4-node fleet: every
+node learns every peer's self-announced (node id → address) entry over the
+CRDT, persisted across reboots, feeding iroh's dialer — including a node that
+slept through an entire rollout and converged within seconds of returning. The
+synchronization protocol this section called for exists.
+
+With it, discovery settles into **three distinct roles** — worth keeping
+separate through the service-mesh pass (`e21`):
+
+1. **Mesh-wide substrate: the CRDT, superseding mDNS.** Addresses — and next,
+   names and services — replicate over gossip; every query is answered from the
+   local replica. No cross-mesh query traffic, works while partitioned, no
+   authoritative node.
+2. **Client edge: mDNS stays, demoted to adapter.** Stock devices speak
+   mDNS/DNS-SD and always will; each node harvests its own /24's announcements
+   into the CRDT and can re-announce remote entries locally — *translator, not
+   repeater* (see [prior-art.md](prior-art.md) §3.2 for the Wide-Area Bonjour /
+   OpenThread-SRP precedent). Broadcast never crosses a segment; the directory
+   does.
+3. **Cross-site: the sync layer is already transport-agnostic.** Gossip rides
+   iroh QUIC identically over the L2 island and the internet; `0yb` proved
+   entries propagate regardless of transport. The cross-site design question in
+   `e21` is therefore not how records travel but **whether the address a record
+   answers with is reachable from the asker** — overlay-routed client subnets,
+   site-scoped answers, or an iroh-native service proxy.
+
 ## Hardware options for open WiFi 6 mesh nodes (2026-06-23 survey)
 
 For *additional* open, mesh-capable nodes (the MikroTiks stay AP/STA-only). The
@@ -182,7 +210,8 @@ hardware, which is the portability story for the talk. Full survey + sources in 
   babeld over `br-mesh`, per-node routed /24s, `mjolnir0` overlay, derived-address
   discovery + gossip. (The earlier container/wired-switch milestones this section
   used to track are complete and superseded.)
-- **Next:** the gossip address book (`0yb` — derived-address seeding already landed)
-  and the service-mesh architecture pass (`e21` — broadcast peer/service discovery
-  with CRDT conflict resolution).
+- **Shipped 2026-07-03:** the gossip address book (`0yb` — closed, field-validated
+  on the 4-node fleet; see the section update above).
+- **Next:** the service-mesh architecture pass (`e21` — `.mesh` naming, broadcast
+  peer/service discovery with CRDT conflict resolution).
 - **Radio:** all-802.11s on mt76 hardware; AP/STA retired.

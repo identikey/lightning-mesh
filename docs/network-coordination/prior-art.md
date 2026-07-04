@@ -88,7 +88,14 @@ How mjolnir-mesh compares to existing approaches for mesh DHCP, routing, and ser
 
 **Why we diverge:** mDNS reflectors are operationally fragile — loops, name collisions on reconnect, multicast storms in larger meshes. A gossiped `/services/{name}` directory sidesteps the entire reflector mess and is naturally tied to device lease lifecycle (via `host_mac`), so service cleanup is automatic.
 
-**Cost:** clients still need to query the mesh DNS resolver (not mDNS directly) to find these services. Standard mDNS clients on devices won't see CRDT-only services unless we also forward them as mDNS announcements. (Future work.)
+**The client edge (the part mDNS keeps):** stock devices speak mDNS/DNS-SD natively and won't switch to unicast queries for service browsing, so the node's role on its own /24 is *translator, not repeater*: harvest local mDNS announcements into the CRDT (ingest), answer `.mesh` unicast queries from the local replica, and optionally re-announce remote CRDT entries into the local mDNS domain as a proxy (serve out). Broadcast never crosses a segment; the directory does.
+
+**The translator pattern has precedent** — we recombine two proven pieces rather than inventing one:
+
+- **DNS-SD was designed for unicast.** [RFC 6763](https://www.rfc-editor.org/rfc/rfc6763) defines service discovery over *both* multicast and ordinary unicast DNS, and Apple's Wide-Area Bonjour deployed exactly the "harvest locally, serve by unicast DNS" split two decades ago. The industry kept the multicast half and forgot the unicast half. A `.mesh` responder serving CRDT-backed service records is unicast DNS-SD with a gossiped, ownerless backend where Wide-Area Bonjour assumed a conventional authoritative DNS server.
+- **OpenThread border routers ship the same shape today:** Thread devices register services with an SRP (Service Registration Protocol) server on the border router, which re-announces them to the home LAN through an mDNS *advertising proxy*. Registration in, proxy out, no multicast across the constrained network — the identical translator, with our CRDT standing in for SRP's single registrar (and removing its authority).
+
+The reflector critique above sharpens accordingly: reflectors fail because they extend a *broadcast domain*; the translator works because it replicates a *database* and re-publishes at each edge. The CRDT is the reflector done right.
 
 ### 3.3 IPv4-only
 
@@ -203,3 +210,9 @@ Addressing is the sharpest contrast. LibreMesh derives both a ULA `/64` and an I
 - shared-state-dnsmasq_hosts — https://libremesh.org/packages/shared-state-dnsmasq_hosts.html
 - LibreMesh config / addressing (`lime-example.txt`) — https://github.com/libremesh/lime-packages/blob/master/packages/lime-docs/files/www/docs/lime-example.txt
 - 2025 native-babeld / L3-only work (Freifunk/GSoC final report) — https://blog.freifunk.net/2025/08/25/final-report-simplify-libremesh-and-get-it-closer-to-openwrt/
+
+**Unicast DNS-SD / the translator pattern (§3.2):**
+
+- RFC 6763, DNS-Based Service Discovery — defines DNS-SD over unicast as well as multicast — https://www.rfc-editor.org/rfc/rfc6763
+- Wide-Area Bonjour / DNS-SD over unicast DNS — https://www.dns-sd.org/
+- OpenThread border router: SRP server + mDNS advertising proxy — https://openthread.io/guides/border-router/services

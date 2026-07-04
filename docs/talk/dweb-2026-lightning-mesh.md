@@ -180,8 +180,25 @@ actually the better asset, and it's the sleeper of the whole design:
 Routing is a commodity — Babel is excellent and replaceable. A
 partition-tolerant, identity-keyed, mesh-wide directory is not a commodity. As it
 grows to carry names, services, and membership, it becomes the thing the network
-*is*. (This section of the talk should grow as the address book and service
-layers ship over the next few sprints.)
+*is*.
+
+**Status beat (shipped):** the address book is live and field-validated on the
+4-router fleet — every node learns every peer's self-announced entry over
+gossip, across reboots. The concrete story: one router slept through an entire
+fleet update, came back online, and converged within seconds — nobody
+re-configured anything. Names and services (`.mesh`) ride the same rails next.
+
+**The lineage beat — mDNS isn't the enemy, multicast-only was the mistake:**
+DNS-SD was *designed* for unicast. RFC 6763 defines service discovery over
+ordinary DNS, and Apple's Wide-Area Bonjour deployed the "harvest locally,
+serve over unicast DNS" split two decades ago; the industry kept the multicast
+half and forgot the unicast half. Thread border routers rediscovered the shape
+(devices register with the router, the router re-announces over mDNS). We
+recombine the halves and remove the last server: harvest mDNS at each edge,
+replicate the directory over the CRDT — no authoritative DNS server, no
+registrar — and re-publish at every other edge. The avahi reflector fails
+because it extends a *broadcast domain*; this works because it replicates a
+*database*. The CRDT is the mDNS reflector done right.
 
 ## 8. The network is a projection of a set of keys
 
@@ -320,6 +337,11 @@ Credibility with this audience comes from naming the limits plainly:
 - "No authority means no authority to configure. That's why it's plug-and-play."
 - "Discovery that comes free from the wire evaporates with the wire. Ours is a
   product, not an accident."
+- "mDNS at the edge, CRDT in the middle: translator, not repeater."
+- "The CRDT is the mDNS reflector done right: reflectors extend a broadcast
+  domain; we replicate a database."
+- "Apple designed DNS-SD to work without multicast. The industry forgot. We
+  remembered — and removed the server."
 - "The network is a projection of a set of keys. Everything physical is routing
   detail — as it should be."
 - "We don't need IPv6. We have keys."
