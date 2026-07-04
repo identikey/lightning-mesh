@@ -135,6 +135,26 @@ enum Command {
     /// backhaul addr assigned, is the interface dual-addressed, did babel
     /// install routes and via what next-hop" without grepping logs.
     Status,
+    /// Claim/refresh a `/services/` name via the running daemon's control API
+    /// (bead e21.2.6, FR26). Thin HTTP client of `POST /v0/publish` on
+    /// `127.0.0.1:5380` — requires `mesh` (or another meshd instance) to
+    /// already be running.
+    Publish {
+        /// Service name to claim (e.g. `wiki.mesh`).
+        name: String,
+        /// TCP/UDP port the service listens on.
+        #[arg(long)]
+        port: u16,
+        /// Extra `key=value` TXT record (repeatable), e.g. `--txt path=/wiki`.
+        #[arg(long = "txt", value_parser = parse_txt_kv)]
+        txt: Vec<(String, String)>,
+    },
+    /// Release a `/services/` name this node owns, via the control API (bead
+    /// e21.2.6, FR27). Thin HTTP client of `POST /v0/unpublish`.
+    Unpublish {
+        /// Service name to release.
+        name: String,
+    },
     /// Listen for inbound mesh connections and echo ping datagrams. Runs until Ctrl-C.
     Listen,
     /// Dial a peer (address blob from `id`/`listen`) and measure a round-trip.
@@ -296,6 +316,15 @@ async fn main() -> Result<()> {
         return run_status(cli.secret_file.as_deref()).await;
     }
 
+    // publish/unpublish are thin HTTP clients of the running daemon's control
+    // API (S3.2, bead e21.2.6) — no iroh endpoint, no CRDT access here.
+    if let Command::Publish { name, port, txt } = &cli.command {
+        return run_publish_cli(name, *port, txt).await;
+    }
+    if let Command::Unpublish { name } = &cli.command {
+        return run_unpublish_cli(name).await;
+    }
+
     // The deployed `mesh` daemon defaults to LAN mode (offline, mDNS, no relay),
     // since the same-site mesh has no internet. Opt into internet/relay mode with
     // `--internet` or by passing `--relay`. The lower-level test commands
@@ -408,7 +437,10 @@ async fn main() -> Result<()> {
             )
             .await?
         }
-        Command::TunTest | Command::Status => unreachable!("handled above"),
+        Command::TunTest
+        | Command::Status
+        | Command::Publish { .. }
+        | Command::Unpublish { .. } => unreachable!("handled above"),
     }
     Ok(())
 }
@@ -3555,6 +3587,141 @@ async fn control_api_start<T: GossipTransport + 'static>(
     Ok((bound, handle))
 }
 
+// --- meshd publish/unpublish CLI (S3.2, bead e21.2.6): thin HTTP clients of
+// the control API above. Deliberately dumb — no CRDT access, no daemon
+// bootstrap — so `meshd publish`/`meshd unpublish` work from any shell with
+// the daemon already running, exactly like `curl`ing the API by hand. ---
+
+/// Parse one `--txt key=value` CLI arg into a `(key, value)` pair. Pure and
+/// unit-tested — the request-shape parsing is the cheap, testable slice of an
+/// otherwise thin HTTP client (S3.2, test_tier: yolo).
+fn parse_txt_kv(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(format!("invalid --txt value '{s}': expected key=value")),
+    }
+}
+
+/// Issue one raw HTTP/1.1 request against meshd's own control API at
+/// `127.0.0.1:{CONTROL_API_PORT}` (fixed by design — S3.1's handoff: no
+/// config flag, the CLI hardcodes it) and return `(status, body)`. No
+/// keep-alive on either side, matching the server's `Connection: close`.
+async fn control_api_client_request(
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> std::io::Result<(u16, Vec<u8>)> {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), CONTROL_API_PORT);
+    let mut stream = TcpStream::connect(addr).await?;
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await?;
+    let invalid = |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string());
+    let split_at = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| invalid("control API response had no header/body separator"))?;
+    let head = String::from_utf8_lossy(&resp[..split_at]);
+    let status_line = head.lines().next().ok_or_else(|| invalid("control API response had no status line"))?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| invalid("control API response had no numeric status code"))?;
+    Ok((status, resp[split_at + 4..].to_vec()))
+}
+
+/// Render the CLI-facing message for a connect failure against the control
+/// API. Every wording variant names the fixed address and states plainly that
+/// the daemon may not be running, per the story's exact-rendering ask.
+fn control_api_connection_error_message(e: &std::io::Error) -> String {
+    format!(
+        "meshd control API unreachable at 127.0.0.1:{CONTROL_API_PORT} — is the daemon running? ({e})"
+    )
+}
+
+/// Render a `POST /v0/publish` error response body into the CLI's exact
+/// wording (FR16/FR34): `reserved` must read "reserved and unclaimable";
+/// `owned_by_other` must name the winner node id. Pure and unit-tested.
+fn control_api_publish_error_message(name: &str, status: u16, body: &[u8]) -> String {
+    let err: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    match err.get("error").and_then(|v| v.as_str()) {
+        Some("reserved") => format!("cannot publish '{name}': name is reserved and unclaimable"),
+        Some("owned_by_other") => {
+            let winner = err.get("winner_node_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+            format!("cannot publish '{name}': already owned by node {winner}")
+        }
+        Some("malformed_body") => format!("cannot publish '{name}': malformed request"),
+        Some(kind) => format!("cannot publish '{name}': control API returned {status} ({kind})"),
+        None => format!("cannot publish '{name}': control API returned {status}"),
+    }
+}
+
+/// Render a `POST /v0/unpublish` error response body into the CLI's exact
+/// wording. Pure and unit-tested.
+fn control_api_unpublish_error_message(name: &str, status: u16, body: &[u8]) -> String {
+    let err: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    match err.get("error").and_then(|v| v.as_str()) {
+        Some("not_owner") => format!("cannot unpublish '{name}': not owned by this node"),
+        Some("malformed_body") => format!("cannot unpublish '{name}': malformed request"),
+        Some(kind) => format!("cannot unpublish '{name}': control API returned {status} ({kind})"),
+        None => format!("cannot unpublish '{name}': control API returned {status}"),
+    }
+}
+
+/// `meshd publish <name> --port N [--txt k=v ...]`: thin HTTP client of
+/// `POST /v0/publish` (FR26). Prints the published entry plainly on success;
+/// on any failure, renders the exact error wording to stderr and exits
+/// nonzero — never touches CRDT state directly.
+async fn run_publish_cli(name: &str, port: u16, txt: &[(String, String)]) -> Result<()> {
+    let txt_map: BTreeMap<String, String> = txt.iter().cloned().collect();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "name": name,
+        "port": port,
+        "txt": txt_map,
+    }))?;
+    match control_api_client_request("POST", "/v0/publish", &body).await {
+        Ok((200, resp_body)) => {
+            let entry: serde_json::Value = serde_json::from_slice(&resp_body).unwrap_or_default();
+            println!(
+                "published {name}  ip={} port={}",
+                entry.get("ip").and_then(|v| v.as_str()).unwrap_or("?"),
+                entry.get("port").and_then(|v| v.as_u64()).unwrap_or(u64::from(port)),
+            );
+            Ok(())
+        }
+        Ok((status, resp_body)) => {
+            anyhow::bail!(control_api_publish_error_message(name, status, &resp_body))
+        }
+        Err(e) => anyhow::bail!(control_api_connection_error_message(&e)),
+    }
+}
+
+/// `meshd unpublish <name>`: thin HTTP client of `POST /v0/unpublish` (FR27).
+/// Prints the resulting status plainly on success; on any failure, renders
+/// the exact error wording to stderr and exits nonzero.
+async fn run_unpublish_cli(name: &str) -> Result<()> {
+    let body = serde_json::to_vec(&serde_json::json!({ "name": name }))?;
+    match control_api_client_request("POST", "/v0/unpublish", &body).await {
+        Ok((200, resp_body)) => {
+            let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap_or_default();
+            let status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+            println!("unpublished {name}: {status}");
+            Ok(())
+        }
+        Ok((status, resp_body)) => {
+            anyhow::bail!(control_api_unpublish_error_message(name, status, &resp_body))
+        }
+        Err(e) => anyhow::bail!(control_api_connection_error_message(&e)),
+    }
+}
+
 /// Assign this node's claimed /24 gateway address (`<net>.1/prefix`) to the local
 /// client interface, giving babeld a concrete *connected* route to redistribute and
 /// letting inbound mesh traffic for the /24 be delivered on-link. Replaces the old
@@ -5339,6 +5506,48 @@ mod tests {
             .iter()
             .map(|c| (c.cidr.to_string(), c.clone()))
             .collect()
+    }
+
+    #[test]
+    fn parse_txt_kv_splits_on_first_equals() {
+        assert_eq!(parse_txt_kv("path=/wiki"), Ok(("path".to_string(), "/wiki".to_string())));
+        // Only the first `=` is a separator — the value may itself contain one.
+        assert_eq!(parse_txt_kv("k=a=b"), Ok(("k".to_string(), "a=b".to_string())));
+    }
+
+    #[test]
+    fn parse_txt_kv_rejects_missing_equals_or_empty_key() {
+        assert!(parse_txt_kv("noequals").is_err());
+        assert!(parse_txt_kv("=value").is_err());
+    }
+
+    #[test]
+    fn publish_error_message_renders_reserved_and_unclaimable() {
+        let body = control_api_error_body("reserved");
+        let msg = control_api_publish_error_message("hello.mesh", 400, &body);
+        assert!(msg.contains("reserved and unclaimable"), "got: {msg}");
+    }
+
+    #[test]
+    fn publish_error_message_names_the_winner_node_id() {
+        let body = control_api_owned_by_other_body("winner-node-id");
+        let msg = control_api_publish_error_message("wiki.mesh", 409, &body);
+        assert!(msg.contains("winner-node-id"), "got: {msg}");
+    }
+
+    #[test]
+    fn unpublish_error_message_reports_not_owner() {
+        let body = control_api_error_body("not_owner");
+        let msg = control_api_unpublish_error_message("wiki.mesh", 409, &body);
+        assert!(msg.contains("not owned by this node"), "got: {msg}");
+    }
+
+    #[test]
+    fn connection_error_message_names_daemon_and_address() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let msg = control_api_connection_error_message(&e);
+        assert!(msg.contains("127.0.0.1:5380"), "got: {msg}");
+        assert!(msg.contains("daemon running"), "got: {msg}");
     }
 
     #[test]
