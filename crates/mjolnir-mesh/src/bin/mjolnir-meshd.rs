@@ -3928,21 +3928,35 @@ const DOH_CANARY_SERVER_LINE: &str = "/use-application-dns.net/";
 /// RFC 8910 DHCP option 114 (`default-url`): points clients at the
 /// hello.mesh front desk (bc7) without any manual URL entry (FR12).
 const DHCP_OPTION_114: &str = "114,http://hello.mesh";
+/// dnsmasq rebind-protection whitelist for the `.mesh` zone. OpenWrt ships
+/// `stop-dns-rebind` on by default, which DROPS any upstream answer carrying
+/// an RFC1918 address — and every `.mesh` answer is an RFC1918 address, so
+/// without this whitelist dnsmasq forwards the query to the responder, gets
+/// the right answer, and silently discards it ("possible DNS-rebind attack
+/// detected"). Found live on the 2026-07-04 fleet rollout (e21.8).
+const MESH_REBIND_DOMAIN: &str = "/mesh/";
 
 /// True when dnsmasq's config already carries the `.mesh` forward line, the
-/// DoH canary NXDOMAIN, and DHCP option 114 — the idempotence check for
-/// [`reconcile_dnsmasq_uci`]. Pure so it's unit-tested below. Both arguments
+/// DoH canary NXDOMAIN, DHCP option 114, and the `.mesh` rebind-protection
+/// whitelist — the idempotence check for [`reconcile_dnsmasq_uci`]. Pure so
+/// it's unit-tested below. All arguments
 /// are `uci get` output for list-typed options: space-joined entries (same
 /// shape as `lan_uci_is_current`'s `ipaddr`), independent of how many other,
 /// unrelated entries (upstream DNS servers, other DHCP options) are present —
 /// this only checks that ours are among them, never that they're the only
 /// ones.
-fn dnsmasq_uci_is_current(current_server_list: &str, current_dhcp_options: &str) -> bool {
+fn dnsmasq_uci_is_current(
+    current_server_list: &str,
+    current_dhcp_options: &str,
+    current_rebind_domains: &str,
+) -> bool {
     let servers: Vec<&str> = current_server_list.split_whitespace().collect();
     let options: Vec<&str> = current_dhcp_options.split_whitespace().collect();
+    let rebinds: Vec<&str> = current_rebind_domains.split_whitespace().collect();
     servers.contains(&MESH_DNS_SERVER_LINE)
         && servers.contains(&DOH_CANARY_SERVER_LINE)
         && options.contains(&DHCP_OPTION_114)
+        && rebinds.contains(&MESH_REBIND_DOMAIN)
 }
 
 /// Wire dnsmasq to forward `.mesh` to the local responder, refuse client-side
@@ -3991,12 +4005,25 @@ async fn reconcile_dnsmasq_uci() {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    if dnsmasq_uci_is_current(&current_server_list, &current_dhcp_options) {
+    let current_rebind_domains = Command::new("uci")
+        .args(["-q", "get", "dhcp.@dnsmasq[0].rebind_domain"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if dnsmasq_uci_is_current(
+        &current_server_list,
+        &current_dhcp_options,
+        &current_rebind_domains,
+    ) {
         return;
     }
-    info!("reconciling dnsmasq UCI: .mesh forward, DoH canary, option 114 (FR9-FR14)");
+    info!("reconciling dnsmasq UCI: .mesh forward, DoH canary, option 114, rebind whitelist (FR9-FR14)");
     let servers: Vec<&str> = current_server_list.split_whitespace().collect();
     let options: Vec<&str> = current_dhcp_options.split_whitespace().collect();
+    let rebinds: Vec<&str> = current_rebind_domains.split_whitespace().collect();
     let mut script = String::new();
     if !servers.contains(&MESH_DNS_SERVER_LINE) {
         script.push_str(&format!(
@@ -4013,13 +4040,18 @@ async fn reconcile_dnsmasq_uci() {
             "uci add_list dhcp.lan.dhcp_option='{DHCP_OPTION_114}'; "
         ));
     }
+    if !rebinds.contains(&MESH_REBIND_DOMAIN) {
+        script.push_str(&format!(
+            "uci add_list dhcp.@dnsmasq[0].rebind_domain='{MESH_REBIND_DOMAIN}'; "
+        ));
+    }
     script.push_str("uci commit dhcp && /etc/init.d/dnsmasq restart");
     // Same lesson as babeld_service/reconcile_client_uci: a procd call can
     // wedge — never let one stall the daemon's startup path.
     let run = Command::new("sh").args(["-c", &script]).output();
     match tokio::time::timeout(Duration::from_secs(30), run).await {
         Ok(Ok(out)) if out.status.success() => {
-            info!("dnsmasq UCI reconciled — .mesh forward + DoH canary + option 114 live")
+            info!("dnsmasq UCI reconciled — .mesh forward + DoH canary + option 114 + rebind whitelist live")
         }
         Ok(Ok(out)) => warn!(
             "dnsmasq UCI reconcile failed: {}",
@@ -5951,21 +5983,36 @@ config meshd 'meshd'
 
     #[test]
     fn stock_dnsmasq_config_needs_reconcile() {
-        // Fresh-from-flash: no server list, no option 114 at all.
-        assert!(!dnsmasq_uci_is_current("", ""));
+        // Fresh-from-flash: no server list, no option 114, no rebind whitelist.
+        assert!(!dnsmasq_uci_is_current("", "", ""));
     }
 
     #[test]
     fn partial_dnsmasq_config_needs_reconcile() {
         // Only the .mesh forward present — DoH canary and option 114 missing.
-        assert!(!dnsmasq_uci_is_current("/mesh/127.0.0.1#5335", ""));
+        assert!(!dnsmasq_uci_is_current("/mesh/127.0.0.1#5335", "", ""));
         // .mesh forward + DoH canary present, option 114 missing.
         assert!(!dnsmasq_uci_is_current(
             "/mesh/127.0.0.1#5335 /use-application-dns.net/",
+            "",
             ""
         ));
         // Only option 114 present, DNS lines missing.
-        assert!(!dnsmasq_uci_is_current("", "114,http://hello.mesh"));
+        assert!(!dnsmasq_uci_is_current("", "114,http://hello.mesh", ""));
+    }
+
+    #[test]
+    fn dns_lines_and_option_present_but_rebind_whitelist_missing_needs_reconcile() {
+        // The exact regression found on the 2026-07-04 fleet rollout: the
+        // forward line, DoH canary, and option 114 were all applied, but
+        // OpenWrt's default stop-dns-rebind silently dropped every .mesh
+        // answer (RFC1918) until `/mesh/` was whitelisted. Without the rebind
+        // arg this config would have wrongly read as "current".
+        assert!(!dnsmasq_uci_is_current(
+            "/mesh/127.0.0.1#5335 /use-application-dns.net/",
+            "114,http://hello.mesh",
+            ""
+        ));
     }
 
     #[test]
@@ -5974,7 +6021,8 @@ config meshd 'meshd'
         // configured, but none of ours yet, still reconciles.
         assert!(!dnsmasq_uci_is_current(
             "8.8.8.8 /corp.example/10.1.1.1",
-            "6,10.0.0.53"
+            "6,10.0.0.53",
+            ""
         ));
     }
 
@@ -5982,7 +6030,8 @@ config meshd 'meshd'
     fn reconciled_dnsmasq_config_is_idempotent() {
         assert!(dnsmasq_uci_is_current(
             "/mesh/127.0.0.1#5335 /use-application-dns.net/",
-            "114,http://hello.mesh"
+            "114,http://hello.mesh",
+            "/mesh/"
         ));
     }
 
@@ -5991,7 +6040,8 @@ config meshd 'meshd'
         // Ours plus pre-existing unrelated entries, any order — still current.
         assert!(dnsmasq_uci_is_current(
             "8.8.8.8 /use-application-dns.net/ /corp.example/10.1.1.1 /mesh/127.0.0.1#5335",
-            "6,10.0.0.53 114,http://hello.mesh"
+            "6,10.0.0.53 114,http://hello.mesh",
+            "/other.lan/ /mesh/"
         ));
     }
 
@@ -6002,7 +6052,8 @@ config meshd 'meshd'
         // or count, matching `uci add_list`'s own dedup-on-repeat behavior).
         assert!(dnsmasq_uci_is_current(
             "/mesh/127.0.0.1#5335 /mesh/127.0.0.1#5335 /use-application-dns.net/",
-            "114,http://hello.mesh 114,http://hello.mesh"
+            "114,http://hello.mesh 114,http://hello.mesh",
+            "/mesh/ /mesh/"
         ));
     }
 
