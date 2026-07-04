@@ -18,26 +18,40 @@ use tiny_http::{Header, Response, Server};
 use tracing::info;
 
 use config::Config;
-use routes::route;
+use routes::{new_challenge_store, route};
 
 fn main() {
     tracing_subscriber::fmt::init();
     let config = Config::parse();
 
-    // Referenced by the S3/S4 handlers landing in mjolnir-mesh-11l / 5zn;
-    // unused in this scaffold story beyond validating the flags parse.
+    // Referenced by the S3 handlers landing in mjolnir-mesh-11l; unused in
+    // this scaffold story beyond validating the flags parse.
     let _ = &config.directory_file;
-    let _ = &config.spool_dir;
+
+    let challenges = new_challenge_store();
 
     let server = Server::http(&config.bind).unwrap_or_else(|err| {
         panic!("failed to bind {}: {err}", config.bind);
     });
     info!(bind = %config.bind, "mjolnir-hello listening");
 
-    for request in server.incoming_requests() {
+    for mut request in server.incoming_requests() {
         let method = request.method().as_str().to_string();
         let url = request.url().to_string();
-        let resp = route(&method, &url, config.static_root.as_deref());
+
+        let mut body = Vec::new();
+        if let Err(err) = request.as_reader().read_to_end(&mut body) {
+            tracing::warn!(%err, "failed to read request body");
+        }
+
+        let resp = route(
+            &method,
+            &url,
+            config.static_root.as_deref(),
+            &body,
+            &challenges,
+            &config.spool_dir,
+        );
 
         let content_type = Header::from_bytes(
             &b"Content-Type"[..],

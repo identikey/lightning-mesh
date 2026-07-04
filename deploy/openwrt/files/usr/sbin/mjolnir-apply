@@ -255,8 +255,26 @@ if [ -f "$STAGE/mjolnir-meshd" ] && ! cmp -s "$STAGE/mjolnir-meshd" /usr/bin/mjo
 	BINARY_CHANGED=1
 fi
 
+# 4.5 mjolnir-hello binary — OPTIONAL front desk (mjolnir-mesh-eei). Only
+#     staged when a local cross-build exists (install-node.sh); its absence,
+#     or a failed install, is never fatal to the mesh apply.
+HELLO_CHANGED=0
+if [ -f "$STAGE/mjolnir-hello" ]; then
+	if ! cmp -s "$STAGE/mjolnir-hello" /usr/bin/mjolnir-hello 2>/dev/null; then
+		log "installing new mjolnir-hello binary"
+		if cp "$STAGE/mjolnir-hello" /usr/bin/mjolnir-hello.new \
+			&& chmod +x /usr/bin/mjolnir-hello.new \
+			&& mv /usr/bin/mjolnir-hello.new /usr/bin/mjolnir-hello; then
+			HELLO_CHANGED=1
+		else
+			NOTES="$NOTES; WARNING: mjolnir-hello binary install failed — front desk left as-is"
+			log "WARN: mjolnir-hello binary install failed"
+		fi
+	fi
+fi
+
 # 5. init scripts + helpers (and this applier itself, for future OTA runs).
-for f in mjolnir-meshd mjolnir-babeld; do
+for f in mjolnir-meshd mjolnir-babeld mjolnir-hello; do
 	if [ -f "$STAGE/init.d-$f" ]; then
 		cp "$STAGE/init.d-$f" "/etc/init.d/$f" && chmod +x "/etc/init.d/$f" || rollback "installing /etc/init.d/$f failed"
 	fi
@@ -292,6 +310,18 @@ mkdir -p /etc/mjolnir
 /etc/init.d/babeld disable 2>/dev/null; /etc/init.d/babeld stop 2>/dev/null
 /etc/init.d/mjolnir-babeld enable 2>/dev/null
 /etc/init.d/mjolnir-meshd enable 2>/dev/null
+
+# 7.5 mjolnir-hello (OPTIONAL front desk, mjolnir-mesh-eei): the apply NEVER
+#     unilaterally turns it on — only 'option enabled 1' in the 'hello'
+#     section of /etc/config/mjolnir does. Mirrors this m8t-style split so a
+#     node stays mesh-only unless the operator opts in.
+HELLO_ENABLED=0
+[ "$(uci -q get mjolnir.hello.enabled 2>/dev/null)" = "1" ] && HELLO_ENABLED=1
+if [ "$HELLO_ENABLED" = 1 ] && [ -x /usr/bin/mjolnir-hello ]; then
+	/etc/init.d/mjolnir-hello enable 2>/dev/null
+else
+	/etc/init.d/mjolnir-hello disable 2>/dev/null
+fi
 
 # 8. optional radio (re)configuration — the other wifi-bouncing step.
 if [ "$RUN_WIRELESS" = 1 ]; then
@@ -340,6 +370,18 @@ if [ "$MESHD_WAS_RUNNING" = 1 ] && { [ "$BINARY_CHANGED" = 1 ] || [ "$WIFI_TOUCH
 	sleep 3
 fi
 
+# 9.5 mjolnir-hello: (re)start on a new binary, or first start after being
+#     newly enabled. Independent lifecycle from meshd — its absence/failure
+#     never gates the mesh health check below.
+HELLO_WAS_RUNNING=0
+/etc/init.d/mjolnir-hello running 2>/dev/null && HELLO_WAS_RUNNING=1
+if [ "$HELLO_ENABLED" = 1 ] && [ -x /usr/bin/mjolnir-hello ] \
+	&& { [ "$HELLO_CHANGED" = 1 ] || [ "$HELLO_WAS_RUNNING" = 0 ]; }; then
+	log "restarting mjolnir-hello (front desk)"
+	/etc/init.d/mjolnir-hello restart
+	sleep 2
+fi
+
 # ============================ HEALTH GATE =====================================
 NEED_GATE=0
 [ "$WIFI_TOUCHED" = 1 ] && NEED_GATE=1
@@ -366,6 +408,36 @@ if [ "$NEED_GATE" = 1 ] && [ "$HAVE_BASELINE" = 1 ]; then
 	log "health gate passed"
 else
 	log "health gate skipped (need_gate=$NEED_GATE baseline=$HAVE_BASELINE — fresh/bench node or nothing disruptive applied)"
+fi
+
+# ---- mjolnir-hello reachability probe (non-fatal — optional service) --------
+# AC (mjolnir-mesh-eei): hello reachable at http://<node-lan-ip>/ when enabled.
+# Never rolls back the mesh apply — a front-desk hiccup isn't a mesh outage.
+if [ "$HELLO_ENABLED" = 1 ] && [ -x /usr/bin/mjolnir-hello ]; then
+	HELLO_PORT=$(uci -q get mjolnir.hello.port 2>/dev/null); HELLO_PORT="${HELLO_PORT:-80}"
+	HELLO_IFACE=$(uci -q get mjolnir.hello.lan_iface 2>/dev/null); HELLO_IFACE="${HELLO_IFACE:-lan}"
+	. /lib/functions/network.sh
+	network_flush_cache
+	HELLO_IP=""
+	network_get_ipaddr HELLO_IP "$HELLO_IFACE"
+	if [ -n "$HELLO_IP" ]; then
+		HELLO_HEALTHY=0
+		i=0
+		while [ "$i" -lt 6 ]; do
+			wget -q -T 2 -O /dev/null "http://$HELLO_IP:$HELLO_PORT/api/health" 2>/dev/null && { HELLO_HEALTHY=1; break; }
+			sleep 2
+			i=$((i + 1))
+		done
+		if [ "$HELLO_HEALTHY" = 1 ]; then
+			log "mjolnir-hello health check passed (http://$HELLO_IP:$HELLO_PORT/api/health)"
+		else
+			NOTES="$NOTES; WARNING: mjolnir-hello did not answer /api/health at $HELLO_IP:$HELLO_PORT — see 'logread -e mjolnir-hello'"
+			log "WARN: mjolnir-hello health check failed"
+		fi
+	else
+		NOTES="$NOTES; WARNING: mjolnir-hello enabled but no IP yet on lan_iface=$HELLO_IFACE"
+		log "WARN: mjolnir-hello enabled but lan_iface=$HELLO_IFACE has no IP"
+	fi
 fi
 
 write_result "OK: applied (wifi_touched=$WIFI_TOUCHED wpad_swapped=$WPAD_SWAPPED binary_changed=$BINARY_CHANGED wireless_run=$RUN_WIRELESS)$NOTES"

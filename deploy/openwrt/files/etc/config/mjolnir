@@ -44,3 +44,22 @@ config meshd 'meshd'
 	#   mjolnir-meshd id --secret-file /etc/mjolnir/secret
 	# list peer '<node-id-of-another-router>'
 	# list peer '<node-id-of-another-router>'
+
+# mjolnir-hello: hello.mesh front desk (static frontend + read-only mesh API).
+# OPTIONAL — the mesh runs fine without it (S7, bead mjolnir-mesh-eei). Reload
+# after edits:  service mjolnir-hello restart
+config hello 'hello'
+	option enabled '0'
+
+	# Logical netifd interface (see /etc/config/network) whose IP the init
+	# script binds to — the node's LAN gateway address, independent of .mesh
+	# resolution (a separate track, mjolnir-mesh-e21). 'lan' is OpenWrt's
+	# default logical name for br-lan.
+	option lan_iface 'lan'
+	option port '80'
+
+	# Daemon seams shared with mjolnir-meshd: it writes directory_file and
+	# drains spool_dir (docs/network-coordination/hello-mesh-service.md §1/§3).
+	# Keep these identical to meshd's own paths.
+	option directory_file '/var/run/mjolnir/directory.json'
+	option spool_dir '/var/run/mjolnir/pending'

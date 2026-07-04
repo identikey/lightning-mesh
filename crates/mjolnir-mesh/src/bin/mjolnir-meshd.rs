@@ -38,9 +38,9 @@ use mjolnir_mesh::babel::{
     OverlayRtt,
 };
 use mjolnir_mesh::{
-    alloc, merge_peer_addr, merge_subnet_claim, merge_user, AddrBook, GossipError, GossipSync,
-    GossipTransport, MergeResult, PeerAddrEntry, PeerEntry, PeerRoster, SubnetClaim, UserBook,
-    UserEntry, HLC,
+    alloc, merge_peer_addr, merge_service, merge_subnet_claim, merge_user, AddrBook, GossipError,
+    GossipSync, GossipTransport, MergeResult, PeerAddrEntry, PeerEntry, PeerRoster, ServiceBook,
+    ServiceEntry, SubnetClaim, UserBook, UserEntry, HLC,
 };
 use mjolnir_mesh::GossipMessage;
 use tracing::{error, info, warn};
@@ -716,6 +716,21 @@ async fn run_mesh(
     }
     let user_book: Arc<Mutex<UserBook>> = Arc::new(Mutex::new(restored_users));
 
+    // Service directory (mjolnir-mesh-7jb): service name → service record, the
+    // focused e21 slice the hello.mesh directory needs. Same persistence pattern
+    // as the user directory — a sibling `services.state`, tolerant load,
+    // tmp+rename write. There is no seed file: services are learned over gossip
+    // (and, later, originated by the node's mDNS bridge), not injected as text,
+    // so the book is empty by default and nodes only relay/persist what they
+    // receive. Anti-entropy re-broadcasts the full book each tick so a late
+    // joiner or a node that missed a packet still converges.
+    let service_book_file = service_book_path(&claims_file);
+    let restored_services = load_service_book(&service_book_file);
+    if !restored_services.is_empty() {
+        info!(count = restored_services.len(), path = %service_book_file.display(), "restored service directory from disk");
+    }
+    let service_book: Arc<Mutex<ServiceBook>> = Arc::new(Mutex::new(restored_services));
+
     // CRDT gossip overlay (mjolnir-mesh-k8c): all mesh nodes join one fixed
     // topic and exchange CRDT updates best-effort, as a second protocol on the
     // same endpoint alongside the TUN data plane.
@@ -844,6 +859,8 @@ async fn run_mesh(
                 let lookup = addr_lookup.clone();
                 let user_book = user_book.clone();
                 let user_book_path = user_book_file.clone();
+                let service_book = service_book.clone();
+                let service_book_path = service_book_file.clone();
                 tokio::spawn(async move {
                     let result = sync
                         .run(move |msg| {
@@ -887,6 +904,25 @@ async fn run_mesh(
                                     persist_user_book(&snapshot, &user_book_path);
                                     info!(user = %entry.username, display = %entry.display_name,
                                         by = %entry.registered_by, "gossip: received user record");
+                                }
+                                return;
+                            }
+                            // Service directory (7jb): learn a service record from
+                            // a peer, persist it, and log for field validation.
+                            // Early return so it never takes the claim-store lock
+                            // below. LWW/duplicate drops happen in
+                            // apply_service_message.
+                            if matches!(msg, GossipMessage::ServiceUpdate { .. }) {
+                                let learned = {
+                                    let mut s = service_book.lock().expect("service directory poisoned");
+                                    apply_service_message(&mut s, &msg)
+                                };
+                                if let Some((name, entry)) = learned {
+                                    let snapshot =
+                                        service_book.lock().expect("service directory poisoned").clone();
+                                    persist_service_book(&snapshot, &service_book_path);
+                                    info!(service = %name, host = %entry.hostname,
+                                        ip = %entry.ip, port = entry.port, "gossip: received service record");
                                 }
                                 return;
                             }
@@ -957,6 +993,8 @@ async fn run_mesh(
                 let users = user_book.clone();
                 let users_path = user_book_file.clone();
                 let users_seed = user_seed_file.clone();
+                let services = service_book.clone();
+                let services_path = service_book_file.clone();
                 let announce = SelfAnnounce {
                     endpoint: endpoint.clone(),
                     self_id: self_id_str.clone(),
@@ -965,7 +1003,8 @@ async fn run_mesh(
                 };
                 tokio::spawn(async move {
                     anti_entropy_loop(
-                        sync, store, path, book, book_path, users, users_path, users_seed, announce,
+                        sync, store, path, book, book_path, users, users_path, users_seed,
+                        services, services_path, announce,
                     )
                     .await
                 })
@@ -1730,6 +1769,81 @@ fn persist_user_book(snapshot: &UserBook, path: &Path) {
     }
 }
 
+/// The service-directory state file path (7jb): a sibling of the claims file
+/// (default `/etc/mjolnir/services.state`). Derived, not a new CLI flag, so the
+/// fleet picks it up with no config change. Mirrors [`user_book_path`].
+fn service_book_path(claims_file: &Path) -> PathBuf {
+    claims_file.with_file_name("services.state")
+}
+
+/// Load the persisted service directory from `path`. Empty (not an error) if the
+/// file is absent (first boot) or fails to decode — the book is best-effort and
+/// relearns over gossip. Mirrors [`load_user_book`].
+fn load_service_book(path: &Path) -> ServiceBook {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ServiceBook::new(),
+        Err(e) => {
+            warn!(path = %path.display(), "failed to read persisted service directory: {e}");
+            return ServiceBook::new();
+        }
+    };
+    match postcard::from_bytes(&bytes) {
+        Ok(book) => book,
+        Err(e) => {
+            warn!(path = %path.display(), "failed to decode persisted service directory: {e}");
+            ServiceBook::new()
+        }
+    }
+}
+
+/// Persist a service-directory snapshot via tmp+rename (crash-safe). Best effort:
+/// failures are logged, not fatal. Mirrors [`persist_user_book`].
+fn persist_service_book(snapshot: &ServiceBook, path: &Path) {
+    let bytes = match postcard::to_allocvec(snapshot) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to encode service directory for persistence: {e}");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        warn!(path = %parent.display(), "failed to create service directory dir: {e}");
+        return;
+    }
+    let tmp_path = path.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+        warn!(path = %tmp_path.display(), "failed to write service directory tmp file: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        warn!(path = %path.display(), "failed to rename service directory tmp file into place: {e}");
+    }
+}
+
+/// Apply an inbound service CRDT message to the directory. Returns the
+/// `(name, entry)` newly inserted or updated (so the caller can persist and
+/// log), or `None` for another CRDT type or an LWW-stale/duplicate update. Pure
+/// over the map (no I/O) so it's unit-tested below — mirrors [`apply_user_message`].
+fn apply_service_message(
+    book: &mut ServiceBook,
+    msg: &GossipMessage,
+) -> Option<(String, ServiceEntry)> {
+    let GossipMessage::ServiceUpdate { name, entry } = msg else {
+        return None;
+    };
+    match merge_service(book.get(name), entry) {
+        MergeResult::Inserted | MergeResult::Updated => {
+            book.insert(name.clone(), entry.clone());
+            Some((name.clone(), entry.clone()))
+        }
+        // merge_service is pure LWW — never Conflict.
+        MergeResult::Unchanged | MergeResult::Conflict { .. } => None,
+    }
+}
+
 /// Parse the seed file into user records this node originates. Each non-empty,
 /// non-`#` line is `username:Display Name` (display defaults to username if the
 /// colon is omitted). Every record is stamped with a fresh HLC and
@@ -1855,6 +1969,8 @@ async fn anti_entropy_loop<T: GossipTransport>(
     user_book: Arc<Mutex<UserBook>>,
     user_book_file: PathBuf,
     user_seed_file: PathBuf,
+    service_book: Arc<Mutex<ServiceBook>>,
+    service_book_file: PathBuf,
     self_announce: SelfAnnounce,
 ) {
     // Self-announce our address once up front (0yb): unlike the claim map, whose
@@ -1871,6 +1987,8 @@ async fn anti_entropy_loop<T: GossipTransport>(
         &self_announce.self_id,
     )
     .await;
+    // Likewise re-broadcast the service directory up front (7jb).
+    announce_service_book(&sync, &service_book, &service_book_file).await;
     let mut ticker = tokio::time::interval(ANTI_ENTROPY_INTERVAL);
     ticker.tick().await; // first tick fires immediately; the warmup claim publish already covered this
     loop {
@@ -1902,6 +2020,8 @@ async fn anti_entropy_loop<T: GossipTransport>(
             &self_announce.self_id,
         )
         .await;
+        // Re-broadcast the full service directory on the same cadence (7jb).
+        announce_service_book(&sync, &service_book, &service_book_file).await;
     }
 }
 
@@ -2010,6 +2130,33 @@ async fn announce_user_book<T: GossipTransport>(
     }
     info!(count = snapshot.len(), "user anti-entropy: re-broadcast full user directory");
     persist_user_book(&snapshot, user_book_file);
+}
+
+/// Re-broadcast the FULL service directory and rewrite the on-disk book (7jb).
+/// Full-map anti-entropy so a late joiner or a node that missed a packet still
+/// converges without a pull protocol. Unlike the user directory there is no seed
+/// to re-stamp — services are learned over gossip (or originated elsewhere) — so
+/// this simply clones the current book and re-publishes it. The lock is only held
+/// to clone the snapshot, never across an `.await`.
+async fn announce_service_book<T: GossipTransport>(
+    sync: &GossipSync<T>,
+    service_book: &Arc<Mutex<ServiceBook>>,
+    service_book_file: &Path,
+) {
+    let snapshot = service_book.lock().expect("service directory poisoned").clone();
+    for (name, entry) in &snapshot {
+        if let Err(e) = sync
+            .publish(GossipMessage::ServiceUpdate {
+                name: name.clone(),
+                entry: entry.clone(),
+            })
+            .await
+        {
+            warn!(%name, "service anti-entropy: re-broadcast failed: {e}");
+        }
+    }
+    info!(count = snapshot.len(), "service anti-entropy: re-broadcast full service directory");
+    persist_service_book(&snapshot, service_book_file);
 }
 
 /// Assign this node's claimed /24 gateway address (`<net>.1/prefix`) to the local
@@ -4142,5 +4289,90 @@ config meshd 'meshd'
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded["peer-a"].announced_at.wall_clock, 100);
         assert_eq!(loaded["peer-b"].direct_addrs[0].to_string(), "10.254.2.2:49737");
+    }
+
+    // --- service directory (7jb) ---
+
+    fn svc_entry(hostname: &str, port: u16, wall_clock: u64, node_id: &str) -> ServiceEntry {
+        use std::net::{IpAddr, Ipv4Addr};
+        ServiceEntry {
+            hostname: hostname.to_string(),
+            ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+            port,
+            protocol: "_ipp._tcp".to_string(),
+            txt: std::collections::BTreeMap::new(),
+            host_mac: [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+            updated_at: HLC {
+                wall_clock,
+                counter: 0,
+                node_id: node_id.to_string(),
+            },
+        }
+    }
+
+    fn svc_msg(name: &str, entry: ServiceEntry) -> GossipMessage {
+        GossipMessage::ServiceUpdate {
+            name: name.to_string(),
+            entry,
+        }
+    }
+
+    #[test]
+    fn apply_service_inserts_new_and_returns_it() {
+        let mut book = ServiceBook::new();
+        let msg = svc_msg("printer._ipp._tcp", svc_entry("printer", 631, 100, "node-a"));
+        let learned = apply_service_message(&mut book, &msg);
+        assert!(learned.is_some());
+        assert_eq!(learned.unwrap().0, "printer._ipp._tcp");
+        assert_eq!(book.len(), 1);
+    }
+
+    #[test]
+    fn apply_service_updates_on_newer_and_ignores_stale() {
+        let mut book = ServiceBook::new();
+        let older = svc_msg("printer._ipp._tcp", svc_entry("printer", 631, 100, "node-a"));
+        let newer = svc_msg("printer._ipp._tcp", svc_entry("printer", 9100, 200, "node-a"));
+        assert!(apply_service_message(&mut book, &older).is_some());
+        assert!(apply_service_message(&mut book, &newer).is_some());
+        assert_eq!(book["printer._ipp._tcp"].port, 9100);
+        // Re-delivering the older message must not roll the record back.
+        assert!(apply_service_message(&mut book, &older).is_none());
+        assert_eq!(book["printer._ipp._tcp"].port, 9100);
+    }
+
+    #[test]
+    fn apply_service_ignores_non_service_messages() {
+        let mut book = ServiceBook::new();
+        let msg = GossipMessage::LeaseRelease {
+            mac: [0; 6],
+            hlc: HLC { wall_clock: 1, counter: 0, node_id: "x".to_string() },
+        };
+        assert!(apply_service_message(&mut book, &msg).is_none());
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn load_service_book_missing_or_corrupt_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_service_book(&dir.path().join("nope.state")).is_empty());
+        let path = dir.path().join("services.state");
+        std::fs::write(&path, b"not a valid postcard payload").unwrap();
+        assert!(load_service_book(&path).is_empty());
+    }
+
+    #[test]
+    fn persist_then_load_service_book_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("services.state");
+        let mut book = ServiceBook::new();
+        book.insert("printer._ipp._tcp".to_string(), svc_entry("printer", 631, 100, "node-a"));
+        book.insert("nas._smb._tcp".to_string(), svc_entry("nas", 445, 200, "node-b"));
+
+        persist_service_book(&book, &path);
+        assert!(path.exists(), "parent dir is created and file written");
+        let loaded = load_service_book(&path);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded["printer._ipp._tcp"].port, 631);
+        assert_eq!(loaded["nas._smb._tcp"].updated_at.wall_clock, 200);
     }
 }

@@ -1,4 +1,5 @@
 use crate::crdt::peer_addr::PeerAddrEntry;
+use crate::crdt::service::ServiceEntry;
 use crate::crdt::subnet::SubnetClaim;
 use crate::crdt::users::UserEntry;
 use std::cmp::Ordering;
@@ -104,6 +105,30 @@ pub fn merge_peer_addr(
 /// Note: this function does not enforce that the map key matches
 /// `incoming.username` — the caller must look up local by `username` first.
 pub fn merge_user(local: Option<&UserEntry>, incoming: &UserEntry) -> MergeResult<UserEntry> {
+    match local {
+        None => MergeResult::Inserted,
+        Some(existing) => match incoming.updated_at.cmp(&existing.updated_at) {
+            Ordering::Greater => MergeResult::Updated,
+            _ => MergeResult::Unchanged,
+        },
+    }
+}
+
+/// Last-writer-wins merge for service records (bead `7jb`, the focused `e21`
+/// slice the hello.mesh directory needs).
+///
+/// Like [`merge_user`], a service record has no single authoritative announcer —
+/// any node that ingests a service advertisement may write it — so there is no
+/// conflict arm: the entry with the newer `updated_at` HLC wins outright. HLC
+/// tie-break (wall_clock → counter → node_id) makes the verdict deterministic
+/// across nodes, so two peers seeing the same pair converge on the same record.
+///
+/// Note: this function does not enforce that the map key matches the service
+/// name — the caller must look up local by name before calling.
+pub fn merge_service(
+    local: Option<&ServiceEntry>,
+    incoming: &ServiceEntry,
+) -> MergeResult<ServiceEntry> {
     match local {
         None => MergeResult::Inserted,
         Some(existing) => match incoming.updated_at.cmp(&existing.updated_at) {
@@ -366,5 +391,66 @@ mod tests {
         let local = user("ada", "Ada", 1_000, 0, "router-a");
         let incoming = user("ada", "Ada2", 1_000, 1, "router-a");
         assert!(matches!(merge_user(Some(&local), &incoming), MergeResult::Updated));
+    }
+
+    // --- merge_service tests (bead 7jb) ---
+
+    fn service(hostname: &str, port: u16, wall_clock: u64, counter: u32, node_id: &str) -> ServiceEntry {
+        use std::net::{IpAddr, Ipv4Addr};
+        ServiceEntry {
+            hostname: hostname.to_string(),
+            ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+            port,
+            protocol: "_ipp._tcp".to_string(),
+            txt: BTreeMap::new(),
+            host_mac: [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+            updated_at: HLC {
+                wall_clock,
+                counter,
+                node_id: node_id.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn service_inserted_when_no_local() {
+        let incoming = service("printer", 631, 1_000, 0, "router-a");
+        assert!(matches!(merge_service(None, &incoming), MergeResult::Inserted));
+    }
+
+    #[test]
+    fn service_updated_on_newer() {
+        let local = service("printer", 631, 1_000, 0, "router-a");
+        let incoming = service("printer", 9100, 2_000, 0, "router-b");
+        assert!(matches!(merge_service(Some(&local), &incoming), MergeResult::Updated));
+    }
+
+    #[test]
+    fn service_unchanged_on_older() {
+        let local = service("printer", 9100, 2_000, 0, "router-b");
+        let incoming = service("printer", 631, 1_000, 0, "router-a");
+        assert!(matches!(merge_service(Some(&local), &incoming), MergeResult::Unchanged));
+    }
+
+    #[test]
+    fn service_unchanged_on_duplicate() {
+        let entry = service("printer", 631, 5_000, 2, "router-a");
+        assert!(matches!(merge_service(Some(&entry), &entry), MergeResult::Unchanged));
+    }
+
+    #[test]
+    fn service_counter_breaks_wall_clock_tie() {
+        // Equal wall_clock, higher counter → newer.
+        let local = service("printer", 631, 1_000, 0, "router-a");
+        let incoming = service("printer", 9100, 1_000, 1, "router-a");
+        assert!(matches!(merge_service(Some(&local), &incoming), MergeResult::Updated));
+    }
+
+    #[test]
+    fn service_node_id_breaks_hlc_tie() {
+        // Equal wall_clock and counter, higher node_id → newer (deterministic).
+        let local = service("printer", 631, 1_000, 0, "aaa");
+        let incoming = service("printer", 9100, 1_000, 0, "zzz");
+        assert!(matches!(merge_service(Some(&local), &incoming), MergeResult::Updated));
     }
 }

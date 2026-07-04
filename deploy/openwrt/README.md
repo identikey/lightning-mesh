@@ -18,6 +18,22 @@ the `messense/rust-musl-cross:aarch64-musl` container (the repo is mounted, so
 rebuild as needed. The startup banner stamps the git short-SHA (`MJOLNIR_BUILD`,
 `-dirty` if the tree is dirty); see "Verify identity" below.
 
+### Build the hello.mesh front desk (optional, S7 / mjolnir-mesh-eei)
+
+```sh
+deploy/openwrt/build-hello.sh       # -> deploy/openwrt/mjolnir-hello-aarch64
+```
+
+`mjolnir-hello` is an entirely optional peripheral service — a node runs the
+mesh fine without it, and `install-node.sh` / `update-fleet.sh` skip staging it
+if this binary isn't present. **Ordering dependency:** the SvelteKit frontend
+must be built and synced into `crates/mjolnir-hello/static/` *before* the Rust
+cross-build, because `rust-embed` bakes the contents of that directory into
+the binary at compile time (`crates/mjolnir-hello/src/assets.rs`).
+`build-hello.sh` does both steps in order (`cd hello-mesh-web && bun run
+build:embed`, then the same cross-build approach as `build.sh`); set
+`SKIP_WEB=1` to reuse an already-fresh `static/` and skip the `bun` step.
+
 ## Install on a node
 
 One command — idempotent, safe to re-run, and safe to run **in-band** (over the
@@ -69,6 +85,40 @@ What lands on the node:
 | `/usr/sbin/mjolnir-dongle`        | plug-and-play USB wifi (supported-hardware table + auto-config) |
 | `/etc/hotplug.d/usb/70-mjolnir-dongle` | configures a supported dongle the moment it's plugged in |
 | `/root/mjolnir-stage/`            | staged payload, prefetched packages, apply log + result |
+| `/usr/bin/mjolnir-hello`          | the front desk binary — OPTIONAL, only staged if built locally |
+| `/etc/init.d/mjolnir-hello`       | procd service for the front desk (START=97, always staged; stays disabled unless opted in) |
+
+### hello.mesh front desk (optional, S7 / mjolnir-mesh-eei)
+
+`mjolnir-hello` serves the static frontend + read-only mesh API at the node's
+**LAN gateway IP**, independent of `.mesh` name resolution (a separate track,
+`mjolnir-mesh-e21`). It is entirely optional: a node runs the mesh with or
+without it, and neither `install-node.sh` nor `mjolnir-apply` ever turns it on
+by themselves.
+
+1. Build it: `deploy/openwrt/build-hello.sh` (see above) — its absence just
+   means `install-node.sh` skips staging the binary; the init script and UCI
+   template still land so a node is ready the moment a binary shows up.
+2. Opt in on a node: edit the `hello` section of `/etc/config/mjolnir` —
+   `option enabled '1'` (defaults to `'0'`) — then re-run `install-node.sh` (or
+   `service mjolnir-hello enable && service mjolnir-hello start` directly).
+3. The init script resolves the node's LAN gateway IP itself at start time via
+   netifd (`network_get_ipaddr` on the logical interface named by
+   `option lan_iface`, default `'lan'`) and binds
+   `mjolnir-hello --bind <lan-ip>:<port> --directory-file <path> --spool-dir
+   <path>` — the last two default to the exact paths `mjolnir-meshd` uses
+   (`/var/run/mjolnir/directory.json`, `/var/run/mjolnir/pending`), which are
+   the daemon seams the two processes share.
+4. `mjolnir-apply` treats hello as a second, independent lifecycle: it
+   installs/enables it only when `enabled 1` is already in the config it just
+   applied, restarts it on a changed binary or first opt-in, and afterwards
+   probes `http://<lan-ip>:<port>/api/health` for up to ~12s as a **non-fatal**
+   reachability check — a hello hiccup is logged as a `NOTES` warning in the
+   apply result, never a mesh rollback (only the mesh's own babel/wifi health
+   matters for that gate).
+
+Verify: `curl http://<node-lan-ip>/api/health` (or `/` for the frontend) from a
+box on that node's LAN.
 
 ### USB wifi dongles are plug-and-play (`mjolnir-dongle`)
 

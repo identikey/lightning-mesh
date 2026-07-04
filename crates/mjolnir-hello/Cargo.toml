@@ -29,6 +29,9 @@ serde_json = "1"
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+rand.workspace = true
+data-encoding.workspace = true
+ed25519-dalek = "2"
 
 [dev-dependencies]
 tempfile = "3"

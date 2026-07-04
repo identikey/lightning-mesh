@@ -24,6 +24,11 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$DIR/mjolnir-meshd-aarch64"
+# mjolnir-hello (S7, mjolnir-mesh-eei): OPTIONAL front desk binary. Unlike BIN
+# above, its absence is not fatal — a node runs the mesh fine without it. See
+# README.md "Build the hello front desk" for the (currently manual/documented)
+# cross-build step.
+HELLO_BIN="$DIR/mjolnir-hello-aarch64"
 STAGE=/root/mjolnir-stage
 PKGS="babeld kmod-tun wpad-mesh-mbedtls wpad-basic-mbedtls"  # basic variant = rollback fuel for the wpad swap
 # Drivers for every supported USB dongle ride along on every node (fleet
@@ -61,7 +66,18 @@ scp -O "$DIR/setup-wireless.sh"                "$HOST:$STAGE/setup-wireless.sh"
 scp -O "$DIR/files/usr/sbin/mjolnir-apply"     "$HOST:$STAGE/mjolnir-apply"
 scp -O "$DIR/files/usr/sbin/mjolnir-dongle"    "$HOST:$STAGE/mjolnir-dongle"
 scp -O "$DIR/files/etc/hotplug.d/usb/70-mjolnir-dongle" "$HOST:$STAGE/hotplug-usb-mjolnir-dongle"
+scp -O "$DIR/files/etc/init.d/mjolnir-hello"   "$HOST:$STAGE/init.d-mjolnir-hello"
 ssh "$HOST" "chmod +x $STAGE/mjolnir-apply"
+
+# mjolnir-hello binary is OPTIONAL (mjolnir-mesh-eei) — stage it only if a
+# local cross-build exists; the applier installs/enables it iff staged AND
+# /etc/config/mjolnir has 'option enabled 1' in its 'hello' section.
+if [ -f "$HELLO_BIN" ]; then
+	echo ">> staging mjolnir-hello (optional front desk)"
+	scp -O "$HELLO_BIN" "$HOST:$STAGE/mjolnir-hello"
+else
+	echo ">> mjolnir-hello-aarch64 not built locally — skipping (mesh-only install; see README)"
+fi
 
 RUN_WIRELESS=0
 if [ -n "$WIRELESS_ENV" ]; then

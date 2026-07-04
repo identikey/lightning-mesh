@@ -2223,7 +2223,10 @@ name = "mjolnir-hello"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "data-encoding",
+ "ed25519-dalek 2.2.0",
  "mjolnir-mesh",
+ "rand 0.9.2",
  "rust-embed",
  "serde",
  "serde_json",

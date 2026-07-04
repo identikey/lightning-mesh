@@ -129,6 +129,7 @@ mod tests {
                 protocol: "_ipp._tcp".to_string(),
                 txt,
                 host_mac: [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+                updated_at: make_hlc(1_700_000_007_000, 0, "router-a"),
             },
         };
         let bytes = postcard::to_allocvec(&msg).unwrap();
