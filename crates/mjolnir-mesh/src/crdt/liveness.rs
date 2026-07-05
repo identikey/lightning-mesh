@@ -131,6 +131,16 @@ impl LivenessTracker {
         self.seen.get(node_id).map(|s| now_ms.saturating_sub(s.received_at_ms))
     }
 
+    /// The receiver-local time (ms, this process's monotonic domain) we last
+    /// accepted a newer beacon from `node_id`, or `None` if never. A higher
+    /// value means more recently heard from — used by `f8b` to rank gossip
+    /// bootstrap candidates so a rejoin prefers peers seen recently over
+    /// long-quiet ones. Comparable only against other values from this same
+    /// process run (it is `monotonic_now_ms`-based, not wall clock).
+    pub fn last_seen_ms(&self, node_id: &str) -> Option<u64> {
+        self.seen.get(node_id).map(|s| s.received_at_ms)
+    }
+
     /// True if records owned by `node_id` should stop resolving: either we have
     /// never heard a beacon from it, or the last one is older than
     /// `stale_threshold_ms`. The read-side filter (DNS, status) keys off this.

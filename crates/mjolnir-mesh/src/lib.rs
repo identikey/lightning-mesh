@@ -18,6 +18,7 @@
 
 pub mod alloc;
 pub mod babel;
+pub mod bootstrap;
 pub mod claim_cooldown;
 pub mod crdt;
 #[cfg(feature = "daemon")]

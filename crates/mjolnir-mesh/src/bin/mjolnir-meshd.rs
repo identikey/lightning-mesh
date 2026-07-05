@@ -46,6 +46,7 @@ use mjolnir_mesh::{
     ServiceTombstone, ServiceTombstoneBook, SubnetClaim, UnpublishOutcome, UserBook, UserEntry,
     HLC,
 };
+use mjolnir_mesh::bootstrap::rank_bootstrap_candidates;
 use mjolnir_mesh::GossipMessage;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -532,7 +533,15 @@ impl GossipTransport for IrohGossipTransport {
     }
 }
 
-/// Keep this node in the gossip swarm (mjolnir-mesh-eon). iroh-gossip's
+/// Cap on gossip bootstrap candidates dialed per rejoin attempt (bead f8b).
+/// Bounds the union (roster ∪ addr book ∪ claim owners) so a node that has
+/// accumulated a large, mostly-dead address book over its lifetime does not
+/// turn each zero-neighbor retry into a dial storm. Ranked most-recently-seen
+/// first (see [`rank_bootstrap_candidates`]), so the cap keeps the best
+/// candidates.
+const BOOTSTRAP_CANDIDATE_CAP: usize = 16;
+
+/// Keep this node in the gossip swarm (mjolnir-mesh-eon / f8b). iroh-gossip's
 /// bootstrap join is a one-shot dial: at boot the 802.11s radio and mDNS
 /// discovery usually aren't up yet, every bootstrap dial fails ("No
 /// addressing information available"), and the node stays a gossip island
@@ -540,16 +549,28 @@ impl GossipTransport for IrohGossipTransport {
 /// so the claim-conflict machinery never fires. Meanwhile the tunnel data
 /// plane comes up fine because `connector_loop` redials with backoff. This is
 /// that same retry policy for the gossip swarm: whenever we have zero
-/// neighbors, re-issue `join_peers` with the roster bootstrap set, capped
-/// exponential backoff, resetting once we've been joined.
+/// neighbors, re-issue `join_peers`, capped exponential backoff, resetting once
+/// we've been joined.
+///
+/// f8b: the candidate set is no longer the static roster — it is **recomputed
+/// each retry** as the union of the roster, the (live, growing) address book,
+/// and known claim owners, ranked by recency and capped
+/// ([`rank_bootstrap_candidates`]). So a node whose configured peers are all
+/// down still rejoins via any other live node it has ever learned, and a peer
+/// learned mid-run gets used on the very next retry — self-healing joins, no
+/// more islands. The `MemoryLookup` (seeded from the same sources) already
+/// resolves these ids to addresses, so choosing to dial them is all that was
+/// missing.
 async fn gossip_rejoin_loop(
     sender: GossipSender,
-    bootstrap: Vec<EndpointId>,
+    roster: Vec<EndpointId>,
+    addr_book: Arc<Mutex<AddrBook>>,
+    claims: ClaimStore,
+    liveness: Arc<Mutex<LivenessTracker>>,
+    self_id: String,
     mut neigh_rx: tokio::sync::watch::Receiver<usize>,
 ) {
-    if bootstrap.is_empty() {
-        return;
-    }
+    let roster_ids: Vec<String> = roster.iter().map(|id| id.to_string()).collect();
     let min_backoff = Duration::from_secs(5);
     let max_backoff = Duration::from_secs(60);
     let mut backoff = min_backoff;
@@ -560,8 +581,38 @@ async fn gossip_rejoin_loop(
                 return; // transport dropped — shutting down
             }
         }
-        info!(peers = bootstrap.len(), "gossip: no neighbors — (re)joining bootstrap peers");
-        if let Err(e) = sender.join_peers(bootstrap.clone()).await {
+        // Recompute the bootstrap union from the current (persisted + learned)
+        // state each attempt, so entries learned since boot are used (f8b).
+        let candidate_ids: Vec<String> = {
+            let book = addr_book.lock().expect("address book poisoned");
+            let claim_owners: Vec<String> = {
+                let store = claims.lock().expect("claim store poisoned");
+                store.values().map(|c| c.owner_node_id.clone()).collect()
+            };
+            let tracker = liveness.lock().expect("liveness tracker poisoned");
+            rank_bootstrap_candidates(
+                &roster_ids,
+                &book,
+                &claim_owners,
+                &tracker,
+                &self_id,
+                mjolnir_mesh::monotonic_now_ms(),
+                BOOTSTRAP_CANDIDATE_CAP,
+            )
+        };
+        // Parse id strings back into EndpointIds; skip any that don't (a
+        // corrupt persisted id should not abort the whole rejoin).
+        let peers: Vec<EndpointId> =
+            candidate_ids.iter().filter_map(|s| s.parse::<EndpointId>().ok()).collect();
+        if peers.is_empty() {
+            // Nothing to dial yet (factory-fresh disk, empty roster): back off
+            // and re-check — the address book may fill from mDNS/derivation.
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(max_backoff);
+            continue;
+        }
+        info!(peers = peers.len(), "gossip: no neighbors — (re)joining bootstrap union (f8b)");
+        if let Err(e) = sender.join_peers(peers).await {
             warn!("gossip: join_peers failed: {e}");
         }
         // Let the join attempt land (or fail) before trying again.
@@ -988,6 +1039,10 @@ async fn run_mesh(
             let rejoin = tokio::spawn(gossip_rejoin_loop(
                 sender.clone(),
                 bootstrap,
+                addr_book.clone(),
+                claims.clone(),
+                liveness.clone(),
+                self_id_str.clone(),
                 neigh_rx.clone(),
             ));
             let sync = Arc::new(GossipSync::new(IrohGossipTransport {
