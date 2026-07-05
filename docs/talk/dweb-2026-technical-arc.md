@@ -1,7 +1,14 @@
-# Lightning Mesh — DWeb Talk Source Material
+# Lightning Mesh — DWeb Talk (technical-arc source)
 
-**Status:** Talk source / public-facing narrative | **Audience:** DWeb (a project of
-the Internet Archive) | **Date started:** 2026-07-02
+**Status:** Talk source / **technical-arc** cut — NOT the final talk script |
+**Audience:** DWeb (a project of the Internet Archive) | **Date started:** 2026-07-02
+
+> **This is source material, not the talk.** It's the *technical-arc* cut — the
+> same story told as systems design (Cerf & Kahn, the flat-L2 wall,
+> projection-of-keys). Its sibling is
+> [the personal-narrative cut](dweb-2026-personal-narrative.md), which tells the
+> road-to-here as a human story. Both are raw material to be braided into the
+> actual talk later; neither is the deliverable on its own.
 
 This is the source material for the Lightning Mesh talk, written for a
 decentralization-native audience. It is deliberately public-facing: no internal
