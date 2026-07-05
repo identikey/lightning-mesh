@@ -90,7 +90,7 @@ and AI agents all coexist on the same fabric.
 - [Mjolnir + Lightning Mesh integration](docs/vision/mjolnir-integration.md)
 
 ### Public / talk
-- [DWeb talk source material](docs/talk/dweb-2026-lightning-mesh.md) — the
+- [DWeb talk source material](docs/talk/dweb-2026-technical-arc.md) — the
   public narrative; eventually the basis for website documentation
 
 ### Architecture

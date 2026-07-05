@@ -3,7 +3,7 @@
 > Companion doc: [Philosophical outcomes of the architecture](philosophical-outcomes.md)
 > — what the "heterogeneous link islands stitched by L3 routing" design buys, and how
 > it places Lightning Mesh in the lineage of Cerf & Kahn. The public talk narrative
-> lives in [docs/talk/dweb-2026-lightning-mesh.md](../talk/dweb-2026-lightning-mesh.md).
+> lives in [docs/talk/dweb-2026-technical-arc.md](../talk/dweb-2026-technical-arc.md).
 
 ## The Problem
 
