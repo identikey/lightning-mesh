@@ -68,16 +68,20 @@ Answer discipline:
 
 ## Namespace: flat, one arbitration rule
 
-`wiki.mesh`, `printer.mesh`, `laptop.mesh` — flat names, one namespace, no typed
-zones. Prettiest UX and truest to the founding vision ("services broadcast on the
-local mesh and discoverable via `.mesh`"). Three name classes share it, resolved
-in this order:
+`wiki.mesh`, `printer.mesh` — flat names for the **curated global tier**
+(well-known + services): few, human-published, so flat-global first-writer-wins
+is safe and gives the prettiest UX, truest to the founding vision ("services
+broadcast on the local mesh and discoverable via `.mesh`"). **Device names are
+the exception** — auto-derived and many, they are local-first and, when global,
+*scoped* (see "Device names" below), so they never contend in the flat tier.
+The name classes, resolved in this order:
 
 | Class | Source | Answer | Status |
 |---|---|---|---|
 | **Well-known node-local** (`hello.mesh`, `id.mesh`) | compiled-in reserved list — **never in the CRDT, unclaimable** | this node's own client gateway IP (`10.42.x.1`) | first stone |
 | **Services** (`wiki.mesh`) | `/services/{name}` CRDT lane, gossiped | the published `ip` (+ SRV port, TXT) | first stone |
-| **Devices** (`laptop.mesh`) | `/dns/{hostname}` derived from `/devices/{mac}` leases | the device's lease IP | later (needs lease lane) |
+| **Devices, stationary** (`nas.n7x3.mesh`) | explicit opt-in publish, **scoped** (a device-published service) | the device's IP | later (e21.3) |
+| **Devices, auto** (`laptop.duke.mesh`) | DHCP lease lane, **identity-scoped**, gossiped + location-tracked | current lease IP | deferred (`e21.5`) |
 
 Well-known names are **anycast by convention**: every node answers `hello.mesh`
 with itself. That is deliberate and load-bearing for rp9 — `hello.mesh` is the
@@ -99,6 +103,54 @@ No registrar, no vote. Squatting is still possible (first claim is cheap) — th
 durable answer is web-of-trust identity arbitration, punted to its own bead
 with the discovered needs recorded. Full requirements:
 `../prd-mesh-naming-first-stone.md`.
+
+## Device names: identity-gated, stationary opt-in first (revised 2026-07-04)
+
+Devices are unlike services: **auto-derived from DHCP and many, with hostnames
+the device picks, not the mesh** (`laptop`, `iphone`, `android-a3f2`). Two
+constraints — surfaced in the e21.3 design pass — together prove that a *good*
+auto device name (unique + human + roaming-stable + unforgeable) cannot exist
+without identity:
+
+- **Forgery / shadowing.** A bare `<host>.mesh` device name shares the flat form
+  with services and well-knowns, so a device whose DHCP hostname is `wiki` (or
+  `hello`, `id`) collides with the real `wiki.mesh` — shadowing it for clients on
+  that node, or being shadowed when a real service appears. A reserved-list +
+  precedence patch is whack-a-mole. The fix is structural: **devices never occupy
+  the bare flat form.** (Owner-scoped globals like `nas.n7x3.mesh` are two labels
+  and structurally cannot collide with a one-label service — the hole is only in
+  the bare form.)
+- **Roaming, even within one house.** Each node owns a **routed /24** and we
+  deliberately **do not bridge client L2 across nodes** (broadcast containment) —
+  there is no single L2 island spanning the mesh. So a device roaming between two
+  mesh nodes *in the same home* re-DHCPs onto a new /24: new IP, new owning node.
+  Node-local or node-scoped names therefore aren't stable — they're a **de-dup
+  handle, not a name**. Stability requires binding to the device's/owner's
+  identity and tracking its location mesh-wide (a gossiped lane updating the
+  A-record as it roams), which is exactly what identity (`e21.5`) provides.
+
+So device naming is staged on identity:
+
+1. **Stationary opt-in (e21.3, pre-identity).** The only safe *and* useful
+   pre-identity form: an operator **explicitly publishes** a non-roaming device
+   (NAS, print server, always-on box) under a scope, e.g. `nas.<node>.mesh`.
+   Safe — scoped, so no bare-form forgery; explicit, so no auto-flood. Stable —
+   it doesn't roam, so node-scope holds. Mechanically it is a *device-published
+   service*: the `/services` v2 lane already carries `host_mac` for exactly this,
+   and `e21.9` handles staleness. Auto names for phones/laptops are **not** shipped
+   here.
+2. **Auto, stable, identity-scoped (deferred, `e21.5`).** `<host>.<owner>.mesh`
+   bound to IdentiKey identity, gossiped and location-tracked so it survives
+   roaming across the owner's nodes — the real portable device name, and the home
+   of the auto-from-DHCP lease lane. Built only once identity exists, because
+   before then it can be neither stable nor unforgeable, and such a name is worse
+   than none.
+
+**Locked shape:** bare `<host>.mesh` is reserved for the **curated global tier**
+(well-known + services) and is never a device; every device name is **scoped**
+`<host>.<scope>.mesh`, and the scope segment is always key-derived (node id now,
+identity later), so the hierarchy is authority-free and Sybil-bounded — you
+cannot publish under a scope whose key you do not hold.
 
 ## Local *and* internet access: free, by construction
 
@@ -172,8 +224,14 @@ neighbor/service directory — the directory is a *projection* of this lane plus
 
 - **Hosts-file rendering (`--hostsdir`):** A-records only, no SRV/TXT, and it
   re-opens daemon-managed dnsmasq state. Rejected.
-- **Typed zones (`laptop.d.mesh`):** solves device/service collisions we don't
-  have yet, at permanent UX cost. Revisit with the lease lane if collisions bite.
-- **A real registrar / hierarchy:** an authority, rejected on ethos. Name
-  disputes resolve by HLC now and by web-of-trust identity later — the same arc
-  as node membership (`membership-enrollment.md`).
+- **Typed zones (`laptop.d.mesh`):** solves *type* collisions (device vs service)
+  we don't have — devices and services don't share a tier (devices are
+  local-first / owner-scoped, see above), so a type discriminator buys nothing at
+  permanent UX cost. Rejected. (Distinct from *owner*-scoping, which we do adopt
+  for global device names — that scopes by identity, not by type.)
+- **A real registrar / hierarchy:** a registrar is an authority, rejected on
+  ethos. Note the owner-scoping above *is* a hierarchy but **not** a registrar:
+  its segments are key-derived (a node id / identity you already hold), so no
+  authority issues them — hierarchy without a registrar. Name disputes in the
+  flat tier resolve by HLC now and web-of-trust identity later — the same arc as
+  node membership (`membership-enrollment.md`).
