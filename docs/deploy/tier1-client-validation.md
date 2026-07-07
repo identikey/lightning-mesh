@@ -24,7 +24,7 @@ already deployed.
 | wr3000s-a | `10.254.242.84` | Cudy WR3000S  | no WAN of its own                                |
 | m3000-b   | `10.254.12.214` | Cudy M3000    | wired/jump node (`192.168.1.1` on ethernet)      |
 | m3000     | `10.254.242.172`| Cudy M3000    | radio-only                                       |
-| tr3000    | `10.254.61.115` | Cudy TR3000   | gateway-capable (auto; WAN via `192.168.0.1`)    |
+| tr3000    | `10.254.61.115` | Cudy TR3000   | 2.5GbE eth0 + USB3                                |
 
 - Client AP: SSID **`Lightning Mesh`**, key **`lightning!`** (unless rotated in
   `fleet-secrets/wireless.env`). Same SSID on every node — which node you land
@@ -166,9 +166,9 @@ to `9.9.9.9` / `1.1.1.1` (fleet-wide via `setup-wireless.sh`). So from the
 laptop on a **non-gateway** node:
 
 ```sh
-ping -c5 8.8.8.8                 # raw egress through tr3000
+ping -c5 8.8.8.8                 # raw egress through whichever node has the WAN
 dig example.com @10.42.x.1       # DNS via the local node's dnsmasq
-traceroute -n 8.8.8.8            # expect: 10.42.x.1 → mesh hop(s) → tr3000 → 192.168.0.1 → internet
+traceroute -n 8.8.8.8            # expect: 10.42.x.1 → mesh hop(s) → gateway node → its WAN → internet
 curl -sI https://example.com     # full stack
 ```
 
@@ -181,7 +181,7 @@ If `ping 8.8.8.8` fails, check in order:
    `ip route show default` points out a real WAN (non-mesh) iface; if it does
    and the mesh still sees nothing, confirm it isn't set `gateway='never'`
    (`uci get mjolnir.meshd.gateway`) and that babeld reloaded.
-2. Route present but no replies → NAT: on tr3000,
+2. Route present but no replies → NAT: on the gateway node,
    `iptables -t nat -L -v | grep -i masq` (or `nft list ruleset | grep masq`) —
    mesh-sourced traffic must hit the wan-zone masquerade.
 3. Ping works but names don't → DNS: `dig example.com @9.9.9.9` from the
