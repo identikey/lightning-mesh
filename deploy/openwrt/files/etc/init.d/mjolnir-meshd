@@ -51,9 +51,18 @@ start_service() {
 	# auu retest (mjolnir-mesh-auu / 0yb.1): re-enable per-peer iroh tunnels in LAN
 	# mode. Default 0 = data rides the shared-L2 backhaul (babel).
 	config_get_bool lan_tunnels meshd lan_tunnels 0
-	# a8o: internet-gateway role — redistribute this node's WAN default route
-	# into the mesh so other nodes (and their clients) egress via it.
-	config_get_bool gateway meshd gateway 0
+	# chj: auto-gateway. The redistribute line is self-gating — babeld only
+	# exports 0.0.0.0/0 while a matching NON-babel kernel default route exists
+	# (netifd's DHCP/static WAN default) and withdraws it ~1s after the uplink
+	# drops. So we render the line by DEFAULT (auto) on every node and let the
+	# kernel FIB be the detector: a node with no WAN uplink exports nothing, a
+	# node plugged into real internet self-elects as a gateway with no flag.
+	#   auto  (default) render the line; WAN presence gates it.
+	#   always           same as auto today (Phase 2 will add uplink-health
+	#                    probing that gates auto but not always).
+	#   never | 0        never advertise egress — set on nodes on an untrusted/
+	#                    metered/captive LAN that must not become fleet egress.
+	config_get gateway meshd gateway 'auto'
 
 	mkdir -p "$(dirname "$secret_file")" "$(dirname "$babel_config")" 2>/dev/null
 
@@ -74,7 +83,11 @@ start_service() {
 	esac
 	[ -n "$relay" ] && procd_append_param command --relay "$relay"
 	[ "$lan_tunnels" -gt 0 ] && procd_append_param command --lan-tunnels
-	[ "$gateway" -gt 0 ] && procd_append_param command --gateway
+	# never/0 opts out; auto/always (the default) render the self-gating line.
+	case "$gateway" in
+		never|0) ;;
+		*) procd_append_param command --gateway ;;
+	esac
 
 	procd_set_param env RUST_LOG="$log_level"
 	# Supervise: restart forever (final 0 = infinite retries) after a 5s settle.

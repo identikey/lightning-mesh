@@ -24,7 +24,7 @@ already deployed.
 | wr3000s-a | `10.254.242.84` | Cudy WR3000S  | no WAN of its own                                |
 | m3000-b   | `10.254.12.214` | Cudy M3000    | wired/jump node (`192.168.1.1` on ethernet)      |
 | m3000     | `10.254.242.172`| Cudy M3000    | radio-only                                       |
-| tr3000    | `10.254.61.115` | Cudy TR3000   | **gateway** (`gateway=1`, WAN via `192.168.0.1`) |
+| tr3000    | `10.254.61.115` | Cudy TR3000   | gateway-capable (auto; WAN via `192.168.0.1`)    |
 
 - Client AP: SSID **`Lightning Mesh`**, key **`lightning!`** (unless rotated in
   `fleet-secrets/wireless.env`). Same SSID on every node — which node you land
@@ -154,10 +154,14 @@ overlay (future work), not L2 tricks.
 
 ## Tier-2 spoiler — egress over the mesh may already work
 
-a8o is implemented and was validated live once: tr3000 runs with
-`gateway=1`, meshd renders babeld config that announces the kernel default
-route into the mesh (nearest-exit metric semantics), the wan-zone masquerade
-covers mesh sources, and **every** node's dnsmasq already forwards client DNS
+a8o is implemented and was validated live once. As of chj (auto-gateway,
+`gateway='auto'` by default) **any** node with a live WAN uplink self-elects:
+meshd always renders the `0.0.0.0/0` redistribute line and babeld exports it
+only while a non-babel kernel default route exists, so plugging a node into
+real internet (e.g. an m3000 on the venue-WiFi MikroTik uplink) makes it a
+gateway with no flag. It announces the kernel default route into the mesh
+(nearest-exit metric semantics), the wan-zone masquerade covers mesh sources,
+and **every** node's dnsmasq already forwards client DNS
 to `9.9.9.9` / `1.1.1.1` (fleet-wide via `setup-wireless.sh`). So from the
 laptop on a **non-gateway** node:
 
@@ -172,8 +176,11 @@ If `ping 8.8.8.8` fails, check in order:
 
 1. Non-gateway node has the route? `ssh root@<mgmt> 'ip route show default'`
    → expect `default via <fe80/10.254 next-hop> dev mj-peer-… proto babel`-ish.
-   Missing → tr3000 isn't announcing (check its `uci get mjolnir.meshd.gateway`
-   and that its own `ip route show default` points out the WAN).
+   Missing → the gateway node isn't announcing. With `gateway='auto'` (default)
+   the only thing that matters is whether that node's own
+   `ip route show default` points out a real WAN (non-mesh) iface; if it does
+   and the mesh still sees nothing, confirm it isn't set `gateway='never'`
+   (`uci get mjolnir.meshd.gateway`) and that babeld reloaded.
 2. Route present but no replies → NAT: on tr3000,
    `iptables -t nat -L -v | grep -i masq` (or `nft list ruleset | grep masq`) —
    mesh-sourced traffic must hit the wan-zone masquerade.

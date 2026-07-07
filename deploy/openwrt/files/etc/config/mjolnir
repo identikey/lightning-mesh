@@ -29,13 +29,21 @@ config meshd 'meshd'
 	# verify the same-site tunnel stays up natively (mjolnir-mesh-auu / 0yb.1).
 	option lan_tunnels '0'
 
-	# a8o: internet-gateway role. Set to 1 on a node whose WAN port has real
-	# upstream internet: it redistributes its default route into the mesh
-	# (0.0.0.0/0, metric 128) and every other node — and their clients —
-	# egresses through it, NAT'd by the standard wan-zone masquerade. Safe on
-	# several nodes at once (babel picks the nearest exit) and self-withdraws
-	# when the uplink drops. Default 0.
-	# option gateway '1'
+	# chj: auto-gateway (default 'auto'). Any node whose WAN port has real
+	# upstream internet AUTOMATICALLY redistributes its default route into the
+	# mesh (0.0.0.0/0, metric 128); every other node — and their clients —
+	# egresses through it, NAT'd by the standard wan-zone masquerade. The
+	# announcement is self-gating: babeld exports it only while a matching
+	# non-babel kernel default route exists, so it appears on plug-in and
+	# withdraws ~1s after the uplink drops. Safe on several nodes at once
+	# (babel picks the nearest exit). No flag to remember — plug in and go.
+	#   auto   (default) become a gateway iff a live WAN uplink is present
+	#   always same as auto today (reserved for Phase-2 uplink-health probing)
+	#   never  never advertise egress — use on a node plugged into an untrusted,
+	#          metered, or captive-portal LAN that must not become fleet egress
+	#          (also set 'never' on mode='internet'/overlay nodes until the oif
+	#          exclusion lands — mjolnir-mesh-chj Phase 2).
+	option gateway 'auto'
 
 	option log_level 'info'
 
