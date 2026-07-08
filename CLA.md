@@ -11,11 +11,9 @@ copyright to your contribution** — this is a license, not an assignment. But
 you grant the Project the rights below, including the right to include your
 contribution in commercially-licensed releases.
 
-> **Who is "the Project":** the Lightning Mesh maintainers, currently
-> **Duke Jones** (`duke@worldtree.io`). If a legal entity is later
-> incorporated to steward Lightning Mesh, the rights granted here run to that
-> entity as successor. Replace "Duke Jones" with the entity's legal name when
-> that happens.
+> **Who is "the Project":** **Identikey Inc.**, the entity that stewards
+> Lightning Mesh (contact `duke@identikey.io`). The rights granted here run to
+> Identikey Inc. and its successors and assigns.
 
 By signing this CLA (see **How to sign** below), you accept and agree to the
 following terms for your present and future Contributions to the Project.
@@ -132,7 +130,7 @@ your name to `contributors/individual.md` in a pull request with the statement:
 
 If you are contributing as part of your employment, an authorized
 representative of your employer must agree to this CLA on the company's behalf
-and list the employees authorized to contribute. Email **duke@worldtree.io**
+and list the employees authorized to contribute. Email **duke@identikey.io**
 with:
 
 > Company: <legal entity name>
@@ -145,17 +143,3 @@ with:
 >
 > Signature: <name>
 > Date: <YYYY-MM-DD>
-
----
-
-### A lighter alternative: the DCO
-
-If maintaining CLA signatures ever becomes too heavy, the project can fall back
-to the [Developer Certificate of Origin](https://developercertificate.org/)
-(`Signed-off-by:` trailers). **Note the trade-off:** the DCO certifies a
-contributor's right to submit under the project's *inbound* license (AGPL) but
-does **not** grant the outbound relicensing right in Section 2. Under a
-DCO-only model, the project could no longer relicense new contributions under
-the commercial license, which would erode the dual-licensing model over time.
-For that reason, the CLA above is the recommended mechanism while commercial
-licensing is a goal.

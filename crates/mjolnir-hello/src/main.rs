@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 Duke Jones and the Lightning Mesh contributors
+// Copyright (C) 2026 Identikey Inc. and the Lightning Mesh contributors
 // Lightning Mesh is dual-licensed (AGPL-3.0-or-later or commercial); see LICENSE
 // and COMMERCIAL-LICENSE.md at the repository root.
 

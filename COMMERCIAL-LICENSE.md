@@ -11,11 +11,6 @@ You only need a commercial license if the AGPL's obligations don't work for
 your product. If you're happy to comply with the AGPL, you owe nothing and can
 stop reading.
 
-> **Legal entity note:** the commercial licensor is currently
-> **Duke Jones** (`duke@worldtree.io`). If/when a formal company is
-> incorporated to hold this project, replace "Duke Jones" throughout this file
-> and in `CLA.md` with that entity's legal name.
-
 ---
 
 ## When you need a commercial license
@@ -66,7 +61,7 @@ source in this repository.
 
 ## How to obtain one
 
-Email **duke@worldtree.io** with:
+Email **duke@identikey.io** with:
 
 - your company and product,
 - roughly how Lightning Mesh will be used (embedded appliance, hosted

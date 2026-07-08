@@ -1,5 +1,5 @@
 Lightning Mesh
-Copyright (C) 2026 Duke Jones and the Lightning Mesh contributors
+Copyright (C) 2026 Identikey Inc. and the Lightning Mesh contributors
 
 This program is free software: you can redistribute it and/or modify it
 under the terms of the GNU Affero General Public License as published by
@@ -25,7 +25,7 @@ Lightning Mesh is available under two licenses:
   2. A separate commercial license, for organizations that wish to embed
      Lightning Mesh in a proprietary product or offer it as a network
      service without the AGPL's source-disclosure obligations. See
-     COMMERCIAL-LICENSE.md, or contact duke@worldtree.io.
+     COMMERCIAL-LICENSE.md, or contact duke@identikey.io.
 
 Contributions to this project are accepted under the Contributor License
 Agreement in CLA.md, which is what makes the dual-licensing model possible.
