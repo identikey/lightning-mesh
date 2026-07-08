@@ -151,4 +151,18 @@ and pushed with `deploy/openwrt/install-node.sh`); `meshctl` comes from
 
 ## License
 
-See `Cargo.toml` workspace metadata for license information.
+Lightning Mesh is **dual-licensed**:
+
+- **[GNU AGPL v3.0 or later](LICENSE)** — free for everyone. Community mesh
+  networks, researchers, hobbyists, and any deployment willing to comply with
+  the AGPL (including its network-use source-sharing clause, §13) can use,
+  modify, and redistribute Lightning Mesh at no cost, forever. Copyleft here is
+  a feature: it keeps the mesh un-enclosable.
+- **[Commercial license](COMMERCIAL-LICENSE.md)** — for embedding Lightning
+  Mesh in a proprietary appliance or hosted service without AGPL
+  source-disclosure obligations. Contact **duke@worldtree.io**.
+
+Contributions are accepted under the **[Contributor License Agreement](CLA.md)**,
+which is what makes the dual-licensing model possible — please sign it before
+your first pull request. See also [`NOTICE`](NOTICE) for third-party components
+(notably `iroh`, MIT/Apache-2.0, and `babeld`, run as a separate process).

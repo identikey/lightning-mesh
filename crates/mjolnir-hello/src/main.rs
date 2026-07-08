@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Duke Jones and the Lightning Mesh contributors
+// Lightning Mesh is dual-licensed (AGPL-3.0-or-later or commercial); see LICENSE
+// and COMMERCIAL-LICENSE.md at the repository root.
+
 //! `mjolnir-hello` — the hello.mesh front desk server.
 //!
 //! Serves the embedded static frontend bundle and (starting with S3/S4) a

@@ -5,7 +5,10 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+# Dual-licensed: AGPL-3.0-or-later for the open-source distribution (see LICENSE),
+# plus a separate commercial license (see COMMERCIAL-LICENSE.md). The SPDX field
+# below is the open-source license; the commercial option is offered out of band.
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 # iroh networking
