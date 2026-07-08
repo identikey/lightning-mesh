@@ -1437,6 +1437,11 @@ async fn run_mesh(
             babel_reconciler(registry, claims, me, babel_config, l2, gateway).await
         })
     };
+    // Reachability probe (mjolnir-mesh-42j): drives GATEWAY_PROBE_HEALTHY so a
+    // captive/dead uplink stops advertising egress (fail-open). Self-gates on
+    // uplink presence, so it's harmless on a non-gateway node; detached because
+    // its verdict is consumed via local_egress, not a join handle.
+    tokio::spawn(gateway_probe_task());
     if let Some(iface) = &l2_backhaul {
         info!(%iface, "LAN mode: routing babel over the shared-L2 backhaul (no per-peer iroh tunnels)");
     }
@@ -3202,16 +3207,130 @@ async fn read_default_routes() -> Vec<mjolnir_mesh::DefaultRoute> {
     Vec::new()
 }
 
+/// Reachability-probe verdict (mjolnir-mesh-42j), shared from [`gateway_probe_task`]
+/// to [`local_egress`]. **Fail-open**: initialised `true`, so before the probe has
+/// run — or if it can never run — the node behaves exactly as pre-42j (route
+/// presence alone implies healthy). Only sustained *confirmed* unreachability
+/// flips it false. `Relaxed` is fine: a stale read for one reconcile tick is
+/// harmless, there is nothing to synchronise against.
+static GATEWAY_PROBE_HEALTHY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 /// This node's internet-egress advertisement right now (mjolnir-mesh-5lw), or
 /// `None` if it is not a live local gateway. Reads the kernel default routes and
 /// runs the pure [`classify_egress`](mjolnir_mesh::classify_egress): a candidate
 /// qualifies only if it is NOT `proto babel` and its interface is not the
-/// backhaul/overlay. Shared by the beacon emitter (what we advertise) and the
-/// babel reconcilers (whether we render the `0.0.0.0/0` redistribute line).
+/// backhaul/overlay. `EgressAd::healthy` carries the current reachability-probe
+/// verdict (42j). Shared by the beacon emitter (what we advertise) and the babel
+/// reconcilers (whether we render the `0.0.0.0/0` redistribute line).
 async fn local_egress() -> Option<mjolnir_mesh::EgressAd> {
     let routes = read_default_routes().await;
-    mjolnir_mesh::classify_egress(&routes, mjolnir_mesh::EXCLUDED_EGRESS_IFACES)
+    // `option gateway 'always'` sets MJOLNIR_GATEWAY_NO_PROBE=1 (mjolnir-mesh-42j):
+    // bypass the probe and trust route presence, for an uplink that works but that
+    // the 204 endpoints can't reach (restrictive-but-live networks). Default (auto)
+    // lets the fail-open probe gate `healthy`.
+    let healthy = gateway_probe_bypassed()
+        || GATEWAY_PROBE_HEALTHY.load(std::sync::atomic::Ordering::Relaxed);
+    mjolnir_mesh::classify_egress(&routes, mjolnir_mesh::EXCLUDED_EGRESS_IFACES, healthy)
 }
+
+/// True when the reachability probe is bypassed (`option gateway 'always'`),
+/// making the node advertise egress on route presence alone (mjolnir-mesh-42j).
+fn gateway_probe_bypassed() -> bool {
+    matches!(
+        std::env::var("MJOLNIR_GATEWAY_NO_PROBE").as_deref(),
+        Ok("1" | "true" | "yes")
+    )
+}
+
+/// One HTTP-204 captive-portal / reachability check (mjolnir-mesh-42j). Returns
+/// `Some(true)` if any well-known `generate_204` endpoint answers with a real
+/// `204` (proves genuine internet, not a captive portal that would answer `200`/
+/// a redirect); `Some(false)` if the check ran against at least one endpoint and
+/// none returned `204` (dead or captive upstream); `None` if the check could not
+/// run at all (no `wget`) — which the hysteresis treats as no evidence.
+///
+/// Uses busybox `wget -S` and greps the response status for `204`: a lease from a
+/// dead upstream gets no response, a captive portal answers non-204, and only a
+/// clean egress yields 204. Plain HTTP on purpose — captive portals intercept it.
+#[cfg(target_os = "linux")]
+async fn probe_internet() -> Option<bool> {
+    const URLS: &[&str] = &[
+        "http://connectivitycheck.gstatic.com/generate_204",
+        "http://www.gstatic.com/generate_204",
+        "http://clients3.google.com/generate_204",
+    ];
+    let mut any_ran = false;
+    for url in URLS {
+        match tokio::process::Command::new("wget")
+            .args(["-q", "-S", "-O", "/dev/null", "-T", "5", url])
+            .output()
+            .await
+        {
+            Ok(out) => {
+                any_ran = true;
+                // busybox wget prints the server response headers to stderr even
+                // with -q; a 204 status line is the only healthy signal.
+                if String::from_utf8_lossy(&out.stderr).contains(" 204") {
+                    return Some(true);
+                }
+            }
+            // No wget on PATH -> can't probe; caller treats None as no evidence.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            // Transient spawn error for this URL -> try the next one.
+            Err(_) => {}
+        }
+    }
+    if any_ran { Some(false) } else { None }
+}
+
+/// Periodically probe real internet reachability and publish the fail-open
+/// verdict to [`GATEWAY_PROBE_HEALTHY`] (mjolnir-mesh-42j). Only probes while the
+/// node actually has an uplink route (otherwise it isn't a gateway and health is
+/// moot); when the uplink disappears it resets to healthy so a freshly-plugged
+/// uplink advertises immediately and the probe re-confirms. Runs forever; a
+/// no-op on non-Linux.
+#[cfg(target_os = "linux")]
+async fn gateway_probe_task() {
+    const INTERVAL: Duration = Duration::from_secs(30);
+    // Three sustained failures (~90s) before demoting — long enough to ride out
+    // a blip, short enough to pull a captive/dead gateway reasonably fast.
+    const DEMOTE_AFTER: u32 = 3;
+    let mut hyst = mjolnir_mesh::ProbeHysteresis::new(DEMOTE_AFTER);
+    loop {
+        // Is there a local uplink route to probe? (Ignore the probe verdict here —
+        // we only want to know a candidate route exists.)
+        let has_uplink = mjolnir_mesh::classify_egress(
+            &read_default_routes().await,
+            mjolnir_mesh::EXCLUDED_EGRESS_IFACES,
+            true,
+        )
+        .is_some();
+        if has_uplink {
+            let healthy = hyst.observe(probe_internet().await);
+            let prev = GATEWAY_PROBE_HEALTHY.swap(healthy, std::sync::atomic::Ordering::Relaxed);
+            if prev != healthy {
+                if healthy {
+                    info!("gateway probe: uplink reachable again — advertising egress");
+                } else {
+                    warn!(
+                        "gateway probe: uplink present but internet unreachable \
+                         ({DEMOTE_AFTER} consecutive failures — captive/dead upstream?) — \
+                         withdrawing egress advertisement"
+                    );
+                }
+            }
+        } else {
+            // No uplink: reset to fail-open healthy for the next plug-in.
+            hyst = mjolnir_mesh::ProbeHysteresis::new(DEMOTE_AFTER);
+            GATEWAY_PROBE_HEALTHY.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        tokio::time::sleep(INTERVAL).await;
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn gateway_probe_task() {}
 
 /// Broadcast this node's ephemeral liveness beacon (bead e21.9) and refresh our
 /// own liveness locally. `counter` is a per-boot monotonic sequence bumped each
@@ -5003,7 +5122,9 @@ async fn babel_reconciler(
         // local uplink. A no-WAN node therefore never emits the line, so it can
         // never re-export a stale `proto babel` default and hijack the mesh's
         // egress (the field bug). Re-sampled every loop, so plug/unplug flips it.
-        let gateway_now = gateway && local_egress().await.is_some();
+        // 42j: also require the reachability probe to pass (auto), unless
+        // bypassed (always). `local_egress().healthy` already folds the bypass in.
+        let gateway_now = gateway && local_egress().await.is_some_and(|e| e.healthy);
         let iface_refs: Vec<&str> = ifaces.iter().map(String::as_str).collect();
         let inputs = BabelConfigInputs::new(local_subnet, &iface_refs)
             .l2_interfaces(&l2_refs)
@@ -5538,7 +5659,9 @@ async fn babel_reconciler_overlay(
         // EXCLUDED_EGRESS_IFACES guard (br-mesh, mjolnir0) is what stops a
         // mode=internet overlay node from re-announcing its own underlay uplink
         // back into the overlay (buw.7).
-        let gateway_now = gateway && local_egress().await.is_some();
+        // 42j: also require the reachability probe to pass (auto), unless
+        // bypassed (always). `local_egress().healthy` already folds the bypass in.
+        let gateway_now = gateway && local_egress().await.is_some_and(|e| e.healthy);
         let conf = render_overlay_babeld_conf(
             OVERLAY_IFACE,
             local_subnet,

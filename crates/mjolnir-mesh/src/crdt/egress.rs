@@ -52,14 +52,23 @@ pub struct DefaultRoute {
     pub proto_babel: bool,
 }
 
-/// Decide whether this node is a local internet gateway from its default-route
-/// candidates. A route qualifies iff it is NOT `proto babel` and its output
-/// interface is not in `excluded` (the backhaul / overlay). Returns the egress
-/// advertisement to beacon, or `None` if no candidate qualifies.
+/// Decide whether this node has a local internet-uplink route from its
+/// default-route candidates. A route qualifies iff it is NOT `proto babel` and
+/// its output interface is not in `excluded` (the backhaul / overlay). Returns
+/// the egress advertisement, or `None` if no candidate qualifies.
 ///
-/// `cost_hint` is `0` for a directly-attached uplink (this is the exit); a probe
-/// step may later raise it. Pure and platform-free.
-pub fn classify_egress<'a, I>(candidates: I, excluded: &[&str]) -> Option<EgressAd>
+/// `probe_healthy` (mjolnir-mesh-42j) is the reachability-probe verdict — whether
+/// the uplink actually reaches the internet (vs a dead or captive lease). It is
+/// carried through as [`EgressAd::healthy`]; route *presence* (Some/None) is kept
+/// separate from *health* so the caller can decide policy (a gateway with a route
+/// but `healthy: false` should not be selected). Pass `true` where no probe runs
+/// (fail-open — route presence alone implies healthy). `cost_hint` is `0` for a
+/// directly-attached uplink. Pure and platform-free.
+pub fn classify_egress<'a, I>(
+    candidates: I,
+    excluded: &[&str],
+    probe_healthy: bool,
+) -> Option<EgressAd>
 where
     I: IntoIterator<Item = &'a DefaultRoute>,
 {
@@ -67,9 +76,66 @@ where
         .into_iter()
         .any(|r| !r.proto_babel && !excluded.contains(&r.oif.as_str()));
     qualifies.then_some(EgressAd {
-        healthy: true,
+        healthy: probe_healthy,
         cost_hint: 0,
     })
+}
+
+/// Fail-open reachability-probe hysteresis (mjolnir-mesh-42j). Drives the
+/// `EgressAd::healthy` verdict from a stream of probe outcomes so a node with an
+/// uplink route but a dead/captive upstream stops advertising egress — WITHOUT
+/// letting a flaky probe knock a working gateway off the air.
+///
+/// **Fail-open** is the whole safety property: it starts HEALTHY, demotes only
+/// after `demote_after` *consecutive confirmed* failures, promotes on a single
+/// success, and treats "couldn't run the probe" (`None`) as no evidence — state
+/// unchanged. So the worst case is today's behaviour (a dead uplink keeps
+/// advertising a little longer), never the dangerous one (a probe bug cutting a
+/// live gateway's advertisement fleet-wide).
+#[derive(Debug, Clone)]
+pub struct ProbeHysteresis {
+    healthy: bool,
+    consecutive_fail: u32,
+    demote_after: u32,
+}
+
+impl ProbeHysteresis {
+    /// `demote_after` consecutive confirmed failures flip healthy -> false.
+    /// Starts healthy (fail-open). `demote_after` is clamped to at least 1.
+    pub fn new(demote_after: u32) -> Self {
+        Self {
+            healthy: true,
+            consecutive_fail: 0,
+            demote_after: demote_after.max(1),
+        }
+    }
+
+    /// Feed one probe outcome and return the current health verdict:
+    /// - `Some(true)`  — reachable: reset the failure run, promote to healthy.
+    /// - `Some(false)` — confirmed unreachable: count it; demote once the run
+    ///   reaches `demote_after`.
+    /// - `None`        — the probe couldn't run (no tool, spawn error): NO
+    ///   evidence either way, leave the verdict untouched (fail-open).
+    pub fn observe(&mut self, outcome: Option<bool>) -> bool {
+        match outcome {
+            Some(true) => {
+                self.consecutive_fail = 0;
+                self.healthy = true;
+            }
+            Some(false) => {
+                self.consecutive_fail = self.consecutive_fail.saturating_add(1);
+                if self.consecutive_fail >= self.demote_after {
+                    self.healthy = false;
+                }
+            }
+            None => {}
+        }
+        self.healthy
+    }
+
+    pub fn healthy(&self) -> bool {
+        self.healthy
+    }
 }
 
 #[cfg(test)]
@@ -87,7 +153,7 @@ mod tests {
     fn real_wan_default_is_a_gateway() {
         let routes = [route("wan", false)];
         assert_eq!(
-            classify_egress(&routes, EXCLUDED_EGRESS_IFACES),
+            classify_egress(&routes, EXCLUDED_EGRESS_IFACES, true),
             Some(EgressAd {
                 healthy: true,
                 cost_hint: 0
@@ -98,7 +164,7 @@ mod tests {
     #[test]
     fn no_default_route_is_not_a_gateway() {
         let routes: [DefaultRoute; 0] = [];
-        assert_eq!(classify_egress(&routes, EXCLUDED_EGRESS_IFACES), None);
+        assert_eq!(classify_egress(&routes, EXCLUDED_EGRESS_IFACES, true), None);
     }
 
     #[test]
@@ -107,7 +173,7 @@ mod tests {
         // babel) must never advertise itself as a gateway, or it re-exports a
         // path back into the mesh and can hijack the real uplink.
         let routes = [route("br-mesh", true)];
-        assert_eq!(classify_egress(&routes, EXCLUDED_EGRESS_IFACES), None);
+        assert_eq!(classify_egress(&routes, EXCLUDED_EGRESS_IFACES, true), None);
     }
 
     #[test]
@@ -115,11 +181,11 @@ mod tests {
         // Even a non-babel default out br-mesh/mjolnir0 is the mesh's own path,
         // not an uplink (buw.7 mode=internet self-announce guard).
         assert_eq!(
-            classify_egress(&[route("br-mesh", false)], EXCLUDED_EGRESS_IFACES),
+            classify_egress(&[route("br-mesh", false)], EXCLUDED_EGRESS_IFACES, true),
             None
         );
         assert_eq!(
-            classify_egress(&[route("mjolnir0", false)], EXCLUDED_EGRESS_IFACES),
+            classify_egress(&[route("mjolnir0", false)], EXCLUDED_EGRESS_IFACES, true),
             None
         );
     }
@@ -129,6 +195,52 @@ mod tests {
         // Multi-default node: it learned a mesh default AND has its own WAN.
         // Its own WAN qualifies -> it is a gateway.
         let routes = [route("br-mesh", true), route("wan", false)];
-        assert!(classify_egress(&routes, EXCLUDED_EGRESS_IFACES).is_some());
+        assert!(classify_egress(&routes, EXCLUDED_EGRESS_IFACES, true).is_some());
+    }
+
+    #[test]
+    fn hysteresis_is_fail_open_and_demotes_only_after_run() {
+        let mut h = ProbeHysteresis::new(3);
+        assert!(h.healthy(), "starts healthy (fail-open)");
+        // Two confirmed failures: not enough to demote yet.
+        assert!(h.observe(Some(false)));
+        assert!(h.observe(Some(false)));
+        // Third consecutive confirmed failure -> demote.
+        assert!(!h.observe(Some(false)));
+        // A single success re-promotes immediately.
+        assert!(h.observe(Some(true)));
+    }
+
+    #[test]
+    fn hysteresis_none_is_no_evidence() {
+        let mut h = ProbeHysteresis::new(2);
+        // Probe couldn't run: must NOT count toward demotion (fail-open).
+        assert!(h.observe(None));
+        assert!(h.observe(None));
+        assert!(h.observe(None));
+        assert!(h.healthy(), "None outcomes never demote");
+        // A confirmed failure interrupted by a None does not accumulate across it.
+        assert!(h.observe(Some(false))); // 1 fail, need 2
+        assert!(h.observe(None)); // no evidence — run preserved but not advanced
+        assert!(!h.observe(Some(false)), "second confirmed failure demotes");
+    }
+
+    #[test]
+    fn probe_verdict_rides_through_to_healthy() {
+        // 42j: a real uplink whose reachability probe FAILED is still a route
+        // (Some), but advertised unhealthy — consumers/render gate skip it.
+        let routes = [route("wan", false)];
+        assert_eq!(
+            classify_egress(&routes, EXCLUDED_EGRESS_IFACES, false),
+            Some(EgressAd {
+                healthy: false,
+                cost_hint: 0
+            })
+        );
+        // No uplink route at all -> None regardless of probe verdict.
+        assert_eq!(
+            classify_egress(&[route("br-mesh", true)], EXCLUDED_EGRESS_IFACES, false),
+            None
+        );
     }
 }

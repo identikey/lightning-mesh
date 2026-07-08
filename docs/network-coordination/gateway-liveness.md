@@ -139,8 +139,17 @@ whole fleet at once.
    route deletion. Fast multi-gateway failover is already babel's job (metric +
    hop cost). If a positive-withdraw is ever wanted, it must be gated on the
    DATA path (babel's own route state), not the gossip beacon.
-5. Fold in `42j`: replace the probe stub with the real ICMP + HTTP-204 captive
-   check + hysteresis. `classify_egress` sets `healthy` from the probe.
+5. Fold in `42j` — reachability probe. **[done]** `gateway_probe_task` runs an
+   HTTP-204 captive/connectivity check (busybox `wget -S`, several `generate_204`
+   endpoints) every 30s and drives `GATEWAY_PROBE_HEALTHY` through a **fail-open**
+   `ProbeHysteresis` (starts healthy; demotes only after 3 consecutive *confirmed*
+   failures; a probe that can't run is "no evidence", never a demotion). `local_egress`
+   reads it into `EgressAd.healthy`, and both render gates now require
+   `local_egress().healthy` — so a dead/captive lease stops advertising `0.0.0.0/0`.
+   `option gateway 'always'` sets `MJOLNIR_GATEWAY_NO_PROBE=1` to bypass the probe
+   for a working-but-unreachable-to-204 uplink. Fail-open is the safety property:
+   worst case is a dead uplink advertising slightly longer (today's behaviour),
+   never a probe bug cutting a live gateway off the air.
 
 ## Test plan
 

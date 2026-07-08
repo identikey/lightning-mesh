@@ -35,7 +35,7 @@ pub mod tun;
 
 pub use crdt::{
     dns::DnsEntry,
-    egress::{DefaultRoute, EXCLUDED_EGRESS_IFACES, EgressAd, classify_egress},
+    egress::{DefaultRoute, EXCLUDED_EGRESS_IFACES, EgressAd, ProbeHysteresis, classify_egress},
     gossip::GossipMessage,
     hlc::HLC,
     lease::LeaseEntry,

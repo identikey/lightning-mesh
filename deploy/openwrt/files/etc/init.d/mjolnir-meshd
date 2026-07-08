@@ -57,9 +57,13 @@ start_service() {
 	# drops. So we render the line by DEFAULT (auto) on every node and let the
 	# kernel FIB be the detector: a node with no WAN uplink exports nothing, a
 	# node plugged into real internet self-elects as a gateway with no flag.
-	#   auto  (default) render the line; WAN presence gates it.
-	#   always           same as auto today (Phase 2 will add uplink-health
-	#                    probing that gates auto but not always).
+	#   auto  (default) advertise egress iff a live WAN uplink is present AND the
+	#                    meshd reachability probe passes (mjolnir-mesh-42j) — a
+	#                    dead/captive lease does NOT become fleet egress. The probe
+	#                    is fail-open (only sustained confirmed failure demotes).
+	#   always           advertise on WAN-uplink presence alone; bypass the probe
+	#                    (MJOLNIR_GATEWAY_NO_PROBE=1) for a working uplink the 204
+	#                    endpoints can't reach (restrictive-but-live networks).
 	#   never | 0        never advertise egress — set on nodes on an untrusted/
 	#                    metered/captive LAN that must not become fleet egress.
 	config_get gateway meshd gateway 'auto'
@@ -83,13 +87,16 @@ start_service() {
 	esac
 	[ -n "$relay" ] && procd_append_param command --relay "$relay"
 	[ "$lan_tunnels" -gt 0 ] && procd_append_param command --lan-tunnels
-	# never/0 opts out; auto/always (the default) render the self-gating line.
+	# never/0 opts out; auto/always render the self-gating line. 'always' also
+	# bypasses the 42j reachability probe via MJOLNIR_GATEWAY_NO_PROBE (set below).
 	case "$gateway" in
 		never|0) ;;
-		*) procd_append_param command --gateway ;;
+		always)  procd_append_param command --gateway; gateway_no_probe=1 ;;
+		*)       procd_append_param command --gateway ;;
 	esac
 
 	procd_set_param env RUST_LOG="$log_level"
+	[ "${gateway_no_probe:-0}" = 1 ] && procd_append_param env MJOLNIR_GATEWAY_NO_PROBE=1
 	# Supervise: restart forever (final 0 = infinite retries) after a 5s settle.
 	procd_set_param respawn 3600 5 0
 	procd_set_param stdout 1
