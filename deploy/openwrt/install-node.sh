@@ -30,7 +30,7 @@ BIN="$DIR/mjolnir-meshd-aarch64"
 # cross-build step.
 HELLO_BIN="$DIR/mjolnir-hello-aarch64"
 STAGE=/root/mjolnir-stage
-PKGS="babeld kmod-tun wpad-mesh-mbedtls wpad-basic-mbedtls"  # basic variant = rollback fuel for the wpad swap
+PKGS="babeld kmod-tun wpad-mesh-mbedtls wpad-basic-mbedtls iperf3"  # basic variant = rollback fuel for the wpad swap; iperf3 = always-on measurement service (81n)
 # Drivers for every supported USB dongle ride along on every node (fleet
 # plug-and-play: a dongle plugged in the FIELD needs no download). The table
 # in files/usr/sbin/mjolnir-dongle is the single source of truth.
@@ -67,6 +67,7 @@ scp -O "$DIR/files/usr/sbin/mjolnir-apply"     "$HOST:$STAGE/mjolnir-apply"
 scp -O "$DIR/files/usr/sbin/mjolnir-dongle"    "$HOST:$STAGE/mjolnir-dongle"
 scp -O "$DIR/files/etc/hotplug.d/usb/70-mjolnir-dongle" "$HOST:$STAGE/hotplug-usb-mjolnir-dongle"
 scp -O "$DIR/files/etc/init.d/mjolnir-hello"   "$HOST:$STAGE/init.d-mjolnir-hello"
+scp -O "$DIR/files/etc/init.d/iperf3-server"   "$HOST:$STAGE/init.d-iperf3-server"
 ssh "$HOST" "chmod +x $STAGE/mjolnir-apply"
 
 # mjolnir-hello binary is OPTIONAL (mjolnir-mesh-eei) — stage it only if a

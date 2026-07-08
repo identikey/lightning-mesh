@@ -231,6 +231,13 @@ if [ -f "$STAGE/mjolnir-dongle" ]; then
 	done
 fi
 
+# 2.6 iperf3 — always-on measurement service (mjolnir-mesh-81n). Non-fatal:
+#     a missing iperf3 package just means no throughput probe on this node.
+if ! pkg_ensure iperf3; then
+	NOTES="$NOTES; WARNING: iperf3 install failed — no on-demand throughput probe on this node"
+	log "WARN: iperf3 install failed"
+fi
+
 # 3. wpad swap (802.11s SAE needs the mesh variant) — the wifi-bouncing step.
 #    Skipped entirely when wpad-mesh is already in place, so re-runs are
 #    non-disruptive. The variants PROVIDE/CONFLICT on `wpad`, so remove must
@@ -274,7 +281,7 @@ if [ -f "$STAGE/mjolnir-hello" ]; then
 fi
 
 # 5. init scripts + helpers (and this applier itself, for future OTA runs).
-for f in mjolnir-meshd mjolnir-babeld mjolnir-hello; do
+for f in mjolnir-meshd mjolnir-babeld mjolnir-hello iperf3-server; do
 	if [ -f "$STAGE/init.d-$f" ]; then
 		cp "$STAGE/init.d-$f" "/etc/init.d/$f" && chmod +x "/etc/init.d/$f" || rollback "installing /etc/init.d/$f failed"
 	fi
@@ -310,6 +317,13 @@ mkdir -p /etc/mjolnir
 /etc/init.d/babeld disable 2>/dev/null; /etc/init.d/babeld stop 2>/dev/null
 /etc/init.d/mjolnir-babeld enable 2>/dev/null
 /etc/init.d/mjolnir-meshd enable 2>/dev/null
+
+# 7.1 iperf3-server: always-on measurement listener (81n). Independent of the
+# mesh daemons — best-effort, never gates the mesh apply.
+if [ -x /usr/bin/iperf3 ]; then
+	/etc/init.d/iperf3-server enable 2>/dev/null
+	/etc/init.d/iperf3-server running 2>/dev/null || /etc/init.d/iperf3-server start 2>/dev/null
+fi
 
 # 7.5 mjolnir-hello (front desk, mjolnir-mesh-eei/4ke): runs wherever the
 #     binary is deployed. mjolnir-apply preserves an existing
