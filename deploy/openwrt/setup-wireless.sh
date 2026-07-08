@@ -162,21 +162,25 @@ if [ -n "$FT_KEY" ] && [ "$CLIENT_ENC" != none ]; then
 	add_ft_wildcard_rxkh clientap
 fi
 
-# --- co-located client AP, concurrent with the mesh-point on the BACKHAUL radio/channel ---
-# (section name 'clientap2g' is legacy — it's the AP that shares the backhaul radio, which
-# is 2.4 GHz in the default layout.) Its reason to exist: when the backhaul is on 2.4 GHz,
+# --- co-located client AP on the BACKHAUL radio/channel (DISABLED by default) ---
+# (section name 'clientap2g' is legacy — it's the AP that would share the backhaul radio,
+# which is 2.4 GHz in the default layout.) Reason it exists: when the backhaul is on 2.4 GHz,
 # the primary client AP is on 5 GHz, and most ESP32s (classic/S2/S3/C3/C6) + cheap IoT are
-# 2.4-GHz-only — the 5 GHz AP alone locks them out, so this fills the gap on the backhaul
-# channel. mt76 runs a mesh-point + AP concurrently on one radio — they share $bh_channel
-# and its airtime (fine for low-bandwidth IoT; steer heavy clients to the primary AP). Same
-# SSID/key as the primary AP so a device roams across bands on one L2. Default WPA2-PSK for
-# max IoT compatibility. (mjolnir-mesh-ab4)
-# NOTE: with BACKHAUL_BAND=5g the primary client AP already sits on 2.4 GHz and covers IoT
-# directly, so this co-located (now 5 GHz) AP is usually redundant — leave it disabled.
+# 2.4-GHz-only — the 5 GHz AP alone locks them out, so this would fill the gap on the
+# backhaul channel with the same SSID/key as the primary AP.
+#
+# WHY IT'S OFF BY DEFAULT (mjolnir-mesh-12y / oaq): mt76 (mt7981/mt7986) CANNOT safely run
+# an 802.11s mesh-point + an AP concurrently on the same radio — bringing up the co-located
+# AP breaks the mesh join. This was field-confirmed; the supported way to serve 2.4 GHz
+# clients on a 2.4-GHz-backhaul node is a USB dongle in the 'ap2g' role (files/usr/sbin/
+# mjolnir-dongle), NOT this co-located vif. (Bead ab4 originally claimed mt76 concurrency
+# works; that was WRONG and is superseded by oaq — see deploy/openwrt/README.md.)
+#
 # The section is rendered UNCONDITIONALLY but disabled unless CLIENT_AP_2G=1 — a disabled
-# wifi-iface creates no vif, so it can't trigger the oaq mesh-join breakage (band-independent:
-# it's concurrent-AP-on-the-mesh-radio, not a 2.4-specific quirk), and enabling in the field
-# is one uci flip instead of a setup-wireless re-run.
+# wifi-iface creates no vif, so it can't trigger the mesh-join breakage. Flipping CLIENT_AP_2G=1
+# is intentionally an explicit opt-in (it will likely break the mesh on mt76); prefer the
+# dongle. With BACKHAUL_BAND=5g the primary client AP already sits on 2.4 GHz and covers IoT
+# directly, so this is redundant anyway.
 uci -q delete wireless.clientap2g || true
 uci set wireless.clientap2g='wifi-iface'
 if [ "$CLIENT_AP_2G" = 1 ]; then

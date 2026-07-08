@@ -173,21 +173,48 @@ fi"
 
 # ---- poll for the result over reconnecting SSH --------------------------------
 # The connection WILL drop if the apply bounces the radio we're riding — that's
-# expected; keep reconnecting until the applier reports, or we give up.
+# expected; keep reconnecting until the applier reports, or we give up. The
+# applier ALWAYS writes $STAGE/result (OK or rolled-back), so an unreadable
+# result means THIS machine can't reach the node yet, NOT that the apply failed
+# (mjolnir-mesh-3wj). Two things bit us in the field: the poll gave up too early,
+# and when the ProxyJump hops through a node that is itself bouncing its wifi,
+# the transit path can stay down PAST the window even though the result exists.
+# Fix: a generous main window, then a longer-timeout GRACE re-read before we ever
+# declare failure.
+read_result() { # $1 = ConnectTimeout secs
+	ssh -o BatchMode=yes -o ConnectTimeout="$1" "$HOST" "cat $STAGE/result 2>/dev/null" 2>/dev/null || true
+}
 echo ">> waiting for result (SSH may drop and reconnect — that's normal in-band)"
-DEADLINE=$(( $(date +%s) + HEALTH_TIMEOUT + 240 ))
+DEADLINE=$(( $(date +%s) + HEALTH_TIMEOUT + 300 ))
 RES=""
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-	RES=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST" "cat $STAGE/result 2>/dev/null" 2>/dev/null || true)
+	RES=$(read_result 5)
 	[ -n "$RES" ] && break
 	sleep 5
 done
 
+# Grace re-read: a leaf/transit node can be slow to rejoin the mesh after its
+# wifi bounce, so the result may only become READABLE now. Keep trying with a
+# longer connect timeout before concluding anything.
+if [ -z "$RES" ]; then
+	echo ">> no result readable after $((HEALTH_TIMEOUT + 300))s — the node may still be"
+	echo ">> rejoining the mesh (transit can lag a wifi bounce). Grace re-read up to 180s..."
+	GRACE_DEADLINE=$(( $(date +%s) + 180 ))
+	while [ "$(date +%s)" -lt "$GRACE_DEADLINE" ]; do
+		RES=$(read_result 10)
+		[ -n "$RES" ] && { echo ">> result readable now — it was just transit lag, not a failure"; break; }
+		sleep 10
+	done
+fi
+
 if [ -z "$RES" ]; then
 	cat <<EOF
->> NO RESULT after $((HEALTH_TIMEOUT + 240))s. The node may still be converging,
-   or it rolled back onto a config this machine can't reach from here.
-   - retry:            ssh $HOST 'cat $STAGE/result; tail -40 $STAGE/apply.log'
+>> STILL NO RESULT after $((HEALTH_TIMEOUT + 480))s. IMPORTANT: the applier writes
+   $STAGE/result even on rollback, so an unreadable result means this machine cannot
+   reach the node yet (transit still down) — it does NOT by itself mean the apply failed.
+   Check the node directly before assuming the worst:
+   - read it:   ssh $HOST 'cat $STAGE/result; tail -40 $STAGE/apply.log'
+                (if it says 'OK: applied', the node is fine — it just rejoined slowly)
    - recovery of last resort: ethernet LAN port, root@192.168.1.1
 EOF
 	exit 1

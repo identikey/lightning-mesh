@@ -60,11 +60,29 @@ while IFS='|' read -r -u3 name addr node_id model notes; do
 	fi
 
 	if ! "$DIR/install-node.sh" "${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}" "root@$addr"; then
-		echo
-		echo ">> ROLLOUT HALTED at $name — the node rolled back (or FAILED with nothing"
-		echo ">> changed). Inspect:  ssh root@$addr 'cat /root/mjolnir-stage/apply.log'"
-		echo ">> Already updated this run: ${UPDATED[*]:-none}. Re-running is safe (idempotent)."
-		exit 1
+		# install-node couldn't READ the result in time — but the applier writes
+		# it even on rollback, and a bouncing transit path (ProxyJump through a
+		# wifi-reloading node) can outlast the read window on a node that actually
+		# applied fine (mjolnir-mesh-3wj). Before halting the whole rollout, do one
+		# final direct read once the node has had a moment to settle: if it says
+		# OK, the apply stuck — continue instead of stranding downstream nodes.
+		sleep 15
+		final=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "root@$addr" \
+			"cat /root/mjolnir-stage/result 2>/dev/null" 2>/dev/null || true)
+		case "$final" in
+			OK*)
+				echo ">> $name: install-node timed out reading the result, but the node"
+				echo ">> reports '$final' — apply stuck (slow rejoin). Continuing."
+				;;
+			*)
+				echo
+				echo ">> ROLLOUT HALTED at $name — result='${final:-<unreadable>}'. If unreadable,"
+				echo ">> the node may just be slow to rejoin; verify directly before assuming failure:"
+				echo ">>   ssh root@$addr 'cat /root/mjolnir-stage/result; tail -40 /root/mjolnir-stage/apply.log'"
+				echo ">> Already updated this run: ${UPDATED[*]:-none}. Re-running is safe (idempotent)."
+				exit 1
+				;;
+		esac
 	fi
 
 	# Post-check beyond the node's own health gate: it still routes the mesh.
