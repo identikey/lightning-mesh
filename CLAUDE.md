@@ -60,6 +60,25 @@ cargo clippy
 deploy/openwrt/build.sh          # cross-build static aarch64 mjolnir-meshd for routers
 ```
 
+## Deploy (hello.mesh / fleet)
+
+```bash
+deploy/openwrt/build-hello.sh    # web build → embed → cross-build (ORDER MATTERS:
+                                 # rust-embed bakes crates/mjolnir-hello/static/ into
+                                 # the binary; stale static/ = stale UI shipped)
+deploy/openwrt/update-fleet.sh   # sequential health-gated rollout over fleet-nodes.conf
+                                 # (leaf-first, wired jump node last; halts on failure;
+                                 # unchanged binaries are not restarted)
+```
+
+Facts that have bitten before:
+- `mjolnir-hello` binds each node's **LAN address** (`10.42.<x>.1:80`), NOT the
+  overlay `10.254.x` — post-deploy HTTP checks (`/api/health`, `/api/radio`)
+  must hit LAN gateways, which are routed mesh-wide. SSH stays on overlay addrs.
+- The web TopologyPanel fetches neighbors' `/api/radio` at their subnet-derived
+  LAN gateway (CORS is enabled on GET `/api/*` for this).
+- Don't deploy from a dirty tree in `hello-mesh-web/` or `crates/`.
+
 ## Architecture Overview
 
 A decentralized router mesh: symmetric, non-authoritative nodes; **the L3
