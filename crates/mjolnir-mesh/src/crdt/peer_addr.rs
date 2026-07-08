@@ -39,7 +39,12 @@ impl PeerAddrEntry {
     ) -> Self {
         direct_addrs.sort_by_key(|a| a.to_string());
         direct_addrs.dedup();
-        Self { node_id, direct_addrs, relay_url, announced_at }
+        Self {
+            node_id,
+            direct_addrs,
+            relay_url,
+            announced_at,
+        }
     }
 }
 
@@ -96,9 +101,10 @@ mod tests {
     fn postcard_roundtrip_ipv6_addr() {
         let original = PeerAddrEntry {
             node_id: "cafebabe".repeat(8),
-            direct_addrs: vec![
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 7000),
-            ],
+            direct_addrs: vec![SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                7000,
+            )],
             relay_url: None,
             announced_at: hlc(1_700_000_003_000, 0, "cafebabe"),
         };

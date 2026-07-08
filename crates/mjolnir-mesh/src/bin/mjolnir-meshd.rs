@@ -22,33 +22,32 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use ipnet::{IpNet, Ipv4Net};
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::endpoint::presets;
 use iroh::endpoint::Connection;
-use iroh_mdns_address_lookup::MdnsAddressLookup;
+use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::{Gossip, TopicId};
-use mjolnir_mesh::tun::{
-    classify, spawn_overlay_tun, spawn_tunnel, DatagramConn, EncapError, Fib, OverlayDest, Tunnel,
-    UnicastRouter, OVERLAY_IFACE, TUNNEL_MTU,
-};
+use iroh_mdns_address_lookup::MdnsAddressLookup;
+use mjolnir_mesh::GossipMessage;
 use mjolnir_mesh::babel::{
-    render_babeld_conf, render_overlay_babeld_conf, write_atomic_if_changed, BabelConfigInputs,
-    OverlayRtt,
-};
-use mjolnir_mesh::{
-    alloc, apply_service_publish_v2_tracking_loss, apply_service_unpublish_v2, device_service_key,
-    merge_peer_addr, parse_host_mac,
-    merge_service, merge_subnet_claim, merge_user, publish_service_v2, AddrBook, GossipError,
-    GossipSync, GossipTransport, LivenessTracker, LostNameMap, MergeResult, PeerAddrEntry,
-    PeerEntry, PeerRoster,
-    PublishOutcome, ServiceBook, ServiceBookV2, ServiceEntry, ServiceEntryV2, ServicePublishError,
-    ServiceTombstone, ServiceTombstoneBook, SubnetClaim, UnpublishOutcome, UserBook, UserEntry,
-    HLC,
+    BabelConfigInputs, OverlayRtt, render_babeld_conf, render_overlay_babeld_conf,
+    write_atomic_if_changed,
 };
 use mjolnir_mesh::bootstrap::rank_bootstrap_candidates;
-use mjolnir_mesh::GossipMessage;
+use mjolnir_mesh::tun::{
+    DatagramConn, EncapError, Fib, OVERLAY_IFACE, OverlayDest, TUNNEL_MTU, Tunnel, UnicastRouter,
+    classify, spawn_overlay_tun, spawn_tunnel,
+};
+use mjolnir_mesh::{
+    AddrBook, GossipError, GossipSync, GossipTransport, HLC, LivenessTracker, LostNameMap,
+    MergeResult, PeerAddrEntry, PeerEntry, PeerRoster, PublishOutcome, ServiceBook, ServiceBookV2,
+    ServiceEntry, ServiceEntryV2, ServicePublishError, ServiceTombstone, ServiceTombstoneBook,
+    SubnetClaim, UnpublishOutcome, UserBook, UserEntry, alloc,
+    apply_service_publish_v2_tracking_loss, apply_service_unpublish_v2, device_service_key,
+    merge_peer_addr, merge_service, merge_subnet_claim, merge_user, parse_host_mac,
+    publish_service_v2,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -338,7 +337,14 @@ async fn main() -> Result<()> {
 
     // publish/unpublish are thin HTTP clients of the running daemon's control
     // API (S3.2, bead e21.2.6) — no iroh endpoint, no CRDT access here.
-    if let Command::Publish { name, port, ip, mac, txt } = &cli.command {
+    if let Command::Publish {
+        name,
+        port,
+        ip,
+        mac,
+        txt,
+    } = &cli.command
+    {
         return run_publish_cli(name, *port, *ip, mac.as_deref(), txt).await;
     }
     if let Command::Unpublish { name, device } = &cli.command {
@@ -403,7 +409,10 @@ async fn main() -> Result<()> {
             // address (backhaul_addr + MESH_IROH_PORT), no mDNS needed (0yb.1).
             // `backhaul_ip` is claim-aware (pt9): a collision loser binds its
             // re-derived address, and peers learn it from the gossiped claim.
-            Some(SocketAddr::new(std::net::IpAddr::V4(backhaul_ip), MESH_IROH_PORT))
+            Some(SocketAddr::new(
+                std::net::IpAddr::V4(backhaul_ip),
+                MESH_IROH_PORT,
+            ))
         }
         None => None,
     };
@@ -620,8 +629,10 @@ async fn gossip_rejoin_loop(
         };
         // Parse id strings back into EndpointIds; skip any that don't (a
         // corrupt persisted id should not abort the whole rejoin).
-        let peers: Vec<EndpointId> =
-            candidate_ids.iter().filter_map(|s| s.parse::<EndpointId>().ok()).collect();
+        let peers: Vec<EndpointId> = candidate_ids
+            .iter()
+            .filter_map(|s| s.parse::<EndpointId>().ok())
+            .collect();
         if peers.is_empty() {
             // Nothing to dial yet (factory-fresh disk, empty roster): back off
             // and re-check — the address book may fill from mDNS/derivation.
@@ -629,7 +640,10 @@ async fn gossip_rejoin_loop(
             backoff = (backoff * 2).min(max_backoff);
             continue;
         }
-        info!(peers = peers.len(), "gossip: no neighbors — (re)joining bootstrap union (f8b)");
+        info!(
+            peers = peers.len(),
+            "gossip: no neighbors — (re)joining bootstrap union (f8b)"
+        );
         if let Err(e) = sender.join_peers(peers).await {
             warn!("gossip: join_peers failed: {e}");
         }
@@ -662,7 +676,9 @@ async fn run_tun_listen(endpoint: Endpoint, no_relay: bool) -> Result<()> {
         .accept(TUN_ALPN, TunnelHandler { self_id, registry })
         .spawn();
 
-    tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl-C")?;
     router.shutdown().await.context("router shutdown")?;
     Ok(())
 }
@@ -707,7 +723,9 @@ async fn run_tun_connect(endpoint: Endpoint, addr_blob: &str) -> Result<()> {
     probe_peer(peer_addr, direct).await;
 
     info!("tunnel established; holding open (Ctrl-C to exit)");
-    tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl-C")?;
     drop(tunnel);
     Ok(())
 }
@@ -786,7 +804,9 @@ async fn run_mesh(
     // service table (e21.1.3), which reads straight from `service_book_v2`.
     let dns_table: Arc<dyn mjolnir_mesh::dns_responder::NameTable> =
         Arc::new(mjolnir_mesh::dns_responder::CompositeTable::new(vec![
-            Arc::new(mjolnir_mesh::dns_responder::WellKnownTable::new(gateway_handle.clone())),
+            Arc::new(mjolnir_mesh::dns_responder::WellKnownTable::new(
+                gateway_handle.clone(),
+            )),
             Arc::new(mjolnir_mesh::dns_responder::ServiceTable::with_liveness(
                 service_book_v2.clone(),
                 liveness.clone(),
@@ -838,8 +858,8 @@ async fn run_mesh(
     let mut peer_entries: Vec<PeerEntry> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     if let Some(path) = roster_path.as_deref() {
-        let roster = PeerRoster::load(path)
-            .with_context(|| format!("loading roster {}", path.display()))?;
+        let roster =
+            PeerRoster::load(path).with_context(|| format!("loading roster {}", path.display()))?;
         for e in roster.peers() {
             if seen.insert(e.token.clone()) {
                 peer_entries.push(e.clone());
@@ -890,7 +910,12 @@ async fn run_mesh(
             fib,
             conns: conns.clone(),
         };
-        tokio::spawn(overlay_reader(reader, conns.clone(), router, TUNNEL_MTU as usize));
+        tokio::spawn(overlay_reader(
+            reader,
+            conns.clone(),
+            router,
+            TUNNEL_MTU as usize,
+        ));
 
         Some((conns, inbound_tx))
     } else {
@@ -1045,54 +1070,52 @@ async fn run_mesh(
             None
         }
     };
-    let (gossip_dispatch, claim_task, anti_entropy_task, rejoin_task, control_api_task) = match gossip
-        .subscribe(mesh_topic_id(), bootstrap.clone())
-        .await
-    {
-        Ok(topic) => {
-            let (sender, receiver) = topic.split();
-            // Neighbor count: fed by the dispatch loop's NeighborUp/Down
-            // events; gates the first claim and drives the rejoin loop (eon).
-            let (neighbors_tx, neigh_rx) = tokio::sync::watch::channel(0usize);
-            let rejoin = tokio::spawn(gossip_rejoin_loop(
-                sender.clone(),
-                bootstrap,
-                addr_book.clone(),
-                claims.clone(),
-                liveness.clone(),
-                self_id_str.clone(),
-                neigh_rx.clone(),
-            ));
-            let sync = Arc::new(GossipSync::new(IrohGossipTransport {
-                sender,
-                receiver: tokio::sync::Mutex::new(receiver),
-                neighbors_tx,
-            }));
-            info!("gossip topic subscribed; joining swarm in background");
+    let (gossip_dispatch, claim_task, anti_entropy_task, rejoin_task, control_api_task) =
+        match gossip.subscribe(mesh_topic_id(), bootstrap.clone()).await {
+            Ok(topic) => {
+                let (sender, receiver) = topic.split();
+                // Neighbor count: fed by the dispatch loop's NeighborUp/Down
+                // events; gates the first claim and drives the rejoin loop (eon).
+                let (neighbors_tx, neigh_rx) = tokio::sync::watch::channel(0usize);
+                let rejoin = tokio::spawn(gossip_rejoin_loop(
+                    sender.clone(),
+                    bootstrap,
+                    addr_book.clone(),
+                    claims.clone(),
+                    liveness.clone(),
+                    self_id_str.clone(),
+                    neigh_rx.clone(),
+                ));
+                let sync = Arc::new(GossipSync::new(IrohGossipTransport {
+                    sender,
+                    receiver: tokio::sync::Mutex::new(receiver),
+                    neighbors_tx,
+                }));
+                info!("gossip topic subscribed; joining swarm in background");
 
-            // Signalled by the apply loop when a conflict costs us our claim;
-            // carries the lost /24 so the claim manager can retract its address.
-            let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::unbounded_channel::<Ipv4Net>();
+                // Signalled by the apply loop when a conflict costs us our claim;
+                // carries the lost /24 so the claim manager can retract its address.
+                let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::unbounded_channel::<Ipv4Net>();
 
-            let dispatch = {
-                let sync = sync.clone();
-                let store = claims.clone();
-                let me = self_id_str.clone();
-                let claims_path = claims_file.clone();
-                let book = addr_book.clone();
-                let book_path = addr_book_file.clone();
-                let lookup = addr_lookup.clone();
-                let user_book = user_book.clone();
-                let user_book_path = user_book_file.clone();
-                let service_book = service_book.clone();
-                let service_book_path = service_book_file.clone();
-                let service_book_v2 = service_book_v2.clone();
-                let service_tombstones_v2 = service_tombstones_v2.clone();
-                let lost_names_v2 = lost_names_v2.clone();
-                let service_book_v2_persist_path = service_book_v2_file.clone();
-                let liveness = liveness.clone();
-                tokio::spawn(async move {
-                    let result = sync
+                let dispatch = {
+                    let sync = sync.clone();
+                    let store = claims.clone();
+                    let me = self_id_str.clone();
+                    let claims_path = claims_file.clone();
+                    let book = addr_book.clone();
+                    let book_path = addr_book_file.clone();
+                    let lookup = addr_lookup.clone();
+                    let user_book = user_book.clone();
+                    let user_book_path = user_book_file.clone();
+                    let service_book = service_book.clone();
+                    let service_book_path = service_book_file.clone();
+                    let service_book_v2 = service_book_v2.clone();
+                    let service_tombstones_v2 = service_tombstones_v2.clone();
+                    let lost_names_v2 = lost_names_v2.clone();
+                    let service_book_v2_persist_path = service_book_v2_file.clone();
+                    let liveness = liveness.clone();
+                    tokio::spawn(async move {
+                        let result = sync
                         .run(move |msg| {
                             // Liveness beacon (e21.9): purely refresh the
                             // in-memory tracker — never merged, never persisted.
@@ -1250,122 +1273,143 @@ async fn run_mesh(
                             }
                         })
                         .await;
-                    if let Err(e) = result {
-                        warn!("gossip dispatch loop ended: {e}");
-                    }
-                })
-            };
-
-            let claim = {
-                let sync = sync.clone();
-                let store = claims.clone();
-                let me = self_id_str.clone();
-                let neigh_rx = neigh_rx.clone();
-                let claims_path = claims_file.clone();
-                let gateway = gateway_handle.clone();
-                tokio::spawn(async move {
-                    claim_manager(
-                        sync,
-                        store,
-                        me,
-                        client_iface,
-                        backhaul_ip,
-                        claims_path,
-                        reclaim_rx,
-                        neigh_rx,
-                        gateway,
-                    )
-                    .await
-                })
-            };
-
-            // Anti-entropy (mjolnir-mesh-s9v, part 1 of 5r0): periodically re-broadcast
-            // the FULL known claim map (not just our own claim — that weaker form is
-            // `claim_and_publish` above) and persist it to disk. Fixes late-joiner /
-            // dropped-packet / restart convergence cheaply since the map is tiny.
-            let anti_entropy = {
-                let sync = sync.clone();
-                let store = claims.clone();
-                let path = claims_file.clone();
-                let book = addr_book.clone();
-                let book_path = addr_book_file.clone();
-                let users = user_book.clone();
-                let users_path = user_book_file.clone();
-                let users_seed = user_seed_file.clone();
-                let services = service_book.clone();
-                let services_path = service_book_file.clone();
-                let services_v2 = service_book_v2.clone();
-                let tombstones_v2 = service_tombstones_v2.clone();
-                let lost_names_v2 = lost_names_v2.clone();
-                let services_v2_path = service_book_v2_file.clone();
-                let directory_path = directory_file.clone();
-                let spool_path = spool_dir.clone();
-                let liveness = liveness.clone();
-                let announce = SelfAnnounce {
-                    endpoint: endpoint.clone(),
-                    self_id: self_id_str.clone(),
-                    backhaul_ip,
-                    no_relay,
+                        if let Err(e) = result {
+                            warn!("gossip dispatch loop ended: {e}");
+                        }
+                    })
                 };
-                tokio::spawn(async move {
-                    anti_entropy_loop(
-                        sync, store, path, book, book_path, users, users_path, users_seed,
-                        services, services_path, services_v2, tombstones_v2, lost_names_v2,
-                        services_v2_path, directory_path, spool_path, announce, liveness,
-                        boot_incarnation,
+
+                let claim = {
+                    let sync = sync.clone();
+                    let store = claims.clone();
+                    let me = self_id_str.clone();
+                    let neigh_rx = neigh_rx.clone();
+                    let claims_path = claims_file.clone();
+                    let gateway = gateway_handle.clone();
+                    tokio::spawn(async move {
+                        claim_manager(
+                            sync,
+                            store,
+                            me,
+                            client_iface,
+                            backhaul_ip,
+                            claims_path,
+                            reclaim_rx,
+                            neigh_rx,
+                            gateway,
+                        )
+                        .await
+                    })
+                };
+
+                // Anti-entropy (mjolnir-mesh-s9v, part 1 of 5r0): periodically re-broadcast
+                // the FULL known claim map (not just our own claim — that weaker form is
+                // `claim_and_publish` above) and persist it to disk. Fixes late-joiner /
+                // dropped-packet / restart convergence cheaply since the map is tiny.
+                let anti_entropy = {
+                    let sync = sync.clone();
+                    let store = claims.clone();
+                    let path = claims_file.clone();
+                    let book = addr_book.clone();
+                    let book_path = addr_book_file.clone();
+                    let users = user_book.clone();
+                    let users_path = user_book_file.clone();
+                    let users_seed = user_seed_file.clone();
+                    let services = service_book.clone();
+                    let services_path = service_book_file.clone();
+                    let services_v2 = service_book_v2.clone();
+                    let tombstones_v2 = service_tombstones_v2.clone();
+                    let lost_names_v2 = lost_names_v2.clone();
+                    let services_v2_path = service_book_v2_file.clone();
+                    let directory_path = directory_file.clone();
+                    let spool_path = spool_dir.clone();
+                    let liveness = liveness.clone();
+                    let announce = SelfAnnounce {
+                        endpoint: endpoint.clone(),
+                        self_id: self_id_str.clone(),
+                        backhaul_ip,
+                        no_relay,
+                    };
+                    tokio::spawn(async move {
+                        anti_entropy_loop(
+                            sync,
+                            store,
+                            path,
+                            book,
+                            book_path,
+                            users,
+                            users_path,
+                            users_seed,
+                            services,
+                            services_path,
+                            services_v2,
+                            tombstones_v2,
+                            lost_names_v2,
+                            services_v2_path,
+                            directory_path,
+                            spool_path,
+                            announce,
+                            liveness,
+                            boot_incarnation,
+                        )
+                        .await
+                    })
+                };
+
+                // Control API (S3.1, bead e21.2.5): needs `sync` for the immediate
+                // publish/unpublish gossip broadcast (FR25), so — like the tasks
+                // above — it's only started once gossip subscribe succeeds. A
+                // bind failure (port already in use) is logged and non-fatal:
+                // the mesh runs fine without the control plane, same as a failed
+                // babeld reconcile.
+                let control_api = {
+                    let sync = sync.clone();
+                    let service_book_v2 = service_book_v2.clone();
+                    let service_tombstones_v2 = service_tombstones_v2.clone();
+                    let lost_names_v2 = lost_names_v2.clone();
+                    let service_book_v2_file = service_book_v2_file.clone();
+                    let self_id = self_id_str.clone();
+                    let gateway = gateway_handle.clone();
+                    let claims = claims.clone();
+                    let addr_book = addr_book.clone();
+                    let user_book = user_book.clone();
+                    match control_api_start(
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), CONTROL_API_PORT),
+                        sync,
+                        service_book_v2,
+                        service_tombstones_v2,
+                        lost_names_v2,
+                        service_book_v2_file,
+                        self_id,
+                        gateway,
+                        claims,
+                        addr_book,
+                        user_book,
+                        backhaul_ip,
                     )
                     .await
-                })
-            };
-
-            // Control API (S3.1, bead e21.2.5): needs `sync` for the immediate
-            // publish/unpublish gossip broadcast (FR25), so — like the tasks
-            // above — it's only started once gossip subscribe succeeds. A
-            // bind failure (port already in use) is logged and non-fatal:
-            // the mesh runs fine without the control plane, same as a failed
-            // babeld reconcile.
-            let control_api = {
-                let sync = sync.clone();
-                let service_book_v2 = service_book_v2.clone();
-                let service_tombstones_v2 = service_tombstones_v2.clone();
-                let lost_names_v2 = lost_names_v2.clone();
-                let service_book_v2_file = service_book_v2_file.clone();
-                let self_id = self_id_str.clone();
-                let gateway = gateway_handle.clone();
-                let claims = claims.clone();
-                let addr_book = addr_book.clone();
-                let user_book = user_book.clone();
-                match control_api_start(
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), CONTROL_API_PORT),
-                    sync,
-                    service_book_v2,
-                    service_tombstones_v2,
-                    lost_names_v2,
-                    service_book_v2_file,
-                    self_id,
-                    gateway,
-                    claims,
-                    addr_book,
-                    user_book,
-                    backhaul_ip,
-                )
-                .await
-                {
-                    Ok((_, handle)) => Some(handle),
-                    Err(e) => {
-                        warn!("control API failed to bind 127.0.0.1:{CONTROL_API_PORT}: {e}");
-                        None
+                    {
+                        Ok((_, handle)) => Some(handle),
+                        Err(e) => {
+                            warn!("control API failed to bind 127.0.0.1:{CONTROL_API_PORT}: {e}");
+                            None
+                        }
                     }
-                }
-            };
+                };
 
-            (Some(dispatch), Some(claim), Some(anti_entropy), Some(rejoin), control_api)
-        }
-        Err(e) => {
-            warn!("gossip subscribe failed: {e}; continuing without CRDT overlay");
-            (None, None, None, None, None)
-        }
-    };
+                (
+                    Some(dispatch),
+                    Some(claim),
+                    Some(anti_entropy),
+                    Some(rejoin),
+                    control_api,
+                )
+            }
+            Err(e) => {
+                warn!("gossip subscribe failed: {e}; continuing without CRDT overlay");
+                (None, None, None, None, None)
+            }
+        };
 
     // babeld config reconciler (mjolnir-mesh-83k / m8t): regenerates babeld.conf
     // from the live tunnel set (TunnelRegistry) plus our subnet claim (ClaimStore)
@@ -1377,15 +1421,17 @@ async fn run_mesh(
         // per-peer interfaces means the config never churns (qz9 by construction).
         let claims = claims.clone();
         let me = self_id_str.clone();
-        tokio::spawn(async move { babel_reconciler_overlay(claims, me, babel_config, gateway).await })
+        tokio::spawn(
+            async move { babel_reconciler_overlay(claims, me, babel_config, gateway).await },
+        )
     } else {
         let registry = registry.clone();
         let claims = claims.clone();
         let me = self_id_str.clone();
         let l2 = l2_backhaul.clone();
-        tokio::spawn(
-            async move { babel_reconciler(registry, claims, me, babel_config, l2, gateway).await },
-        )
+        tokio::spawn(async move {
+            babel_reconciler(registry, claims, me, babel_config, l2, gateway).await
+        })
     };
     if let Some(iface) = &l2_backhaul {
         info!(%iface, "LAN mode: routing babel over the shared-L2 backhaul (no per-peer iroh tunnels)");
@@ -1412,7 +1458,9 @@ async fn run_mesh(
         info!("LAN mode: not dialing per-peer iroh tunnels — babel routes over the shared L2");
     } else {
         if lan && lan_tunnels {
-            info!("LAN mode: per-peer iroh tunnels ENABLED (--lan-tunnels; mjolnir-mesh-auu retest)");
+            info!(
+                "LAN mode: per-peer iroh tunnels ENABLED (--lan-tunnels; mjolnir-mesh-auu retest)"
+            );
         }
         for entry in &peer_entries {
             let addr = match parse_peer(&entry.token) {
@@ -1464,9 +1512,14 @@ async fn run_mesh(
             }
         }
     }
-    info!(dialing = dialers.len(), "mesh up — holding (Ctrl-C to exit)");
+    info!(
+        dialing = dialers.len(),
+        "mesh up — holding (Ctrl-C to exit)"
+    );
 
-    tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl-C")?;
     info!("shutting down mesh");
     for d in &dialers {
         d.abort();
@@ -1606,8 +1659,7 @@ fn apply_subnet_message(
                 }
                 MergeResult::Unchanged => None,
                 MergeResult::Conflict { winner, loser } => {
-                    let we_lost =
-                        loser.owner_node_id == self_id && winner.owner_node_id != self_id;
+                    let we_lost = loser.owner_node_id == self_id && winner.owner_node_id != self_id;
                     let lost = match (we_lost, loser.cidr) {
                         (true, IpNet::V4(n)) => Some(n),
                         _ => None,
@@ -2281,9 +2333,19 @@ fn snapshot_service_state_v2(
     lost_names: &Arc<Mutex<LostNameMap>>,
 ) -> ServiceStateV2 {
     let book = book.lock().expect("v2 service book poisoned").clone();
-    let tombstones = tombstones.lock().expect("v2 service tombstones poisoned").clone();
-    let lost_names = lost_names.lock().expect("v2 service lost-names poisoned").clone();
-    ServiceStateV2 { book, tombstones, lost_names }
+    let tombstones = tombstones
+        .lock()
+        .expect("v2 service tombstones poisoned")
+        .clone();
+    let lost_names = lost_names
+        .lock()
+        .expect("v2 service lost-names poisoned")
+        .clone();
+    ServiceStateV2 {
+        book,
+        tombstones,
+        lost_names,
+    }
 }
 
 /// Schema version for the `directory.json` projection (bead avs). Bump this
@@ -2546,7 +2608,10 @@ fn write_directory_projection(
     let claims_snapshot = claims.lock().expect("claim store poisoned").clone();
     let addr_snapshot = addr_book.lock().expect("address book poisoned").clone();
     let user_snapshot = user_book.lock().expect("user directory poisoned").clone();
-    let service_snapshot = service_book.lock().expect("service directory poisoned").clone();
+    let service_snapshot = service_book
+        .lock()
+        .expect("service directory poisoned")
+        .clone();
     let snapshot = build_directory_snapshot(
         &claims_snapshot,
         &addr_snapshot,
@@ -2929,7 +2994,10 @@ async fn anti_entropy_loop<T: GossipTransport>(
                 warn!(%cidr, "anti-entropy: re-broadcast failed: {e}");
             }
         }
-        info!(count = snapshot.len(), "anti-entropy: re-broadcast full claim map");
+        info!(
+            count = snapshot.len(),
+            "anti-entropy: re-broadcast full claim map"
+        );
         persist_claims(&snapshot, &claims_file);
         // Re-announce our own address and re-broadcast the full address book
         // alongside the claim map, on the same cadence (0yb).
@@ -3042,7 +3110,9 @@ fn sweep_stale_lanes(
     // (the DNS read filter follows the same discipline).
     let entries: Vec<(String, String)> = {
         let book = service_book_v2.lock().expect("v2 service book poisoned");
-        book.iter().map(|(n, e)| (n.clone(), e.owner_node_id.clone())).collect()
+        book.iter()
+            .map(|(n, e)| (n.clone(), e.owner_node_id.clone()))
+            .collect()
     };
     let expired: Vec<String> = {
         let tracker = liveness.lock().expect("liveness tracker poisoned");
@@ -3058,12 +3128,17 @@ fn sweep_stale_lanes(
             book.remove(name);
         }
         changed = true;
-        info!(count = expired.len(), "e21.9 sweep: hard-expired long-silent service entries");
+        info!(
+            count = expired.len(),
+            "e21.9 sweep: hard-expired long-silent service entries"
+        );
     }
 
     // 2. Tombstone GC with lazy first-seen stamping.
     {
-        let mut tombstones = service_tombstones_v2.lock().expect("v2 service tombstones poisoned");
+        let mut tombstones = service_tombstones_v2
+            .lock()
+            .expect("v2 service tombstones poisoned");
         for name in tombstones.keys() {
             tombstone_observed.entry(name.clone()).or_insert(now_ms);
         }
@@ -3082,7 +3157,10 @@ fn sweep_stale_lanes(
         tombstone_observed.retain(|name, _| tombstones.contains_key(name));
         if !gc.is_empty() {
             changed = true;
-            info!(count = gc.len(), "e21.9 sweep: GC'd aged unpublish tombstones");
+            info!(
+                count = gc.len(),
+                "e21.9 sweep: GC'd aged unpublish tombstones"
+            );
         }
     }
 
@@ -3121,7 +3199,12 @@ fn build_self_addr_entry(ctx: &SelfAnnounce) -> PeerAddrEntry {
     } else {
         observed.relay_urls().next().map(|u| u.to_string())
     };
-    PeerAddrEntry::new(ctx.self_id.clone(), direct, relay_url, now_hlc(&ctx.self_id))
+    PeerAddrEntry::new(
+        ctx.self_id.clone(),
+        direct,
+        relay_url,
+        now_hlc(&ctx.self_id),
+    )
 }
 
 /// Refresh this node's own entry (fresh HLC), then re-broadcast the FULL known
@@ -3153,7 +3236,10 @@ async fn announce_addr_book<T: GossipTransport>(
             warn!(%node_id, "addrbook anti-entropy: re-broadcast failed: {e}");
         }
     }
-    info!(count = snapshot.len(), "addrbook anti-entropy: re-broadcast full address book");
+    info!(
+        count = snapshot.len(),
+        "addrbook anti-entropy: re-broadcast full address book"
+    );
     persist_addr_book(&snapshot, addr_book_file);
 }
 
@@ -3196,7 +3282,10 @@ async fn announce_user_book<T: GossipTransport>(
             warn!(%username, "user anti-entropy: re-broadcast failed: {e}");
         }
     }
-    info!(count = snapshot.len(), "user anti-entropy: re-broadcast full user directory");
+    info!(
+        count = snapshot.len(),
+        "user anti-entropy: re-broadcast full user directory"
+    );
     persist_user_book(&snapshot, user_book_file);
 }
 
@@ -3211,7 +3300,10 @@ async fn announce_service_book<T: GossipTransport>(
     service_book: &Arc<Mutex<ServiceBook>>,
     service_book_file: &Path,
 ) {
-    let snapshot = service_book.lock().expect("service directory poisoned").clone();
+    let snapshot = service_book
+        .lock()
+        .expect("service directory poisoned")
+        .clone();
     for (name, entry) in &snapshot {
         if let Err(e) = sync
             .publish(GossipMessage::ServiceUpdate {
@@ -3223,7 +3315,10 @@ async fn announce_service_book<T: GossipTransport>(
             warn!(%name, "service anti-entropy: re-broadcast failed: {e}");
         }
     }
-    info!(count = snapshot.len(), "service anti-entropy: re-broadcast full service directory");
+    info!(
+        count = snapshot.len(),
+        "service anti-entropy: re-broadcast full service directory"
+    );
     persist_service_book(&snapshot, service_book_file);
 }
 
@@ -3251,8 +3346,12 @@ async fn announce_service_book_v2<T: GossipTransport>(
 ) {
     let (own_entries, own_tombstones, snapshot) = {
         let book = service_book_v2.lock().expect("v2 service book poisoned");
-        let tombstones = service_tombstones_v2.lock().expect("v2 service tombstones poisoned");
-        let lost_names = lost_names_v2.lock().expect("v2 service lost-names poisoned");
+        let tombstones = service_tombstones_v2
+            .lock()
+            .expect("v2 service tombstones poisoned");
+        let lost_names = lost_names_v2
+            .lock()
+            .expect("v2 service lost-names poisoned");
         let own_entries: Vec<(String, ServiceEntryV2)> = book
             .iter()
             .filter(|(_, entry)| entry.owner_node_id == self_id)
@@ -3263,13 +3362,19 @@ async fn announce_service_book_v2<T: GossipTransport>(
             .filter(|(_, tombstone)| tombstone.owner_node_id == self_id)
             .map(|(name, tombstone)| (name.clone(), tombstone.clone()))
             .collect();
-        let snapshot =
-            ServiceStateV2 { book: book.clone(), tombstones: tombstones.clone(), lost_names: lost_names.clone() };
+        let snapshot = ServiceStateV2 {
+            book: book.clone(),
+            tombstones: tombstones.clone(),
+            lost_names: lost_names.clone(),
+        };
         (own_entries, own_tombstones, snapshot)
     };
     for (name, entry) in &own_entries {
         if let Err(e) = sync
-            .publish(GossipMessage::ServicePublishV2 { name: name.clone(), entry: entry.clone() })
+            .publish(GossipMessage::ServicePublishV2 {
+                name: name.clone(),
+                entry: entry.clone(),
+            })
             .await
         {
             warn!(%name, "v2 service anti-entropy: re-broadcast publish failed: {e}");
@@ -3316,16 +3421,32 @@ async fn publish_service<T: GossipTransport>(
 ) -> Result<PublishOutcome, ServicePublishError> {
     let (outcome, snapshot) = {
         let mut book = service_book_v2.lock().expect("v2 service book poisoned");
-        let tombstones = service_tombstones_v2.lock().expect("v2 service tombstones poisoned");
-        let mut lost_names = lost_names_v2.lock().expect("v2 service lost-names poisoned");
-        let outcome =
-            publish_service_v2(&mut book, &tombstones, &mut lost_names, self_id, name, entry.clone())?;
-        let snapshot =
-            ServiceStateV2 { book: book.clone(), tombstones: tombstones.clone(), lost_names: lost_names.clone() };
+        let tombstones = service_tombstones_v2
+            .lock()
+            .expect("v2 service tombstones poisoned");
+        let mut lost_names = lost_names_v2
+            .lock()
+            .expect("v2 service lost-names poisoned");
+        let outcome = publish_service_v2(
+            &mut book,
+            &tombstones,
+            &mut lost_names,
+            self_id,
+            name,
+            entry.clone(),
+        )?;
+        let snapshot = ServiceStateV2 {
+            book: book.clone(),
+            tombstones: tombstones.clone(),
+            lost_names: lost_names.clone(),
+        };
         (outcome, snapshot)
     };
     if let Err(e) = sync
-        .publish(GossipMessage::ServicePublishV2 { name: name.to_string(), entry })
+        .publish(GossipMessage::ServicePublishV2 {
+            name: name.to_string(),
+            entry,
+        })
         .await
     {
         warn!(%name, "local service publish: immediate broadcast failed: {e}");
@@ -3351,11 +3472,24 @@ async fn unpublish_service<T: GossipTransport>(
 ) -> UnpublishOutcome {
     let (outcome, snapshot) = {
         let mut book = service_book_v2.lock().expect("v2 service book poisoned");
-        let mut tombstones = service_tombstones_v2.lock().expect("v2 service tombstones poisoned");
-        let outcome = apply_service_unpublish_v2(&mut book, &mut tombstones, name, owner_node_id, hlc.clone());
-        let lost_names = lost_names_v2.lock().expect("v2 service lost-names poisoned");
-        let snapshot =
-            ServiceStateV2 { book: book.clone(), tombstones: tombstones.clone(), lost_names: lost_names.clone() };
+        let mut tombstones = service_tombstones_v2
+            .lock()
+            .expect("v2 service tombstones poisoned");
+        let outcome = apply_service_unpublish_v2(
+            &mut book,
+            &mut tombstones,
+            name,
+            owner_node_id,
+            hlc.clone(),
+        );
+        let lost_names = lost_names_v2
+            .lock()
+            .expect("v2 service lost-names poisoned");
+        let snapshot = ServiceStateV2 {
+            book: book.clone(),
+            tombstones: tombstones.clone(),
+            lost_names: lost_names.clone(),
+        };
         (outcome, snapshot)
     };
     if let Err(e) = sync
@@ -3440,14 +3574,23 @@ async fn control_api_read_request(
         )));
     }
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().ok_or(ControlApiReadError::Malformed)?.to_string();
-    let path = parts.next().ok_or(ControlApiReadError::Malformed)?.to_string();
+    let method = parts
+        .next()
+        .ok_or(ControlApiReadError::Malformed)?
+        .to_string();
+    let path = parts
+        .next()
+        .ok_or(ControlApiReadError::Malformed)?
+        .to_string();
 
     let mut content_length: usize = 0;
     let mut header_bytes: usize = 0;
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await.map_err(ControlApiReadError::Io)?;
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .map_err(ControlApiReadError::Io)?;
         if n == 0 {
             break; // EOF mid-headers — treat what we have as the full header block.
         }
@@ -3470,7 +3613,10 @@ async fn control_api_read_request(
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body).await.map_err(ControlApiReadError::Io)?;
+        reader
+            .read_exact(&mut body)
+            .await
+            .map_err(ControlApiReadError::Io)?;
     }
     Ok(ControlApiRequest { method, path, body })
 }
@@ -3723,7 +3869,9 @@ async fn control_api_handle_unpublish<T: GossipTransport>(
         hlc,
     )
     .await;
-    let status_json = |status: &str| serde_json::to_vec(&serde_json::json!({ "status": status })).unwrap_or_default();
+    let status_json = |status: &str| {
+        serde_json::to_vec(&serde_json::json!({ "status": status })).unwrap_or_default()
+    };
     match outcome {
         UnpublishOutcome::Unpublished => (200, status_json("unpublished")),
         UnpublishOutcome::TombstoneRecorded => (200, status_json("tombstone_recorded")),
@@ -3748,8 +3896,14 @@ fn control_api_handle_directory(
     let claims_snapshot = claims.lock().expect("claim store poisoned").clone();
     let addr_snapshot = addr_book.lock().expect("address book poisoned").clone();
     let user_snapshot = user_book.lock().expect("user directory poisoned").clone();
-    let service_snapshot = service_book_v2.lock().expect("v2 service book poisoned").clone();
-    let lost_snapshot = lost_names_v2.lock().expect("v2 service lost-names poisoned").clone();
+    let service_snapshot = service_book_v2
+        .lock()
+        .expect("v2 service book poisoned")
+        .clone();
+    let lost_snapshot = lost_names_v2
+        .lock()
+        .expect("v2 service lost-names poisoned")
+        .clone();
     let snapshot = build_directory_snapshot_v2(
         &claims_snapshot,
         &addr_snapshot,
@@ -3870,11 +4024,15 @@ async fn control_api_handle_conn<T: GossipTransport>(
                 )
                 .await
             }
-            Err(ControlApiReadError::BodyTooLarge) => (413, control_api_error_body("body_too_large")),
+            Err(ControlApiReadError::BodyTooLarge) => {
+                (413, control_api_error_body("body_too_large"))
+            }
             Err(ControlApiReadError::HeadersTooLarge) => {
                 (400, control_api_error_body("headers_too_large"))
             }
-            Err(ControlApiReadError::Malformed) => (400, control_api_error_body("malformed_request")),
+            Err(ControlApiReadError::Malformed) => {
+                (400, control_api_error_body("malformed_request"))
+            }
             Err(ControlApiReadError::Io(e)) => {
                 debug!("control API: connection closed before a full request: {e}");
                 return;
@@ -3974,7 +4132,10 @@ async fn control_api_client_request(
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| invalid("control API response had no header/body separator"))?;
     let head = String::from_utf8_lossy(&resp[..split_at]);
-    let status_line = head.lines().next().ok_or_else(|| invalid("control API response had no status line"))?;
+    let status_line = head
+        .lines()
+        .next()
+        .ok_or_else(|| invalid("control API response had no status line"))?;
     let status: u16 = status_line
         .split_whitespace()
         .nth(1)
@@ -4000,14 +4161,21 @@ fn control_api_publish_error_message(name: &str, status: u16, body: &[u8]) -> St
     match err.get("error").and_then(|v| v.as_str()) {
         Some("reserved") => format!("cannot publish '{name}': name is reserved and unclaimable"),
         Some("owned_by_other") => {
-            let winner = err.get("winner_node_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let winner = err
+                .get("winner_node_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             format!("cannot publish '{name}': already owned by node {winner}")
         }
         Some("malformed_body") => format!("cannot publish '{name}': malformed request"),
         Some("invalid_device_name") => {
-            format!("cannot publish '{name}': invalid device host label (use a single DNS label, e.g. `nas`)")
+            format!(
+                "cannot publish '{name}': invalid device host label (use a single DNS label, e.g. `nas`)"
+            )
         }
-        Some("invalid_mac") => format!("cannot publish '{name}': invalid --mac (expected aa:bb:cc:dd:ee:ff)"),
+        Some("invalid_mac") => {
+            format!("cannot publish '{name}': invalid --mac (expected aa:bb:cc:dd:ee:ff)")
+        }
         Some(kind) => format!("cannot publish '{name}': control API returned {status} ({kind})"),
         None => format!("cannot publish '{name}': control API returned {status}"),
     }
@@ -4021,7 +4189,9 @@ fn control_api_unpublish_error_message(name: &str, status: u16, body: &[u8]) -> 
         Some("not_owner") => format!("cannot unpublish '{name}': not owned by this node"),
         Some("malformed_body") => format!("cannot unpublish '{name}': malformed request"),
         Some("invalid_device_name") => {
-            format!("cannot unpublish '{name}': invalid device host label (use a single DNS label, e.g. `nas`)")
+            format!(
+                "cannot unpublish '{name}': invalid device host label (use a single DNS label, e.g. `nas`)"
+            )
         }
         Some(kind) => format!("cannot unpublish '{name}': control API returned {status} ({kind})"),
         None => format!("cannot unpublish '{name}': control API returned {status}"),
@@ -4083,12 +4253,17 @@ async fn run_unpublish_cli(name: &str, device: bool) -> Result<()> {
     match control_api_client_request("POST", "/v0/unpublish", &body).await {
         Ok((200, resp_body)) => {
             let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap_or_default();
-            let status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let status = resp
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             println!("unpublished {name}: {status}");
             Ok(())
         }
         Ok((status, resp_body)) => {
-            anyhow::bail!(control_api_unpublish_error_message(name, status, &resp_body))
+            anyhow::bail!(control_api_unpublish_error_message(
+                name, status, &resp_body
+            ))
         }
         Err(e) => anyhow::bail!(control_api_connection_error_message(&e)),
     }
@@ -4392,7 +4567,9 @@ async fn reconcile_dnsmasq_uci() {
     ) {
         return;
     }
-    info!("reconciling dnsmasq UCI: .mesh forward, DoH canary, option 114, rebind whitelist (FR9-FR14)");
+    info!(
+        "reconciling dnsmasq UCI: .mesh forward, DoH canary, option 114, rebind whitelist (FR9-FR14)"
+    );
     let servers: Vec<&str> = current_server_list.split_whitespace().collect();
     let options: Vec<&str> = current_dhcp_options.split_whitespace().collect();
     let rebinds: Vec<&str> = current_rebind_domains.split_whitespace().collect();
@@ -4423,7 +4600,9 @@ async fn reconcile_dnsmasq_uci() {
     let run = Command::new("sh").args(["-c", &script]).output();
     match tokio::time::timeout(Duration::from_secs(30), run).await {
         Ok(Ok(out)) if out.status.success() => {
-            info!("dnsmasq UCI reconciled — .mesh forward + DoH canary + option 114 + rebind whitelist live")
+            info!(
+                "dnsmasq UCI reconciled — .mesh forward + DoH canary + option 114 + rebind whitelist live"
+            )
         }
         Ok(Ok(out)) => warn!(
             "dnsmasq UCI reconcile failed: {}",
@@ -4575,7 +4754,10 @@ async fn babeld_service(action: &str) -> bool {
             false
         }
         Err(_) => {
-            warn!(action, "mjolnir-babeld action timed out after 10s — leaving it to procd");
+            warn!(
+                action,
+                "mjolnir-babeld action timed out after 10s — leaving it to procd"
+            );
             false
         }
     }
@@ -4613,7 +4795,10 @@ async fn babel_reconciler(
         && !parent.as_os_str().is_empty()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        warn!("could not create babeld config dir {}: {e}", parent.display());
+        warn!(
+            "could not create babeld config dir {}: {e}",
+            parent.display()
+        );
     }
 
     let mut started = false;
@@ -4686,7 +4871,10 @@ async fn babel_reconciler(
                     }
                 }
             }
-            Err(e) => warn!("failed to write babeld config {}: {e}", config_path.display()),
+            Err(e) => warn!(
+                "failed to write babeld config {}: {e}",
+                config_path.display()
+            ),
         }
 
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -4945,7 +5133,12 @@ impl OverlayRouter {
                 // reverse of tun::iface::overlay_link_local.
                 if seg[0] == 0xfe80 {
                     let host = seg[7];
-                    Some(Ipv4Addr::new(10, 254, (host >> 8) as u8, (host & 0xff) as u8))
+                    Some(Ipv4Addr::new(
+                        10,
+                        254,
+                        (host >> 8) as u8,
+                        (host & 0xff) as u8,
+                    ))
                 } else {
                     None
                 }
@@ -5139,7 +5332,10 @@ async fn babel_reconciler_overlay(
         && !parent.as_os_str().is_empty()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        warn!("could not create babeld config dir {}: {e}", parent.display());
+        warn!(
+            "could not create babeld config dir {}: {e}",
+            parent.display()
+        );
     }
     let mut started = false;
     let mut last_rendered: Option<String> = None;
@@ -5169,7 +5365,10 @@ async fn babel_reconciler_overlay(
                     }
                     last_rendered = Some(conf);
                 }
-                Err(e) => warn!("failed to write overlay babeld config {}: {e}", config_path.display()),
+                Err(e) => warn!(
+                    "failed to write overlay babeld config {}: {e}",
+                    config_path.display()
+                ),
             }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -5267,7 +5466,10 @@ async fn probe_peer(peer_ip: Ipv4Addr, direct_path: bool) {
     for i in 1..=5u32 {
         let payload = format!("mjolnir-tun-ping-{i}");
         let start = Instant::now();
-        if let Err(e) = sock.send_to(payload.as_bytes(), (peer_ip, TUN_PROBE_PORT)).await {
+        if let Err(e) = sock
+            .send_to(payload.as_bytes(), (peer_ip, TUN_PROBE_PORT))
+            .await
+        {
             warn!("probe {i} send failed: {e}");
             continue;
         }
@@ -5275,7 +5477,10 @@ async fn probe_peer(peer_ip: Ipv4Addr, direct_path: bool) {
         match tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await {
             Ok(Ok((n, _))) if &buf[..n] == payload.as_bytes() => {
                 ok += 1;
-                println!("tunnel ping {i}: reply from {peer_ip} in {:?}", start.elapsed());
+                println!(
+                    "tunnel ping {i}: reply from {peer_ip} in {:?}",
+                    start.elapsed()
+                );
             }
             Ok(Ok((n, _))) => println!("tunnel ping {i}: unexpected {n}-byte reply"),
             Ok(Err(e)) => warn!("probe {i} recv error: {e}"),
@@ -5283,10 +5488,18 @@ async fn probe_peer(peer_ip: Ipv4Addr, direct_path: bool) {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let path = if direct_path { "direct path" } else { "RELAY-ONLY path (lossy)" };
+    let path = if direct_path {
+        "direct path"
+    } else {
+        "RELAY-ONLY path (lossy)"
+    };
     println!(
         "tunnel reachability: {ok}/5 replies over {path} — {}",
-        if ok > 0 { "DATA PLANE WORKS" } else { "no traffic crossed" }
+        if ok > 0 {
+            "DATA PLANE WORKS"
+        } else {
+            "no traffic crossed"
+        }
     );
 }
 
@@ -5453,7 +5666,11 @@ fn check_reachability(endpoint: &Endpoint, no_relay: bool) {
     let has_nonloopback = ips.iter().any(|ip| !ip.is_loopback());
 
     if has_relay || has_public {
-        info!(relay = has_relay, public_ip = has_public, "reachability OK — peers can connect");
+        info!(
+            relay = has_relay,
+            public_ip = has_public,
+            "reachability OK — peers can connect"
+        );
     } else if no_relay && has_nonloopback {
         warn!(
             "--no-relay: only private/LAN addresses — reachable on the LOCAL network only, \
@@ -5518,7 +5735,9 @@ async fn run_status(secret_file: Option<&std::path::Path>) -> Result<()> {
         println!();
         print_addr_book_status(&addr_book_path(Path::new("/etc/mjolnir/claims.state")));
         println!();
-        print_services_status(&service_book_v2_path(Path::new("/etc/mjolnir/claims.state")));
+        print_services_status(&service_book_v2_path(Path::new(
+            "/etc/mjolnir/claims.state",
+        )));
         return Ok(());
     };
 
@@ -5535,14 +5754,18 @@ async fn run_status(secret_file: Option<&std::path::Path>) -> Result<()> {
     if backhaul == derived {
         println!("  backhaul: {backhaul}/{prefix}  (derived from node id)");
     } else {
-        println!("  backhaul: {backhaul}/{prefix}  (RE-DERIVED after collision, pt9; naive derivation would be {derived})");
+        println!(
+            "  backhaul: {backhaul}/{prefix}  (RE-DERIVED after collision, pt9; naive derivation would be {derived})"
+        );
     }
     println!();
     print_system_status(Some(backhaul)).await;
     println!();
     print_addr_book_status(&addr_book_path(Path::new("/etc/mjolnir/claims.state")));
     println!();
-    print_services_status(&service_book_v2_path(Path::new("/etc/mjolnir/claims.state")));
+    print_services_status(&service_book_v2_path(Path::new(
+        "/etc/mjolnir/claims.state",
+    )));
     Ok(())
 }
 
@@ -5602,7 +5825,10 @@ fn format_services_status(state: &ServiceStateV2) -> Vec<String> {
         for (name, entry) in &state.book {
             lines.push(format!("  {name}"));
             lines.push(format!("    owner: {}", entry.owner_node_id));
-            lines.push(format!("    address: {}:{}/{}", entry.ip, entry.port, entry.protocol));
+            lines.push(format!(
+                "    address: {}:{}/{}",
+                entry.ip, entry.port, entry.protocol
+            ));
         }
     }
 
@@ -5687,7 +5913,9 @@ fn load_secret_readonly(path: &Path) -> Result<Option<SecretKey>> {
         return Ok(Some(parse_secret_hex(hex.trim())?));
     }
     if let Ok(env) = std::env::var("IROH_SECRET") {
-        return Ok(Some(env.parse::<SecretKey>().context("parsing IROH_SECRET")?));
+        return Ok(Some(
+            env.parse::<SecretKey>().context("parsing IROH_SECRET")?,
+        ));
     }
     Ok(None)
 }
@@ -5708,7 +5936,7 @@ async fn print_system_status(backhaul: Option<Ipv4Addr>) {
     use rtnetlink::packet_route::address::AddressAttribute;
     use rtnetlink::packet_route::link::LinkAttribute;
     use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute};
-    use rtnetlink::{new_connection, RouteMessageBuilder};
+    use rtnetlink::{RouteMessageBuilder, new_connection};
     use std::collections::HashMap;
 
     let (connection, handle, _) = match new_connection() {
@@ -5754,7 +5982,10 @@ async fn print_system_status(backhaul: Option<Ipv4Addr>) {
     let mut idxs: Vec<u32> = addrs.keys().copied().collect();
     idxs.sort_unstable();
     for idx in idxs {
-        let name = names.get(&idx).cloned().unwrap_or_else(|| format!("if{idx}"));
+        let name = names
+            .get(&idx)
+            .cloned()
+            .unwrap_or_else(|| format!("if{idx}"));
         if name == "lo" {
             continue;
         }
@@ -5841,7 +6072,9 @@ async fn run_listen(endpoint: Endpoint, no_relay: bool) -> Result<()> {
         .accept(MESH_ALPN, PingHandler)
         .spawn();
 
-    tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl-C")?;
     info!("shutting down");
     router.shutdown().await.context("router shutdown")?;
     Ok(())
@@ -5980,9 +6213,15 @@ mod tests {
 
     #[test]
     fn parse_txt_kv_splits_on_first_equals() {
-        assert_eq!(parse_txt_kv("path=/wiki"), Ok(("path".to_string(), "/wiki".to_string())));
+        assert_eq!(
+            parse_txt_kv("path=/wiki"),
+            Ok(("path".to_string(), "/wiki".to_string()))
+        );
         // Only the first `=` is a separator — the value may itself contain one.
-        assert_eq!(parse_txt_kv("k=a=b"), Ok(("k".to_string(), "a=b".to_string())));
+        assert_eq!(
+            parse_txt_kv("k=a=b"),
+            Ok(("k".to_string(), "a=b".to_string()))
+        );
     }
 
     #[test]
@@ -6022,7 +6261,11 @@ mod tests {
 
     #[test]
     fn format_services_status_reports_owner_tombstone_and_lost_name() {
-        let hlc = |wall_clock: u64| HLC { wall_clock, counter: 0, node_id: "x".to_string() };
+        let hlc = |wall_clock: u64| HLC {
+            wall_clock,
+            counter: 0,
+            node_id: "x".to_string(),
+        };
         let mut book = ServiceBookV2::new();
         book.insert(
             "wiki.mesh".to_string(),
@@ -6040,14 +6283,24 @@ mod tests {
         let mut tombstones = ServiceTombstoneBook::new();
         tombstones.insert(
             "printer.mesh".to_string(),
-            ServiceTombstone { owner_node_id: "node-b".to_string(), hlc: hlc(2) },
+            ServiceTombstone {
+                owner_node_id: "node-b".to_string(),
+                hlc: hlc(2),
+            },
         );
         let mut lost_names = LostNameMap::new();
         lost_names.insert(
             "shared.mesh".to_string(),
-            LostName { winner_node_id: "node-c".to_string(), hlc: hlc(3) },
+            LostName {
+                winner_node_id: "node-c".to_string(),
+                hlc: hlc(3),
+            },
         );
-        let state = ServiceStateV2 { book, tombstones, lost_names };
+        let state = ServiceStateV2 {
+            book,
+            tombstones,
+            lost_names,
+        };
 
         let text = format_services_status(&state).join("\n");
         assert!(text.contains("wiki.mesh"), "got: {text}");
@@ -6065,7 +6318,10 @@ mod tests {
         // absence marker, never silent omission.
         let state = ServiceStateV2::default();
         let text = format_services_status(&state).join("\n");
-        assert!(text.contains("(none — no services claimed yet)"), "got: {text}");
+        assert!(
+            text.contains("(none — no services claimed yet)"),
+            "got: {text}"
+        );
         assert_eq!(
             text.matches("(none)").count(),
             2,
@@ -6102,7 +6358,10 @@ config meshd 'meshd'
         // keeps that address across restarts via its persisted claim.
         let moved = claim("10.254.9.9/32", "me", 500);
         let store = store_of(&[moved]);
-        assert_eq!(pick_backhaul_addr(&store, "me"), "10.254.9.9".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            pick_backhaul_addr(&store, "me"),
+            "10.254.9.9".parse::<Ipv4Addr>().unwrap()
+        );
     }
 
     #[test]
@@ -6119,7 +6378,10 @@ config meshd 'meshd'
     fn pick_backhaul_default_is_legacy_derivation() {
         // Empty store (fresh mesh): byte-identical to the pre-pt9 address.
         let store = HashMap::new();
-        assert_eq!(pick_backhaul_addr(&store, "me"), mjolnir_mesh::tun::backhaul_addr("me"));
+        assert_eq!(
+            pick_backhaul_addr(&store, "me"),
+            mjolnir_mesh::tun::backhaul_addr("me")
+        );
     }
 
     #[test]
@@ -6149,7 +6411,10 @@ config meshd 'meshd'
         let (net, _) = keep.expect("client claim must be kept");
         assert_eq!(net, "10.42.5.0/24".parse::<Ipv4Net>().unwrap());
         assert!(extras.is_empty(), "backhaul claim must not be an 'extra'");
-        assert!(foreign.is_empty(), "foreign backhaul claim must not reach the allocator");
+        assert!(
+            foreign.is_empty(),
+            "foreign backhaul claim must not reach the allocator"
+        );
     }
 
     #[test]
@@ -6203,7 +6468,10 @@ config meshd 'meshd'
     #[test]
     fn same_owner_newer_updates_no_reclaim() {
         let mut store = HashMap::new();
-        store.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 100));
+        store.insert(
+            "10.42.1.0/24".to_string(),
+            claim("10.42.1.0/24", "peer-b", 100),
+        );
         let newer = claim("10.42.1.0/24", "peer-b", 200);
         let reclaim = apply_subnet_message(&mut store, &update(&newer), "self");
         assert!(reclaim.is_none());
@@ -6213,7 +6481,10 @@ config meshd 'meshd'
     #[test]
     fn older_claim_is_unchanged() {
         let mut store = HashMap::new();
-        store.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 200));
+        store.insert(
+            "10.42.1.0/24".to_string(),
+            claim("10.42.1.0/24", "peer-b", 200),
+        );
         let older = claim("10.42.1.0/24", "peer-b", 100);
         let reclaim = apply_subnet_message(&mut store, &update(&older), "self");
         assert!(reclaim.is_none());
@@ -6225,7 +6496,10 @@ config meshd 'meshd'
         // We hold the /24 (wall 200); a peer's earlier claim (wall 100) wins by
         // first-writer-wins, so we lose and must re-claim.
         let mut store = HashMap::new();
-        store.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "self", 200));
+        store.insert(
+            "10.42.1.0/24".to_string(),
+            claim("10.42.1.0/24", "self", 200),
+        );
         let earlier_peer = claim("10.42.1.0/24", "peer-b", 100);
         let reclaim = apply_subnet_message(&mut store, &update(&earlier_peer), "self");
         assert_eq!(
@@ -6241,7 +6515,10 @@ config meshd 'meshd'
         // We hold the /24 with the earlier claim (wall 100); a peer's later
         // claim (wall 200) loses, so we keep it and do NOT re-claim.
         let mut store = HashMap::new();
-        store.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "self", 100));
+        store.insert(
+            "10.42.1.0/24".to_string(),
+            claim("10.42.1.0/24", "self", 100),
+        );
         let later_peer = claim("10.42.1.0/24", "peer-b", 200);
         let reclaim = apply_subnet_message(&mut store, &update(&later_peer), "self");
         assert!(reclaim.is_none());
@@ -6251,7 +6528,10 @@ config meshd 'meshd'
     #[test]
     fn release_removes_when_newer() {
         let mut store = HashMap::new();
-        store.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 100));
+        store.insert(
+            "10.42.1.0/24".to_string(),
+            claim("10.42.1.0/24", "peer-b", 100),
+        );
         let release = GossipMessage::SubnetClaimRelease {
             cidr: "10.42.1.0/24".to_string(),
             hlc: HLC {
@@ -6262,13 +6542,19 @@ config meshd 'meshd'
         };
         let reclaim = apply_subnet_message(&mut store, &release, "self");
         assert!(reclaim.is_none());
-        assert!(!store.contains_key("10.42.1.0/24"), "newer release should remove the claim");
+        assert!(
+            !store.contains_key("10.42.1.0/24"),
+            "newer release should remove the claim"
+        );
     }
 
     #[test]
     fn release_ignored_when_older() {
         let mut store = HashMap::new();
-        store.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 200));
+        store.insert(
+            "10.42.1.0/24".to_string(),
+            claim("10.42.1.0/24", "peer-b", 200),
+        );
         let stale_release = GossipMessage::SubnetClaimRelease {
             cidr: "10.42.1.0/24".to_string(),
             hlc: HLC {
@@ -6278,7 +6564,10 @@ config meshd 'meshd'
             },
         };
         apply_subnet_message(&mut store, &stale_release, "self");
-        assert!(store.contains_key("10.42.1.0/24"), "stale release must not remove a newer claim");
+        assert!(
+            store.contains_key("10.42.1.0/24"),
+            "stale release must not remove a newer claim"
+        );
     }
 
     #[test]
@@ -6287,12 +6576,21 @@ config meshd 'meshd'
         // own claim restored from disk. It must come back as the claim to
         // keep, not land in the avoid set (which made us claim a fresh /24).
         let mut store = HashMap::new();
-        store.insert("10.42.12.0/24".to_string(), claim("10.42.12.0/24", "self", 100));
-        store.insert("10.42.7.0/24".to_string(), claim("10.42.7.0/24", "peer-b", 50));
+        store.insert(
+            "10.42.12.0/24".to_string(),
+            claim("10.42.12.0/24", "self", 100),
+        );
+        store.insert(
+            "10.42.7.0/24".to_string(),
+            claim("10.42.7.0/24", "peer-b", 50),
+        );
         let (keep, extras, foreign) = partition_claims(&store, "self");
         let (net, entry) = keep.expect("own restored claim must be reused");
         assert_eq!(net, "10.42.12.0/24".parse::<Ipv4Net>().unwrap());
-        assert_eq!(entry.claimed_at.wall_clock, 100, "claimed_at must be preserved (seniority)");
+        assert_eq!(
+            entry.claimed_at.wall_clock, 100,
+            "claimed_at must be preserved (seniority)"
+        );
         assert!(extras.is_empty());
         assert_eq!(foreign.len(), 1);
         assert!(foreign.contains(&"10.42.7.0/24".parse().unwrap()));
@@ -6303,11 +6601,21 @@ config meshd 'meshd'
         // Damage from the pre-fix restart bug: we own TWO claims. Keep the
         // senior one (lowest HLC) and mark the newer one for release.
         let mut store = HashMap::new();
-        store.insert("10.42.13.0/24".to_string(), claim("10.42.13.0/24", "self", 200));
-        store.insert("10.42.12.0/24".to_string(), claim("10.42.12.0/24", "self", 100));
+        store.insert(
+            "10.42.13.0/24".to_string(),
+            claim("10.42.13.0/24", "self", 200),
+        );
+        store.insert(
+            "10.42.12.0/24".to_string(),
+            claim("10.42.12.0/24", "self", 100),
+        );
         let (keep, extras, foreign) = partition_claims(&store, "self");
         let (net, _) = keep.expect("a claim must be kept");
-        assert_eq!(net, "10.42.12.0/24".parse::<Ipv4Net>().unwrap(), "senior claim wins");
+        assert_eq!(
+            net,
+            "10.42.12.0/24".parse::<Ipv4Net>().unwrap(),
+            "senior claim wins"
+        );
         assert_eq!(extras, vec!["10.42.13.0/24".parse::<Ipv4Net>().unwrap()]);
         assert!(foreign.is_empty());
     }
@@ -6477,8 +6785,14 @@ config meshd 'meshd'
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claims.state");
         let mut snapshot = HashMap::new();
-        snapshot.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 100));
-        snapshot.insert("10.42.2.0/24".to_string(), claim("10.42.2.0/24", "peer-c", 200));
+        snapshot.insert(
+            "10.42.1.0/24".to_string(),
+            claim("10.42.1.0/24", "peer-b", 100),
+        );
+        snapshot.insert(
+            "10.42.2.0/24".to_string(),
+            claim("10.42.2.0/24", "peer-c", 200),
+        );
 
         persist_claims(&snapshot, &path);
         let loaded = load_claims(&path);
@@ -6493,7 +6807,10 @@ config meshd 'meshd'
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("claims.state");
         let mut snapshot = HashMap::new();
-        snapshot.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 100));
+        snapshot.insert(
+            "10.42.1.0/24".to_string(),
+            claim("10.42.1.0/24", "peer-b", 100),
+        );
 
         persist_claims(&snapshot, &path);
 
@@ -6510,7 +6827,10 @@ config meshd 'meshd'
         std::fs::write(path.with_extension("tmp"), b"leftover garbage").unwrap();
 
         let mut snapshot = HashMap::new();
-        snapshot.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "peer-b", 100));
+        snapshot.insert(
+            "10.42.1.0/24".to_string(),
+            claim("10.42.1.0/24", "peer-b", 100),
+        );
         persist_claims(&snapshot, &path);
 
         assert_eq!(load_claims(&path).len(), 1);
@@ -6523,7 +6843,11 @@ config meshd 'meshd'
             node_id.to_string(),
             vec![addr.parse().unwrap()],
             None,
-            HLC { wall_clock, counter: 0, node_id: node_id.to_string() },
+            HLC {
+                wall_clock,
+                counter: 0,
+                node_id: node_id.to_string(),
+            },
         )
     }
 
@@ -6560,7 +6884,10 @@ config meshd 'meshd'
             entry: addr_entry("me", 1_000, "10.254.9.9:49737"),
         };
         assert!(apply_peer_addr_message(&mut book, &msg, "me").is_none());
-        assert!(book.is_empty(), "own echoed announcement must not enter the book");
+        assert!(
+            book.is_empty(),
+            "own echoed announcement must not enter the book"
+        );
     }
 
     #[test]
@@ -6577,10 +6904,16 @@ config meshd 'meshd'
         assert!(apply_peer_addr_message(&mut book, &older, "me").is_some());
         // Newer announcement wins (LWW).
         assert!(apply_peer_addr_message(&mut book, &newer, "me").is_some());
-        assert_eq!(book["peer-a"].direct_addrs[0].to_string(), "10.254.1.2:49737");
+        assert_eq!(
+            book["peer-a"].direct_addrs[0].to_string(),
+            "10.254.1.2:49737"
+        );
         // Replaying the older one is Unchanged -> None, and does not regress.
         assert!(apply_peer_addr_message(&mut book, &older, "me").is_none());
-        assert_eq!(book["peer-a"].direct_addrs[0].to_string(), "10.254.1.2:49737");
+        assert_eq!(
+            book["peer-a"].direct_addrs[0].to_string(),
+            "10.254.1.2:49737"
+        );
     }
 
     #[test]
@@ -6588,7 +6921,11 @@ config meshd 'meshd'
         let mut book = AddrBook::new();
         let msg = GossipMessage::SubnetClaimRelease {
             cidr: "10.42.1.0/24".to_string(),
-            hlc: HLC { wall_clock: 1, counter: 0, node_id: "x".to_string() },
+            hlc: HLC {
+                wall_clock: 1,
+                counter: 0,
+                node_id: "x".to_string(),
+            },
         };
         assert!(apply_peer_addr_message(&mut book, &msg, "me").is_none());
         assert!(book.is_empty());
@@ -6608,15 +6945,24 @@ config meshd 'meshd'
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("addrbook.state");
         let mut book = AddrBook::new();
-        book.insert("peer-a".to_string(), addr_entry("peer-a", 100, "10.254.1.1:49737"));
-        book.insert("peer-b".to_string(), addr_entry("peer-b", 200, "10.254.2.2:49737"));
+        book.insert(
+            "peer-a".to_string(),
+            addr_entry("peer-a", 100, "10.254.1.1:49737"),
+        );
+        book.insert(
+            "peer-b".to_string(),
+            addr_entry("peer-b", 200, "10.254.2.2:49737"),
+        );
 
         persist_addr_book(&book, &path);
         assert!(path.exists(), "parent dir is created and file written");
         let loaded = load_addr_book(&path);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded["peer-a"].announced_at.wall_clock, 100);
-        assert_eq!(loaded["peer-b"].direct_addrs[0].to_string(), "10.254.2.2:49737");
+        assert_eq!(
+            loaded["peer-b"].direct_addrs[0].to_string(),
+            "10.254.2.2:49737"
+        );
     }
 
     // --- service directory (7jb) ---
@@ -6648,7 +6994,10 @@ config meshd 'meshd'
     #[test]
     fn apply_service_inserts_new_and_returns_it() {
         let mut book = ServiceBook::new();
-        let msg = svc_msg("printer._ipp._tcp", svc_entry("printer", 631, 100, "node-a"));
+        let msg = svc_msg(
+            "printer._ipp._tcp",
+            svc_entry("printer", 631, 100, "node-a"),
+        );
         let learned = apply_service_message(&mut book, &msg);
         assert!(learned.is_some());
         assert_eq!(learned.unwrap().0, "printer._ipp._tcp");
@@ -6658,8 +7007,14 @@ config meshd 'meshd'
     #[test]
     fn apply_service_updates_on_newer_and_ignores_stale() {
         let mut book = ServiceBook::new();
-        let older = svc_msg("printer._ipp._tcp", svc_entry("printer", 631, 100, "node-a"));
-        let newer = svc_msg("printer._ipp._tcp", svc_entry("printer", 9100, 200, "node-a"));
+        let older = svc_msg(
+            "printer._ipp._tcp",
+            svc_entry("printer", 631, 100, "node-a"),
+        );
+        let newer = svc_msg(
+            "printer._ipp._tcp",
+            svc_entry("printer", 9100, 200, "node-a"),
+        );
         assert!(apply_service_message(&mut book, &older).is_some());
         assert!(apply_service_message(&mut book, &newer).is_some());
         assert_eq!(book["printer._ipp._tcp"].port, 9100);
@@ -6673,7 +7028,11 @@ config meshd 'meshd'
         let mut book = ServiceBook::new();
         let msg = GossipMessage::LeaseRelease {
             mac: [0; 6],
-            hlc: HLC { wall_clock: 1, counter: 0, node_id: "x".to_string() },
+            hlc: HLC {
+                wall_clock: 1,
+                counter: 0,
+                node_id: "x".to_string(),
+            },
         };
         assert!(apply_service_message(&mut book, &msg).is_none());
         assert!(book.is_empty());
@@ -6693,8 +7052,14 @@ config meshd 'meshd'
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("services.state");
         let mut book = ServiceBook::new();
-        book.insert("printer._ipp._tcp".to_string(), svc_entry("printer", 631, 100, "node-a"));
-        book.insert("nas._smb._tcp".to_string(), svc_entry("nas", 445, 200, "node-b"));
+        book.insert(
+            "printer._ipp._tcp".to_string(),
+            svc_entry("printer", 631, 100, "node-a"),
+        );
+        book.insert(
+            "nas._smb._tcp".to_string(),
+            svc_entry("nas", 445, 200, "node-b"),
+        );
 
         persist_service_book(&book, &path);
         assert!(path.exists(), "parent dir is created and file written");
@@ -6712,7 +7077,11 @@ config meshd 'meshd'
             display_name: display_name.to_string(),
             registered_by: "self".to_string(),
             attrs: std::collections::BTreeMap::new(),
-            updated_at: HLC { wall_clock, counter: 0, node_id: "self".to_string() },
+            updated_at: HLC {
+                wall_clock,
+                counter: 0,
+                node_id: "self".to_string(),
+            },
         }
     }
 
@@ -6745,12 +7114,24 @@ config meshd 'meshd'
     #[test]
     fn build_directory_snapshot_projects_neighbors_identities_and_services() {
         let mut claims = HashMap::new();
-        claims.insert("10.42.1.0/24".to_string(), claim("10.42.1.0/24", "self", 100));
-        claims.insert("10.42.2.0/24".to_string(), claim("10.42.2.0/24", "peer-a", 100));
+        claims.insert(
+            "10.42.1.0/24".to_string(),
+            claim("10.42.1.0/24", "self", 100),
+        );
+        claims.insert(
+            "10.42.2.0/24".to_string(),
+            claim("10.42.2.0/24", "peer-a", 100),
+        );
 
         let mut addr_book = AddrBook::new();
-        addr_book.insert("self".to_string(), addr_entry("self", 100, "10.254.1.1:49737"));
-        addr_book.insert("peer-a".to_string(), addr_entry("peer-a", 100, "10.254.2.2:49737"));
+        addr_book.insert(
+            "self".to_string(),
+            addr_entry("self", 100, "10.254.1.1:49737"),
+        );
+        addr_book.insert(
+            "peer-a".to_string(),
+            addr_entry("peer-a", 100, "10.254.2.2:49737"),
+        );
 
         let mut user_book = UserBook::new();
         user_book.insert("ada".to_string(), user_entry("ada", "Ada Lovelace", 100));
@@ -6833,11 +7214,23 @@ config meshd 'meshd'
         };
         let entry = spool_submission_to_user_entry(&sub, "router-a");
 
-        assert_eq!(entry.username, "abcdef0123456789", "pubkey is the stable identity key");
-        assert_eq!(entry.display_name, "Ada", "label wins over the derived short form");
+        assert_eq!(
+            entry.username, "abcdef0123456789",
+            "pubkey is the stable identity key"
+        );
+        assert_eq!(
+            entry.display_name, "Ada",
+            "label wins over the derived short form"
+        );
         assert_eq!(entry.registered_by, "router-a");
-        assert_eq!(entry.attrs.get("pubkey"), Some(&"abcdef0123456789".to_string()));
-        assert_eq!(entry.updated_at.node_id, "router-a", "stamped with a fresh HLC");
+        assert_eq!(
+            entry.attrs.get("pubkey"),
+            Some(&"abcdef0123456789".to_string())
+        );
+        assert_eq!(
+            entry.updated_at.node_id, "router-a",
+            "stamped with a fresh HLC"
+        );
     }
 
     #[test]
@@ -6943,7 +7336,10 @@ config meshd 'meshd'
 
         assert!(user_book.lock().unwrap().is_empty());
         assert!(!path.exists(), "malformed file is moved, not left in place");
-        assert!(dir.path().join("bad.json.bad").exists(), "quarantined to a .bad sidecar");
+        assert!(
+            dir.path().join("bad.json.bad").exists(),
+            "quarantined to a .bad sidecar"
+        );
     }
 
     #[test]
@@ -6989,7 +7385,10 @@ config meshd 'meshd'
         _tempdir: tempfile::TempDir,
     }
 
-    async fn start_test_control_api(self_id: &str, gateway_ip: Option<Ipv4Addr>) -> ControlApiTestFixture {
+    async fn start_test_control_api(
+        self_id: &str,
+        gateway_ip: Option<Ipv4Addr>,
+    ) -> ControlApiTestFixture {
         let service_book_v2 = Arc::new(Mutex::new(ServiceBookV2::new()));
         let service_tombstones_v2 = Arc::new(Mutex::new(ServiceTombstoneBook::new()));
         let lost_names_v2: Arc<Mutex<LostNameMap>> = Arc::new(Mutex::new(LostNameMap::new()));
@@ -7041,14 +7440,26 @@ config meshd 'meshd'
         .await
         .expect("bind ephemeral control API port");
 
-        ControlApiTestFixture { addr, handle, lost_names_v2, _tempdir: tempdir }
+        ControlApiTestFixture {
+            addr,
+            handle,
+            lost_names_v2,
+            _tempdir: tempdir,
+        }
     }
 
     /// Issue one raw HTTP/1.1 request against a running control API and
     /// return `(status, body)`. No keep-alive on either side, matching the
     /// server's `Connection: close`.
-    async fn control_api_request(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
-        let mut stream = TcpStream::connect(addr).await.expect("connect to control API");
+    async fn control_api_request(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> (u16, Vec<u8>) {
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .expect("connect to control API");
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -7063,7 +7474,10 @@ config meshd 'meshd'
             .position(|w| w == b"\r\n\r\n")
             .expect("response must have a header/body separator");
         let head = String::from_utf8_lossy(&resp[..split_at]);
-        let status_line = head.lines().next().expect("response must have a status line");
+        let status_line = head
+            .lines()
+            .next()
+            .expect("response must have a status line");
         let status: u16 = status_line
             .split_whitespace()
             .nth(1)
@@ -7077,8 +7491,13 @@ config meshd 'meshd'
     async fn control_api_publish_then_directory_then_unpublish() {
         let fixture = start_test_control_api("node-a", Some("10.42.5.1".parse().unwrap())).await;
 
-        let (status, body) =
-            control_api_request(fixture.addr, "POST", "/v0/publish", br#"{"name":"wiki","port":8080}"#).await;
+        let (status, body) = control_api_request(
+            fixture.addr,
+            "POST",
+            "/v0/publish",
+            br#"{"name":"wiki","port":8080}"#,
+        )
+        .await;
         assert_eq!(status, 200);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["name"], "wiki");
@@ -7105,7 +7524,10 @@ config meshd 'meshd'
         let (status, body) = control_api_request(fixture.addr, "GET", "/v0/directory", b"").await;
         assert_eq!(status, 200);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["services"].as_array().unwrap().is_empty(), "unpublished name is gone");
+        assert!(
+            json["services"].as_array().unwrap().is_empty(),
+            "unpublished name is gone"
+        );
 
         fixture.handle.abort();
     }
@@ -7114,8 +7536,13 @@ config meshd 'meshd'
     async fn control_api_publish_reserved_name_is_rejected() {
         let fixture = start_test_control_api("node-a", None).await;
 
-        let (status, body) =
-            control_api_request(fixture.addr, "POST", "/v0/publish", br#"{"name":"hello","port":80}"#).await;
+        let (status, body) = control_api_request(
+            fixture.addr,
+            "POST",
+            "/v0/publish",
+            br#"{"name":"hello","port":80}"#,
+        )
+        .await;
         assert_eq!(status, 400);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "reserved");
@@ -7142,7 +7569,10 @@ config meshd 'meshd'
         assert_eq!(status, 200);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["name"], scoped, "device name is node-scoped, not bare");
-        assert_eq!(json["ip"], "192.168.7.20", "device IP, not the gateway 10.42.5.1");
+        assert_eq!(
+            json["ip"], "192.168.7.20",
+            "device IP, not the gateway 10.42.5.1"
+        );
         assert_eq!(json["port"], 0, "no port ⇒ A-only, port 0");
 
         // Appears in the directory under its scoped key.
@@ -7153,15 +7583,23 @@ config meshd 'meshd'
         assert_eq!(json["services"][0]["ip"], "192.168.7.20");
 
         // `--device` unpublish re-derives the scoped key and releases it.
-        let (status, body) =
-            control_api_request(fixture.addr, "POST", "/v0/unpublish", br#"{"name":"nas","device":true}"#).await;
+        let (status, body) = control_api_request(
+            fixture.addr,
+            "POST",
+            "/v0/unpublish",
+            br#"{"name":"nas","device":true}"#,
+        )
+        .await;
         assert_eq!(status, 200);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "unpublished");
 
         let (_, body) = control_api_request(fixture.addr, "GET", "/v0/directory", b"").await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["services"].as_array().unwrap().is_empty(), "device released");
+        assert!(
+            json["services"].as_array().unwrap().is_empty(),
+            "device released"
+        );
 
         fixture.handle.abort();
     }
@@ -7202,11 +7640,19 @@ config meshd 'meshd'
         let fixture = start_test_control_api("node-a", None).await;
         fixture.lost_names_v2.lock().unwrap().insert(
             "taken".to_string(),
-            LostName { winner_node_id: "node-b".to_string(), hlc: now_hlc("node-b") },
+            LostName {
+                winner_node_id: "node-b".to_string(),
+                hlc: now_hlc("node-b"),
+            },
         );
 
-        let (status, body) =
-            control_api_request(fixture.addr, "POST", "/v0/publish", br#"{"name":"taken","port":80}"#).await;
+        let (status, body) = control_api_request(
+            fixture.addr,
+            "POST",
+            "/v0/publish",
+            br#"{"name":"taken","port":80}"#,
+        )
+        .await;
         assert_eq!(status, 409);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "owned_by_other");
@@ -7219,7 +7665,8 @@ config meshd 'meshd'
     async fn control_api_publish_malformed_body_is_rejected() {
         let fixture = start_test_control_api("node-a", None).await;
 
-        let (status, body) = control_api_request(fixture.addr, "POST", "/v0/publish", b"not json").await;
+        let (status, body) =
+            control_api_request(fixture.addr, "POST", "/v0/publish", b"not json").await;
         assert_eq!(status, 400);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "malformed_body");
@@ -7254,13 +7701,23 @@ config meshd 'meshd'
         )
         .await;
 
-        let (status, _) =
-            control_api_request(fixture_a.addr, "POST", "/v0/publish", br#"{"name":"wiki","port":8080}"#).await;
+        let (status, _) = control_api_request(
+            fixture_a.addr,
+            "POST",
+            "/v0/publish",
+            br#"{"name":"wiki","port":8080}"#,
+        )
+        .await;
         assert_eq!(status, 200);
 
         // node-b tries to unpublish node-a's "wiki" through its OWN local API.
-        let (status, body) =
-            control_api_request(fixture_b.addr, "POST", "/v0/unpublish", br#"{"name":"wiki"}"#).await;
+        let (status, body) = control_api_request(
+            fixture_b.addr,
+            "POST",
+            "/v0/unpublish",
+            br#"{"name":"wiki"}"#,
+        )
+        .await;
         assert_eq!(status, 409);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "not_owner");

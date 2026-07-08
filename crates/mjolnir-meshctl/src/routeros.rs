@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::ssh::Ssh;
 
@@ -68,7 +68,10 @@ pub fn build_query_script(path: &str, find_filter: Option<&str>, fields: &[&str]
         ));
     }
 
-    format!(":foreach i in={find} do={{:put ({expr})}}; :put {:?}", END_MARKER)
+    format!(
+        ":foreach i in={find} do={{:put ({expr})}}; :put {:?}",
+        END_MARKER
+    )
 }
 
 /// Parse the stdout of a query script into records. Non-`MCTL>` lines (banners,
@@ -99,7 +102,10 @@ pub fn parse_records(stdout: &str) -> Vec<Record> {
 /// Returns the output (sans control lines) on success; on failure, an error
 /// carrying the raw output — which contains RouterOS's own error message.
 fn ensure_complete(stdout: &str) -> Result<()> {
-    if stdout.lines().any(|l| l.trim_end_matches('\r') == END_MARKER) {
+    if stdout
+        .lines()
+        .any(|l| l.trim_end_matches('\r') == END_MARKER)
+    {
         Ok(())
     } else {
         bail!(
@@ -119,8 +125,7 @@ fn ensure_complete(stdout: &str) -> Result<()> {
 pub async fn run_command(ssh: &Ssh, cmd: &str) -> Result<String> {
     let script = format!("{cmd}; :put {END_MARKER:?}");
     let out = ssh.run(&script).await?;
-    ensure_complete(&out)
-        .with_context(|| format!("RouterOS rejected `{cmd}`"))?;
+    ensure_complete(&out).with_context(|| format!("RouterOS rejected `{cmd}`"))?;
     Ok(out)
 }
 

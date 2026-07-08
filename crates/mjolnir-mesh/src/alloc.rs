@@ -340,7 +340,11 @@ mod tests {
     #[test]
     fn or_smaller_returns_requested_when_it_fits() {
         let n = pick_subnet_or_smaller("node-a", &empty(), DEFAULT_MESH_SPACE, 24).unwrap();
-        assert_eq!(n.prefix_len(), 24, "should grant the requested size when free");
+        assert_eq!(
+            n.prefix_len(),
+            24,
+            "should grant the requested size when free"
+        );
     }
 
     #[test]
@@ -352,7 +356,10 @@ mod tests {
         claimed.insert(Ipv4Net::new(Ipv4Addr::new(10, 42, 7, 0), 24).unwrap());
         let n = pick_subnet_or_smaller("only-site", &claimed, DEFAULT_MESH_SPACE, 16).unwrap();
         assert_eq!(n.prefix_len(), 17, "should degrade /16 -> /17");
-        assert!(!overlaps_any(&n, &claimed), "downgraded subnet must not overlap");
+        assert!(
+            !overlaps_any(&n, &claimed),
+            "downgraded subnet must not overlap"
+        );
     }
 
     #[test]
@@ -360,7 +367,10 @@ mod tests {
         // Empty space could fit a /16, but a /28 request must stay /28.
         let n = pick_subnet_or_smaller("node-b", &empty(), DEFAULT_MESH_SPACE, 28).unwrap();
         assert_eq!(n.prefix_len(), 28);
-        assert!(n.prefix_len() >= 28, "never larger (smaller prefix number) than requested");
+        assert!(
+            n.prefix_len() >= 28,
+            "never larger (smaller prefix number) than requested"
+        );
     }
 
     #[test]

@@ -16,15 +16,15 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use simple_dns::rdata::{RData, OPT};
-use simple_dns::{Name, Packet, Question, QCLASS, RCODE, TYPE};
+use simple_dns::rdata::{OPT, RData};
+use simple_dns::{Name, Packet, QCLASS, Question, RCODE, TYPE};
 use tokio::net::UdpSocket;
 
 use crate::crdt::hlc::HLC;
 use crate::crdt::service::{ServiceBookV2, ServiceEntryV2};
 use crate::dns_responder::{
-    handle_query, start, CompositeTable, GatewayHandle, NameTable, ServiceTable, WellKnownTable,
-    PRE_CLAIM_GATEWAY,
+    CompositeTable, GatewayHandle, NameTable, PRE_CLAIM_GATEWAY, ServiceTable, WellKnownTable,
+    handle_query, start,
 };
 
 /// Builds a raw query packet the same way a real client (dnsmasq forwarding
@@ -50,19 +50,34 @@ fn build_query_with_opt(name: &str, qtype: TYPE) -> Vec<u8> {
         QCLASS::CLASS(simple_dns::CLASS::IN),
         false,
     ));
-    *query.opt_mut() = Some(OPT { opt_codes: Vec::new(), udp_packet_size: 4096, version: 0 });
+    *query.opt_mut() = Some(OPT {
+        opt_codes: Vec::new(),
+        udp_packet_size: 4096,
+        version: 0,
+    });
     query.build_bytes_vec().unwrap()
 }
 
 fn service_entry(ip: Ipv4Addr, port: u16, protocol: &str, txt: &[(&str, &str)]) -> ServiceEntryV2 {
     ServiceEntryV2 {
         owner_node_id: "router-conformance".to_string(),
-        first_claimed_at: HLC { wall_clock: 1, counter: 0, node_id: "router-conformance".to_string() },
-        updated_at: HLC { wall_clock: 1, counter: 0, node_id: "router-conformance".to_string() },
+        first_claimed_at: HLC {
+            wall_clock: 1,
+            counter: 0,
+            node_id: "router-conformance".to_string(),
+        },
+        updated_at: HLC {
+            wall_clock: 1,
+            counter: 0,
+            node_id: "router-conformance".to_string(),
+        },
         ip: IpAddr::V4(ip),
         port,
         protocol: protocol.to_string(),
-        txt: txt.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        txt: txt
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
         host_mac: None,
     }
 }
@@ -73,7 +88,11 @@ fn service_entry(ip: Ipv4Addr, port: u16, protocol: &str, txt: &[(&str, &str)]) 
 /// the store-mutation-visibility and tombstone cases).
 fn full_table(
     gateway: Option<Ipv4Addr>,
-) -> (Arc<CompositeTable>, GatewayHandle, Arc<Mutex<ServiceBookV2>>) {
+) -> (
+    Arc<CompositeTable>,
+    GatewayHandle,
+    Arc<Mutex<ServiceBookV2>>,
+) {
     let gateway_handle: GatewayHandle = Arc::new(RwLock::new(gateway));
     let store: Arc<Mutex<ServiceBookV2>> = Arc::new(Mutex::new(ServiceBookV2::new()));
     let table = Arc::new(CompositeTable::new(vec![
@@ -91,7 +110,9 @@ async fn spawn_wired_responder(
     table: Arc<dyn NameTable>,
 ) -> (crate::dns_responder::ResponderHandle, UdpSocket) {
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let handle = start(bind_addr, table).await.expect("responder should bind an ephemeral port");
+    let handle = start(bind_addr, table)
+        .await
+        .expect("responder should bind an ephemeral port");
     let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     client.connect(handle.local_addr).await.unwrap();
     (handle, client)
@@ -190,7 +211,10 @@ async fn service_a_answers_published_ip() {
     assert_eq!(reply.answers.len(), 1);
     assert_eq!(reply.answers[0].ttl, 30);
     match &reply.answers[0].rdata {
-        RData::A(a) => assert_eq!(Ipv4Addr::from(a.address), "10.42.61.50".parse::<Ipv4Addr>().unwrap()),
+        RData::A(a) => assert_eq!(
+            Ipv4Addr::from(a.address),
+            "10.42.61.50".parse::<Ipv4Addr>().unwrap()
+        ),
         other => panic!("expected A record, got {other:?}"),
     }
 
@@ -210,9 +234,17 @@ async fn aaaa_on_well_known_name_is_nodata_not_nxdomain() {
 
     let reply_bytes = query_over_wire(&client, &build_query("hello.mesh.", TYPE::AAAA)).await;
     let reply = Packet::parse(&reply_bytes).unwrap();
-    assert_eq!(reply.rcode(), RCODE::NoError, "AAAA on an existing name must be NODATA, not NXDOMAIN");
+    assert_eq!(
+        reply.rcode(),
+        RCODE::NoError,
+        "AAAA on an existing name must be NODATA, not NXDOMAIN"
+    );
     assert_eq!(reply.answers.len(), 0);
-    assert_eq!(reply.name_servers.len(), 0, "NODATA carries no SOA in this dispatch");
+    assert_eq!(
+        reply.name_servers.len(),
+        0,
+        "NODATA carries no SOA in this dispatch"
+    );
 
     handle.abort();
 }
@@ -228,7 +260,11 @@ async fn mx_on_service_name_is_nodata_not_nxdomain() {
 
     let reply_bytes = query_over_wire(&client, &build_query("wiki.mesh.", TYPE::MX)).await;
     let reply = Packet::parse(&reply_bytes).unwrap();
-    assert_eq!(reply.rcode(), RCODE::NoError, "MX on an existing service name must be NODATA, not NXDOMAIN");
+    assert_eq!(
+        reply.rcode(),
+        RCODE::NoError,
+        "MX on an existing service name must be NODATA, not NXDOMAIN"
+    );
     assert_eq!(reply.answers.len(), 0);
 
     handle.abort();
@@ -241,7 +277,12 @@ async fn service_srv_and_txt_match_the_documented_wire_mapping() {
     let (table, _gateway, store) = full_table(Some("10.42.61.1".parse().unwrap()));
     store.lock().unwrap().insert(
         "printer".to_string(),
-        service_entry("10.42.61.60".parse().unwrap(), 631, "_ipp._tcp", &[("model", "LaserJet"), ("path", "/ipp/print")]),
+        service_entry(
+            "10.42.61.60".parse().unwrap(),
+            631,
+            "_ipp._tcp",
+            &[("model", "LaserJet"), ("path", "/ipp/print")],
+        ),
     );
     let (handle, client) = spawn_wired_responder(table).await;
 
@@ -270,8 +311,14 @@ async fn service_srv_and_txt_match_the_documented_wire_mapping() {
     match &txt_reply.answers[0].rdata {
         RData::TXT(txt) => {
             let attrs = txt.attributes();
-            assert_eq!(attrs.get("model").and_then(|v| v.clone()), Some("LaserJet".to_string()));
-            assert_eq!(attrs.get("path").and_then(|v| v.clone()), Some("/ipp/print".to_string()));
+            assert_eq!(
+                attrs.get("model").and_then(|v| v.clone()),
+                Some("LaserJet".to_string())
+            );
+            assert_eq!(
+                attrs.get("path").and_then(|v| v.clone()),
+                Some("/ipp/print".to_string())
+            );
         }
         other => panic!("expected TXT, got {other:?}"),
     }
@@ -306,7 +353,10 @@ async fn unknown_name_is_nxdomain_with_d005_soa_fields() {
         }
         other => panic!("expected SOA authority record, got {other:?}"),
     }
-    assert_eq!(reply.name_servers[0].ttl, 30, "SOA TTL should match `minimum` per RFC 2308");
+    assert_eq!(
+        reply.name_servers[0].ttl, 30,
+        "SOA TTL should match `minimum` per RFC 2308"
+    );
 
     handle.abort();
 }
@@ -322,17 +372,26 @@ async fn edns0_query_is_answered_without_echoing_opt_and_stays_bounded() {
     );
     let (handle, client) = spawn_wired_responder(table).await;
 
-    client.send(&build_query_with_opt("wiki.mesh.", TYPE::A)).await.unwrap();
+    client
+        .send(&build_query_with_opt("wiki.mesh.", TYPE::A))
+        .await
+        .unwrap();
     let mut buf = [0u8; 4096];
     let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
         .await
         .expect("responder should reply before the timeout")
         .unwrap();
-    assert!(n <= 512, "reply must stay within the classic 512B UDP ceiling, got {n}");
+    assert!(
+        n <= 512,
+        "reply must stay within the classic 512B UDP ceiling, got {n}"
+    );
     let reply = Packet::parse(&buf[..n]).unwrap();
     assert_eq!(reply.rcode(), RCODE::NoError);
     assert_eq!(reply.answers.len(), 1);
-    assert!(reply.opt().is_none(), "responder tolerates EDNS0 but must never echo an OPT back");
+    assert!(
+        reply.opt().is_none(),
+        "responder tolerates EDNS0 but must never echo an OPT back"
+    );
 
     handle.abort();
 }
@@ -363,7 +422,11 @@ async fn garbage_and_oversized_datagrams_never_kill_the_recv_loop() {
     // a well-formed query sent right after must still be answered.
     let reply_bytes = query_over_wire(&client, &build_query("hello.mesh.", TYPE::A)).await;
     let reply = Packet::parse(&reply_bytes).unwrap();
-    assert_eq!(reply.rcode(), RCODE::NoError, "responder must still be alive after garbage datagrams");
+    assert_eq!(
+        reply.rcode(),
+        RCODE::NoError,
+        "responder must still be alive after garbage datagrams"
+    );
     assert_eq!(reply.answers.len(), 1);
 
     handle.abort();
@@ -387,10 +450,17 @@ async fn store_mutation_is_visible_on_the_next_query() {
 
     let after_bytes = query_over_wire(&client, &build_query("printer.mesh.", TYPE::A)).await;
     let after = Packet::parse(&after_bytes).unwrap();
-    assert_eq!(after.rcode(), RCODE::NoError, "must answer from the mutated store with no reload step");
+    assert_eq!(
+        after.rcode(),
+        RCODE::NoError,
+        "must answer from the mutated store with no reload step"
+    );
     assert_eq!(after.answers.len(), 1);
     match &after.answers[0].rdata {
-        RData::A(a) => assert_eq!(Ipv4Addr::from(a.address), "10.42.61.70".parse::<Ipv4Addr>().unwrap()),
+        RData::A(a) => assert_eq!(
+            Ipv4Addr::from(a.address),
+            "10.42.61.70".parse::<Ipv4Addr>().unwrap()
+        ),
         other => panic!("expected A record, got {other:?}"),
     }
 
@@ -416,8 +486,16 @@ async fn removed_service_reverts_to_nxdomain() {
 
     let removed_bytes = query_over_wire(&client, &build_query("printer.mesh.", TYPE::A)).await;
     let removed = Packet::parse(&removed_bytes).unwrap();
-    assert_eq!(removed.rcode(), RCODE::NameError, "a removed/tombstoned service must go back to NXDOMAIN");
-    assert_eq!(removed.name_servers.len(), 1, "NXDOMAIN still carries the SOA authority record");
+    assert_eq!(
+        removed.rcode(),
+        RCODE::NameError,
+        "a removed/tombstoned service must go back to NXDOMAIN"
+    );
+    assert_eq!(
+        removed.name_servers.len(),
+        1,
+        "NXDOMAIN still carries the SOA authority record"
+    );
 
     handle.abort();
 }

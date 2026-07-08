@@ -11,7 +11,7 @@
 //! point exists to bind gossip ↔ CRDT ↔ supervisor together.
 
 use ipnet::Ipv4Net;
-use mjolnir_mesh::babel::{render_babeld_conf, write_atomic_if_changed, BabelConfigInputs};
+use mjolnir_mesh::babel::{BabelConfigInputs, render_babeld_conf, write_atomic_if_changed};
 use std::str::FromStr;
 
 #[test]
@@ -74,17 +74,23 @@ fn peer_disconnect_drops_interface_line() {
 
     let body_connected = render_babeld_conf(&BabelConfigInputs::new(Some(subnet), &with_peer));
     write_atomic_if_changed(&path, &body_connected).unwrap();
-    assert!(std::fs::read_to_string(&path)
-        .unwrap()
-        .contains("mj-peer-aabbccdd"));
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("mj-peer-aabbccdd")
+    );
 
     let body_disconnected = render_babeld_conf(&BabelConfigInputs::new(Some(subnet), &without));
     write_atomic_if_changed(&path, &body_disconnected).unwrap();
-    assert!(!std::fs::read_to_string(&path)
-        .unwrap()
-        .contains("mj-peer-aabbccdd"));
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("mj-peer-aabbccdd")
+    );
     // redistribute line still present — this router still owns its subnet.
-    assert!(std::fs::read_to_string(&path)
-        .unwrap()
-        .contains("redistribute ip 10.42.2.0/24"));
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("redistribute ip 10.42.2.0/24")
+    );
 }

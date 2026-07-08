@@ -23,8 +23,8 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use mjolnir_mesh::{
-    merge_service, GossipError, GossipMessage, GossipSync, GossipTransport, MergeResult,
-    ServiceBook, ServiceEntry, HLC,
+    GossipError, GossipMessage, GossipSync, GossipTransport, HLC, MergeResult, ServiceBook,
+    ServiceEntry, merge_service,
 };
 
 /// One-directional in-process transport standing in for iroh-gossip.
@@ -40,11 +40,19 @@ struct ChannelTransport {
 #[async_trait::async_trait]
 impl GossipTransport for ChannelTransport {
     async fn broadcast(&self, payload: Bytes) -> Result<(), GossipError> {
-        self.outbound.send(payload).await.map_err(|_| GossipError::Closed)
+        self.outbound
+            .send(payload)
+            .await
+            .map_err(|_| GossipError::Closed)
     }
 
     async fn recv(&self) -> Result<Bytes, GossipError> {
-        self.inbound.lock().await.recv().await.ok_or(GossipError::Closed)
+        self.inbound
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(GossipError::Closed)
     }
 }
 
@@ -93,7 +101,9 @@ async fn await_port(book: &Arc<Mutex<ServiceBook>>, name: &str, expected_port: u
         }
         if start.elapsed() > deadline {
             let got = book.lock().unwrap().get(name).map(|e| e.port);
-            panic!("node B did not converge on {name}=port:{expected_port} within {deadline:?}; last saw {got:?}");
+            panic!(
+                "node B did not converge on {name}=port:{expected_port} within {deadline:?}; last saw {got:?}"
+            );
         }
         tokio::time::sleep(poll).await;
     }
@@ -168,5 +178,8 @@ async fn service_record_propagates_a_to_b_end_to_end() {
 
     // Drop A so B's receive loop sees Closed and exits cleanly.
     drop(node_a);
-    dispatch.await.expect("join dispatch").expect("dispatch loop ok");
+    dispatch
+        .await
+        .expect("join dispatch")
+        .expect("dispatch loop ok");
 }

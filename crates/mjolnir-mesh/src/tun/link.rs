@@ -205,7 +205,11 @@ mod tests {
             seen.insert(a);
         }
         // 8 attempts in a 16-bit space: all distinct, statistically certain.
-        assert_eq!(seen.len(), 8, "salted attempts must yield distinct addresses");
+        assert_eq!(
+            seen.len(),
+            8,
+            "salted attempts must yield distinct addresses"
+        );
     }
 
     #[test]
@@ -229,7 +233,11 @@ mod tests {
             seen.insert(backhaul_addr(&format!("node-{i:08x}")));
         }
         // 100 nodes in a 16-bit host space: collisions are statistically negligible.
-        assert_eq!(seen.len(), 100, "all 100 node backhaul addrs must be unique");
+        assert_eq!(
+            seen.len(),
+            100,
+            "all 100 node backhaul addrs must be unique"
+        );
     }
 
     #[test]

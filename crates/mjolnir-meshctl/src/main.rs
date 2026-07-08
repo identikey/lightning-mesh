@@ -36,7 +36,7 @@ mod ssh;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
@@ -46,7 +46,10 @@ use inventory::{Inventory, Role, Router};
 use ssh::Ssh;
 
 #[derive(Parser)]
-#[command(name = "meshctl", about = "Operator-side RouterOS reconciler for the mjolnir mesh swarm")]
+#[command(
+    name = "meshctl",
+    about = "Operator-side RouterOS reconciler for the mjolnir mesh swarm"
+)]
 struct Cli {
     /// Path to the router inventory. When omitted, `deploy/mikrotik/routers.toml`
     /// is searched for upward from the current directory, so meshctl works from
@@ -134,7 +137,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .init();
 
@@ -376,7 +381,10 @@ async fn cmd_apply(inv: &Inventory, name: Option<&str>, all: bool, dry_run: bool
         let (mut done, mut failed) = (0u32, 0u32);
         for c in &changes {
             if dry_run {
-                println!("  + {:<6} {:<11} {:<22} {} [{}]", c.verb, c.kind, c.id, c.cmd, c.reason);
+                println!(
+                    "  + {:<6} {:<11} {:<22} {} [{}]",
+                    c.verb, c.kind, c.id, c.cmd, c.reason
+                );
                 continue;
             }
             match apply::run_change(&ssh, c).await {
@@ -428,9 +436,9 @@ async fn resolve_peer_blob(inv: &Inventory, secrets_dir: &Path, r: &Router) -> R
     if let Some(b) = &r.peer_blob {
         return Ok(b.clone());
     }
-    let peer = inv.peer_of(r).with_context(|| {
-        format!("connector {} has no peer / peer_blob to connect to", r.name)
-    })?;
+    let peer = inv
+        .peer_of(r)
+        .with_context(|| format!("connector {} has no peer / peer_blob to connect to", r.name))?;
     let peer_secret = deploy::ensure_secret(secrets_dir, &peer.name)?;
     let peer_id = deploy::node_id(&peer_secret)?;
     let peer_ssh = Ssh::new(peer.ssh_target(inv));
@@ -501,14 +509,15 @@ async fn cmd_deploy(
                 let _ = deploy::report_reachability(&ssh, &r.name, opts.timeout).await;
                 // Surface a listener's blob (race-free, tied to its stable id)
                 // so connectors or a human can use it.
-                if r.role == Role::Listener {
-                    if let Ok(secret) = deploy::ensure_secret(&secrets_dir, &r.name) {
-                        if let Ok(id) = deploy::node_id(&secret) {
-                            match deploy::read_blob_for_id(&ssh, &id, std::time::Duration::from_secs(30)).await {
-                                Ok(Some(b)) => println!("  {} address blob:\n    {b}", r.name),
-                                _ => println!("  {} node id: {id}", r.name),
-                            }
-                        }
+                if r.role == Role::Listener
+                    && let Ok(secret) = deploy::ensure_secret(&secrets_dir, &r.name)
+                    && let Ok(id) = deploy::node_id(&secret)
+                {
+                    match deploy::read_blob_for_id(&ssh, &id, std::time::Duration::from_secs(30))
+                        .await
+                    {
+                        Ok(Some(b)) => println!("  {} address blob:\n    {b}", r.name),
+                        _ => println!("  {} node id: {id}", r.name),
                     }
                 }
             }
@@ -556,7 +565,11 @@ async fn cmd_bootstrap(
         .and_then(|s| s.to_str())
         .context("pubkey path has no file name")?
         .to_string();
-    println!("installing {} on {} router(s)", pubkey.display(), targets.len());
+    println!(
+        "installing {} on {} router(s)",
+        pubkey.display(),
+        targets.len()
+    );
 
     let mut failures = 0;
     for r in targets {
@@ -637,7 +650,10 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
 
         let found = find_upward(&deep, suffix).unwrap();
-        assert_eq!(found.canonicalize().unwrap(), target.canonicalize().unwrap());
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            target.canonicalize().unwrap()
+        );
     }
 
     #[test]

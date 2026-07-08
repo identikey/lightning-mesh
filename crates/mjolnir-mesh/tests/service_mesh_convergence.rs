@@ -26,8 +26,8 @@ use bytes::Bytes;
 
 use mjolnir_mesh::crdt::sync::{decode, encode};
 use mjolnir_mesh::{
-    apply_service_publish_v2_tracking_loss, apply_service_unpublish_v2, GossipMessage,
-    LostNameMap, ServiceBookV2, ServiceEntryV2, ServiceTombstoneBook, HLC,
+    GossipMessage, HLC, LostNameMap, ServiceBookV2, ServiceEntryV2, ServiceTombstoneBook,
+    apply_service_publish_v2_tracking_loss, apply_service_unpublish_v2,
 };
 
 // --- simulated node ---
@@ -66,7 +66,11 @@ impl SimNode {
                     entry.clone(),
                 );
             }
-            GossipMessage::ServiceUnpublishV2 { name, owner_node_id, hlc } => {
+            GossipMessage::ServiceUnpublishV2 {
+                name,
+                owner_node_id,
+                hlc,
+            } => {
                 let _ = apply_service_unpublish_v2(
                     &mut self.book,
                     &mut self.tombstones,
@@ -107,7 +111,10 @@ impl Network {
                 }
             }
         }
-        Network { nodes: ids.iter().map(|id| SimNode::new(id)).collect(), links }
+        Network {
+            nodes: ids.iter().map(|id| SimNode::new(id)).collect(),
+            links,
+        }
     }
 
     /// Node `from` locally applies `msg` (mirrors a daemon's own publish
@@ -119,7 +126,10 @@ impl Network {
         let payload = encode(&msg).expect("encode gossip message");
         for to in 0..self.nodes.len() {
             if to != from {
-                self.links.get_mut(&(from, to)).unwrap().push(payload.clone());
+                self.links
+                    .get_mut(&(from, to))
+                    .unwrap()
+                    .push(payload.clone());
             }
         }
     }
@@ -142,7 +152,12 @@ impl Network {
     /// Flush every message currently queued on link (from, to) to node `to`,
     /// in FIFO order, then clear the queue (the message has been "delivered").
     fn flush_link(&mut self, from: usize, to: usize) {
-        let queued = self.links.get_mut(&(from, to)).unwrap().drain(..).collect::<Vec<_>>();
+        let queued = self
+            .links
+            .get_mut(&(from, to))
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
         self.deliver(to, &queued);
     }
 
@@ -167,7 +182,11 @@ impl Network {
 // --- fixtures ---
 
 fn hlc(wall_clock: u64, counter: u32, node_id: &str) -> HLC {
-    HLC { wall_clock, counter, node_id: node_id.to_string() }
+    HLC {
+        wall_clock,
+        counter,
+        node_id: node_id.to_string(),
+    }
 }
 
 fn entry(owner: &str, first_claimed: u64, updated: u64, port: u16) -> ServiceEntryV2 {
@@ -184,11 +203,18 @@ fn entry(owner: &str, first_claimed: u64, updated: u64, port: u16) -> ServiceEnt
 }
 
 fn publish_msg(name: &str, e: ServiceEntryV2) -> GossipMessage {
-    GossipMessage::ServicePublishV2 { name: name.to_string(), entry: e }
+    GossipMessage::ServicePublishV2 {
+        name: name.to_string(),
+        entry: e,
+    }
 }
 
 fn unpublish_msg(name: &str, owner: &str, at: HLC) -> GossipMessage {
-    GossipMessage::ServiceUnpublishV2 { name: name.to_string(), owner_node_id: owner.to_string(), hlc: at }
+    GossipMessage::ServiceUnpublishV2 {
+        name: name.to_string(),
+        owner_node_id: owner.to_string(),
+        hlc: at,
+    }
 }
 
 /// Assert all `nodes` (by index into `net`) hold byte-identical books —
@@ -197,7 +223,12 @@ fn unpublish_msg(name: &str, owner: &str, at: HLC) -> GossipMessage {
 fn assert_books_converged(net: &Network, nodes: &[usize], what: &str) {
     let first = net.book(nodes[0]);
     for &n in &nodes[1..] {
-        assert_eq!(net.book(n), first, "{what}: node {n} diverged from node {}", nodes[0]);
+        assert_eq!(
+            net.book(n),
+            first,
+            "{what}: node {n} diverged from node {}",
+            nodes[0]
+        );
         assert_eq!(
             postcard::to_allocvec(net.book(n)).unwrap(),
             postcard::to_allocvec(first).unwrap(),
@@ -230,7 +261,11 @@ fn publish_on_one_node_converges_on_all_within_one_flush() {
     // a no-op — one full round was already enough.
     let before = postcard::to_allocvec(net.book(0)).unwrap();
     net.flush_all();
-    assert_eq!(postcard::to_allocvec(net.book(0)).unwrap(), before, "flush is idempotent once converged");
+    assert_eq!(
+        postcard::to_allocvec(net.book(0)).unwrap(),
+        before,
+        "flush is idempotent once converged"
+    );
 }
 
 // --- 2. PARTITION DOUBLE-CLAIM ---
@@ -255,9 +290,21 @@ fn setup_partition_double_claim() -> Network {
     net.flush_link(1, 2);
     net.flush_link(2, 1); // no-op (C never published), but symmetric for realism.
 
-    assert_eq!(net.book(0).get("wiki.mesh").unwrap().owner_node_id, "a", "A only knows its own claim so far");
-    assert_eq!(net.book(1).get("wiki.mesh").unwrap().owner_node_id, "b", "B only knows its own claim so far");
-    assert_eq!(net.book(2).get("wiki.mesh").unwrap().owner_node_id, "b", "C converged onto B within the B/C partition");
+    assert_eq!(
+        net.book(0).get("wiki.mesh").unwrap().owner_node_id,
+        "a",
+        "A only knows its own claim so far"
+    );
+    assert_eq!(
+        net.book(1).get("wiki.mesh").unwrap().owner_node_id,
+        "b",
+        "B only knows its own claim so far"
+    );
+    assert_eq!(
+        net.book(2).get("wiki.mesh").unwrap().owner_node_id,
+        "b",
+        "C converged onto B within the B/C partition"
+    );
 
     net
 }
@@ -270,10 +317,16 @@ fn assert_healed_to_a(net: &Network) {
     assert_books_converged(net, &[0, 1, 2], "post-heal partition double-claim");
     for n in 0..3 {
         let winner = net.book(n).get("wiki.mesh").unwrap();
-        assert_eq!(winner.owner_node_id, "a", "node {n} must converge on A (earlier first-claim), zero split-brain");
+        assert_eq!(
+            winner.owner_node_id, "a",
+            "node {n} must converge on A (earlier first-claim), zero split-brain"
+        );
     }
     // B's node must record the loss with A as winner (FR32).
-    let lost = net.lost_names(1).get("wiki.mesh").expect("B must record the conflict loss");
+    let lost = net
+        .lost_names(1)
+        .get("wiki.mesh")
+        .expect("B must record the conflict loss");
     assert_eq!(lost.winner_node_id, "a");
 }
 
@@ -359,15 +412,24 @@ fn equal_first_claimed_at_ties_break_on_node_id_deterministically_on_every_node(
     // only owner_node_id differs. "zulu" > "alpha" lexicographically, so
     // resolve_service_conflict_v2's tiebreak picks "alpha".
     let claim_hlc = 5_000;
-    net.publish_from(0, publish_msg("wiki.mesh", entry("zulu-owner", claim_hlc, claim_hlc, 111)));
-    net.publish_from(1, publish_msg("wiki.mesh", entry("alpha-owner", claim_hlc, claim_hlc, 222)));
+    net.publish_from(
+        0,
+        publish_msg("wiki.mesh", entry("zulu-owner", claim_hlc, claim_hlc, 111)),
+    );
+    net.publish_from(
+        1,
+        publish_msg("wiki.mesh", entry("alpha-owner", claim_hlc, claim_hlc, 222)),
+    );
 
     net.flush_all();
 
     assert_books_converged(&net, &[0, 1, 2], "equal-HLC tiebreak");
     for n in 0..3 {
         let winner = net.book(n).get("wiki.mesh").unwrap();
-        assert_eq!(winner.owner_node_id, "alpha-owner", "node {n} must apply the same deterministic node-id tiebreak");
+        assert_eq!(
+            winner.owner_node_id, "alpha-owner",
+            "node {n} must apply the same deterministic node-id tiebreak"
+        );
     }
 }
 
@@ -387,7 +449,10 @@ fn tombstone_propagates_revives_and_rejects_forged_unpublish_on_every_node() {
     net.publish_from(0, unpublish_msg("wiki.mesh", "a", hlc(2_000, 0, "a")));
     net.flush_all();
     for n in 0..3 {
-        assert!(net.book(n).get("wiki.mesh").is_none(), "node {n} must have dropped the unpublished name");
+        assert!(
+            net.book(n).get("wiki.mesh").is_none(),
+            "node {n} must have dropped the unpublished name"
+        );
     }
 
     // A non-owner's forged unpublish (claims to be "a" while sent by node C,
@@ -396,7 +461,10 @@ fn tombstone_propagates_revives_and_rejects_forged_unpublish_on_every_node() {
     // whoever currently holds any (already-vacant) tombstone/live entry —
     // here there is no live entry, so the forged unpublish from a bogus
     // owner must not disturb the real tombstone.
-    net.publish_from(2, unpublish_msg("wiki.mesh", "forger-node", hlc(1_500, 0, "forger-node")));
+    net.publish_from(
+        2,
+        unpublish_msg("wiki.mesh", "forger-node", hlc(1_500, 0, "forger-node")),
+    );
     net.flush_all();
     for n in 0..3 {
         assert!(net.book(n).get("wiki.mesh").is_none());
@@ -413,7 +481,10 @@ fn tombstone_propagates_revives_and_rejects_forged_unpublish_on_every_node() {
     net.flush_all();
     assert_books_converged(&net, &[0, 1, 2], "after revive");
     for n in 0..3 {
-        let e = net.book(n).get("wiki.mesh").expect("revived name must be answerable on every node");
+        let e = net
+            .book(n)
+            .get("wiki.mesh")
+            .expect("revived name must be answerable on every node");
         assert_eq!(e.owner_node_id, "a");
         assert_eq!(e.port, 8081);
     }
@@ -423,7 +494,10 @@ fn tombstone_propagates_revives_and_rejects_forged_unpublish_on_every_node() {
     net.publish_from(1, unpublish_msg("wiki.mesh", "b", hlc(9_000, 0, "b")));
     net.flush_all();
     for n in 0..3 {
-        let e = net.book(n).get("wiki.mesh").expect("forged non-owner unpublish must be ignored, entry stays live");
+        let e = net
+            .book(n)
+            .get("wiki.mesh")
+            .expect("forged non-owner unpublish must be ignored, entry stays live");
         assert_eq!(e.owner_node_id, "a");
         assert_eq!(e.port, 8081);
     }
@@ -437,7 +511,10 @@ fn duplicate_and_reversed_redelivery_leaves_final_state_unchanged() {
 
     net.publish_from(0, publish_msg("wiki.mesh", entry("a", 1_000, 1_000, 8080)));
     net.publish_from(0, publish_msg("wiki.mesh", entry("a", 1_000, 2_000, 8081))); // same-owner refresh
-    net.publish_from(1, publish_msg("printer.mesh", entry("b", 1_500, 1_500, 631)));
+    net.publish_from(
+        1,
+        publish_msg("printer.mesh", entry("b", 1_500, 1_500, 631)),
+    );
 
     // Capture every link's payloads before the first flush so they can be
     // replayed verbatim afterward.
@@ -451,8 +528,9 @@ fn duplicate_and_reversed_redelivery_leaves_final_state_unchanged() {
     }
 
     net.flush_all();
-    let converged_snapshot: Vec<Vec<u8>> =
-        (0..3).map(|n| postcard::to_allocvec(net.book(n)).unwrap()).collect();
+    let converged_snapshot: Vec<Vec<u8>> = (0..3)
+        .map(|n| postcard::to_allocvec(net.book(n)).unwrap())
+        .collect();
     assert_eq!(converged_snapshot[0], converged_snapshot[1]);
     assert_eq!(converged_snapshot[0], converged_snapshot[2]);
 

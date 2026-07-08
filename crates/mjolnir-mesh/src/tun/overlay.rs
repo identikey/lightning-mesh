@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::tun::encap::{DatagramConn, EncapError};
-use crate::tun::mcast::{classify, OverlayDest};
+use crate::tun::mcast::{OverlayDest, classify};
 
 /// Depth of the inbound queue feeding the single TUN writer. Generous: a burst
 /// of babel updates from many peers should never block a receiver task.
@@ -403,8 +403,7 @@ mod tests {
         let a = wire();
         // Router drops all unicast (None).
         let router = move |_pkt: &[u8]| None::<MockConn>;
-        let handles =
-            spawn_overlay_routed(tun_read, dummy_w, vec![a.conn.clone()], router, 1300);
+        let handles = spawn_overlay_routed(tun_read, dummy_w, vec![a.conn.clone()], router, 1300);
 
         // Send an unroutable unicast — it must be dropped, NOT flooded to A.
         let unicast = ipv4_unicast("10.42.9.9");

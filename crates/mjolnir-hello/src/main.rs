@@ -23,7 +23,7 @@ use tiny_http::{Header, Response, Server};
 use tracing::info;
 
 use config::Config;
-use routes::{new_challenge_store, route, DirectoryCache};
+use routes::{DirectoryCache, new_challenge_store, route};
 
 fn main() {
     tracing_subscriber::fmt::init();
@@ -57,11 +57,8 @@ fn main() {
             &config.directory_file,
         );
 
-        let content_type = Header::from_bytes(
-            &b"Content-Type"[..],
-            resp.content_type.as_bytes(),
-        )
-        .expect("valid content-type header");
+        let content_type = Header::from_bytes(&b"Content-Type"[..], resp.content_type.as_bytes())
+            .expect("valid content-type header");
 
         let response = Response::from_data(resp.body)
             .with_status_code(resp.status)

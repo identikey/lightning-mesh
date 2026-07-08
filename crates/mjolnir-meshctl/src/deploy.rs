@@ -18,7 +18,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
 use crate::apply;
@@ -58,7 +58,10 @@ pub fn ensure_secret(secrets_dir: &Path, router: &str) -> Result<String> {
         .with_context(|| format!("creating {}", secrets_dir.display()))?;
     std::fs::write(&path, format!("{hex}\n"))
         .with_context(|| format!("writing secret {}", path.display()))?;
-    info!("generated persistent node secret for {router} at {}", path.display());
+    info!(
+        "generated persistent node secret for {router} at {}",
+        path.display()
+    );
     Ok(hex)
 }
 
@@ -226,10 +229,10 @@ pub async fn read_blob_for_id(
         for line in out.lines() {
             if let Some(idx) = line.find("node id:") {
                 last_id = Some(line[idx + "node id:".len()..].trim());
-            } else if let Some(idx) = line.find("address:") {
-                if last_id == Some(expected_id) {
-                    blob = Some(line[idx + "address:".len()..].trim().to_string());
-                }
+            } else if let Some(idx) = line.find("address:")
+                && last_id == Some(expected_id)
+            {
+                blob = Some(line[idx + "address:".len()..].trim().to_string());
             }
         }
         if blob.is_some() {
@@ -275,7 +278,11 @@ pub async fn deploy_one(
     for c in &changes {
         apply::run_change(ssh, c).await?;
     }
-    info!("{}: network converged ({} change(s))", r.name, changes.len());
+    info!(
+        "{}: network converged ({} change(s))",
+        r.name,
+        changes.len()
+    );
 
     // 2. Upload the container tar.
     let tar = r
@@ -313,7 +320,9 @@ pub async fn deploy_one(
         root = opts.root_dir,
         dns = opts.dns,
     );
-    routeros::run_command(ssh, &add).await.context("container add")?;
+    routeros::run_command(ssh, &add)
+        .await
+        .context("container add")?;
     info!("{}: container added; waiting for extraction…", r.name);
     wait_present(ssh, opts.timeout).await?;
     // This RouterOS exposes no "extracting" signal — only stopped/running. Give
@@ -343,8 +352,7 @@ pub async fn report_reachability(ssh: &Ssh, name: &str, timeout: Duration) -> Re
         // that instant — but the relay handshake usually completes a few seconds
         // later, logging "home is now relay …". Either is a positive signal; the
         // startup "NOT REACHABLE" snapshot is NOT treated as terminal.
-        let reachable =
-            out.contains("reachability OK") || out.contains("home is now relay");
+        let reachable = out.contains("reachability OK") || out.contains("home is now relay");
         if reachable {
             info!("{name}: reachable (relay acquired) ✓");
             return Ok(true);

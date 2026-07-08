@@ -39,9 +39,9 @@ mod linux {
     use rtnetlink::new_connection;
     use tokio::net::UdpSocket;
 
+    use mjolnir_mesh::tun::TUNNEL_MTU;
     use mjolnir_mesh::tun::encap::{DatagramConn, EncapError};
     use mjolnir_mesh::tun::overlay::spawn_overlay;
-    use mjolnir_mesh::tun::TUNNEL_MTU;
 
     /// A `DatagramConn` backed by an UNCONNECTED UDP socket — the spike's
     /// stand-in for an iroh connection. Same one-packet-in / one-packet-out
@@ -73,7 +73,11 @@ mod linux {
         async fn recv_datagram(&self) -> Result<Bytes, EncapError> {
             let mut buf = vec![0u8; TUNNEL_MTU as usize];
             // Accept from the peer only; ignore stray datagrams.
-            let (n, _from) = self.sock.recv_from(&mut buf).await.map_err(EncapError::from)?;
+            let (n, _from) = self
+                .sock
+                .recv_from(&mut buf)
+                .await
+                .map_err(EncapError::from)?;
             buf.truncate(n);
             Ok(Bytes::from(buf))
         }
@@ -97,7 +101,10 @@ mod linux {
 
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
-            let mut val = || it.next().unwrap_or_else(|| panic!("missing value for {flag}"));
+            let mut val = || {
+                it.next()
+                    .unwrap_or_else(|| panic!("missing value for {flag}"))
+            };
             match flag.as_str() {
                 "--tun" => tun = val(),
                 "--addr" => addr_cidr = val(),

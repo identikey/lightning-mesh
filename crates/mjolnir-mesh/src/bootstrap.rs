@@ -125,14 +125,24 @@ mod tests {
     fn entry(id: &str, announced: u64) -> PeerAddrEntry {
         PeerAddrEntry {
             node_id: id.to_string(),
-            direct_addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 254, 0, 1)), 7000)],
+            direct_addrs: vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 254, 0, 1)),
+                7000,
+            )],
             relay_url: None,
-            announced_at: HLC { wall_clock: announced, counter: 0, node_id: id.to_string() },
+            announced_at: HLC {
+                wall_clock: announced,
+                counter: 0,
+                node_id: id.to_string(),
+            },
         }
     }
 
     fn book(entries: &[(&str, u64)]) -> AddrBook {
-        entries.iter().map(|(id, a)| (id.to_string(), entry(id, *a))).collect()
+        entries
+            .iter()
+            .map(|(id, a)| (id.to_string(), entry(id, *a)))
+            .collect()
     }
 
     fn s(ids: &[&str]) -> Vec<String> {
@@ -142,7 +152,13 @@ mod tests {
     #[test]
     fn roster_only_when_nothing_else_known() {
         let got = rank_bootstrap_candidates(
-            &s(&["a", "b"]), &AddrBook::new(), &[], &tracker(), "self", 1_000, 16,
+            &s(&["a", "b"]),
+            &AddrBook::new(),
+            &[],
+            &tracker(),
+            "self",
+            1_000,
+            16,
         );
         assert_eq!(got, s(&["a", "b"]));
     }
@@ -150,8 +166,13 @@ mod tests {
     #[test]
     fn self_is_always_excluded() {
         let got = rank_bootstrap_candidates(
-            &s(&["self", "a"]), &book(&[("self", 5), ("b", 5)]), &s(&["self"]),
-            &tracker(), "self", 1_000, 16,
+            &s(&["self", "a"]),
+            &book(&[("self", 5), ("b", 5)]),
+            &s(&["self"]),
+            &tracker(),
+            "self",
+            1_000,
+            16,
         );
         assert!(!got.contains(&"self".to_string()));
         assert!(got.contains(&"a".to_string()));
@@ -163,7 +184,13 @@ mod tests {
         // The island bug: roster peer "r" is down, but "ab" (addrbook) and "co"
         // (claim owner) are live and dialable — the union must surface them.
         let got = rank_bootstrap_candidates(
-            &s(&["r"]), &book(&[("ab", 10)]), &s(&["co"]), &tracker(), "self", 1_000, 16,
+            &s(&["r"]),
+            &book(&[("ab", 10)]),
+            &s(&["co"]),
+            &tracker(),
+            "self",
+            1_000,
+            16,
         );
         assert_eq!(got, s(&["r", "ab", "co"]));
     }
@@ -172,9 +199,8 @@ mod tests {
     fn roster_ranks_ahead_of_learned_peers() {
         let mut t = tracker();
         t.observe("ab", 1, 1, 900); // recently seen, but still after roster
-        let got = rank_bootstrap_candidates(
-            &s(&["r"]), &book(&[("ab", 10)]), &[], &t, "self", 1_000, 16,
-        );
+        let got =
+            rank_bootstrap_candidates(&s(&["r"]), &book(&[("ab", 10)]), &[], &t, "self", 1_000, 16);
         assert_eq!(got[0], "r");
     }
 
@@ -222,9 +248,8 @@ mod tests {
     #[test]
     fn cap_bounds_the_set_and_keeps_highest_priority() {
         let addr = book(&[("d1", 900), ("d2", 800), ("d3", 700)]);
-        let got = rank_bootstrap_candidates(
-            &s(&["r1", "r2"]), &addr, &[], &tracker(), "self", 1_000, 3,
-        );
+        let got =
+            rank_bootstrap_candidates(&s(&["r1", "r2"]), &addr, &[], &tracker(), "self", 1_000, 3);
         // Roster first (2), then the single highest-announced disk peer.
         assert_eq!(got, s(&["r1", "r2", "d1"]));
     }
@@ -232,7 +257,13 @@ mod tests {
     #[test]
     fn cap_zero_is_empty() {
         let got = rank_bootstrap_candidates(
-            &s(&["a"]), &book(&[("b", 1)]), &[], &tracker(), "self", 1_000, 0,
+            &s(&["a"]),
+            &book(&[("b", 1)]),
+            &[],
+            &tracker(),
+            "self",
+            1_000,
+            0,
         );
         assert!(got.is_empty());
     }
@@ -244,7 +275,13 @@ mod tests {
         let mut t = tracker();
         t.observe("x", 1, 1, 950);
         let got = rank_bootstrap_candidates(
-            &s(&["x"]), &book(&[("x", 10), ("y", 10)]), &s(&["x"]), &t, "self", 1_000, 16,
+            &s(&["x"]),
+            &book(&[("x", 10), ("y", 10)]),
+            &s(&["x"]),
+            &t,
+            "self",
+            1_000,
+            16,
         );
         assert_eq!(got.iter().filter(|id| *id == "x").count(), 1);
         assert_eq!(got[0], "x");

@@ -1,5 +1,5 @@
 use crate::crdt::peer_addr::PeerAddrEntry;
-use crate::crdt::service::{is_reserved_service_name, ServiceEntry, ServiceEntryV2};
+use crate::crdt::service::{ServiceEntry, ServiceEntryV2, is_reserved_service_name};
 use crate::crdt::subnet::SubnetClaim;
 use crate::crdt::users::UserEntry;
 use std::cmp::Ordering;
@@ -208,7 +208,10 @@ pub fn merge_service_v2(
                 }
             } else {
                 let (winner, loser) = resolve_service_conflict_v2(existing, incoming);
-                MergeResult::Conflict { winner: winner.clone(), loser: loser.clone() }
+                MergeResult::Conflict {
+                    winner: winner.clone(),
+                    loser: loser.clone(),
+                }
             }
         }
     })
@@ -244,7 +247,10 @@ mod tests {
     #[test]
     fn inserted_when_no_local() {
         let incoming = claim("router-a", 1_000, 0, "router-a");
-        assert!(matches!(merge_subnet_claim(None, &incoming), MergeResult::Inserted));
+        assert!(matches!(
+            merge_subnet_claim(None, &incoming),
+            MergeResult::Inserted
+        ));
     }
 
     #[test]
@@ -363,7 +369,10 @@ mod tests {
     #[test]
     fn peer_addr_inserted_when_no_local() {
         let incoming = peer("node-a", 1_000, 0);
-        assert!(matches!(merge_peer_addr(None, &incoming), MergeResult::Inserted));
+        assert!(matches!(
+            merge_peer_addr(None, &incoming),
+            MergeResult::Inserted
+        ));
     }
 
     #[test]
@@ -410,7 +419,11 @@ mod tests {
         // Same wall_clock, higher counter → newer.
         let local = peer("node-a", 1_000, 0);
         let incoming = PeerAddrEntry {
-            announced_at: HLC { wall_clock: 1_000, counter: 1, node_id: "node-a".to_string() },
+            announced_at: HLC {
+                wall_clock: 1_000,
+                counter: 1,
+                node_id: "node-a".to_string(),
+            },
             ..peer("node-a", 1_000, 0)
         };
         assert!(matches!(
@@ -421,7 +434,13 @@ mod tests {
 
     // --- merge_user tests (bead 2xd) ---
 
-    fn user(username: &str, display: &str, wall_clock: u64, counter: u32, node_id: &str) -> UserEntry {
+    fn user(
+        username: &str,
+        display: &str,
+        wall_clock: u64,
+        counter: u32,
+        node_id: &str,
+    ) -> UserEntry {
         UserEntry {
             username: username.to_string(),
             display_name: display.to_string(),
@@ -445,20 +464,29 @@ mod tests {
     fn user_updated_on_newer() {
         let local = user("ada", "Ada", 1_000, 0, "router-a");
         let incoming = user("ada", "Ada Lovelace", 2_000, 0, "router-b");
-        assert!(matches!(merge_user(Some(&local), &incoming), MergeResult::Updated));
+        assert!(matches!(
+            merge_user(Some(&local), &incoming),
+            MergeResult::Updated
+        ));
     }
 
     #[test]
     fn user_unchanged_on_older() {
         let local = user("ada", "Ada Lovelace", 2_000, 0, "router-b");
         let incoming = user("ada", "Ada", 1_000, 0, "router-a");
-        assert!(matches!(merge_user(Some(&local), &incoming), MergeResult::Unchanged));
+        assert!(matches!(
+            merge_user(Some(&local), &incoming),
+            MergeResult::Unchanged
+        ));
     }
 
     #[test]
     fn user_unchanged_on_duplicate() {
         let entry = user("ada", "Ada", 5_000, 2, "router-a");
-        assert!(matches!(merge_user(Some(&entry), &entry), MergeResult::Unchanged));
+        assert!(matches!(
+            merge_user(Some(&entry), &entry),
+            MergeResult::Unchanged
+        ));
     }
 
     #[test]
@@ -466,12 +494,21 @@ mod tests {
         // Equal wall_clock, higher counter → newer.
         let local = user("ada", "Ada", 1_000, 0, "router-a");
         let incoming = user("ada", "Ada2", 1_000, 1, "router-a");
-        assert!(matches!(merge_user(Some(&local), &incoming), MergeResult::Updated));
+        assert!(matches!(
+            merge_user(Some(&local), &incoming),
+            MergeResult::Updated
+        ));
     }
 
     // --- merge_service tests (bead 7jb) ---
 
-    fn service(hostname: &str, port: u16, wall_clock: u64, counter: u32, node_id: &str) -> ServiceEntry {
+    fn service(
+        hostname: &str,
+        port: u16,
+        wall_clock: u64,
+        counter: u32,
+        node_id: &str,
+    ) -> ServiceEntry {
         use std::net::{IpAddr, Ipv4Addr};
         ServiceEntry {
             hostname: hostname.to_string(),
@@ -491,27 +528,39 @@ mod tests {
     #[test]
     fn service_inserted_when_no_local() {
         let incoming = service("printer", 631, 1_000, 0, "router-a");
-        assert!(matches!(merge_service(None, &incoming), MergeResult::Inserted));
+        assert!(matches!(
+            merge_service(None, &incoming),
+            MergeResult::Inserted
+        ));
     }
 
     #[test]
     fn service_updated_on_newer() {
         let local = service("printer", 631, 1_000, 0, "router-a");
         let incoming = service("printer", 9100, 2_000, 0, "router-b");
-        assert!(matches!(merge_service(Some(&local), &incoming), MergeResult::Updated));
+        assert!(matches!(
+            merge_service(Some(&local), &incoming),
+            MergeResult::Updated
+        ));
     }
 
     #[test]
     fn service_unchanged_on_older() {
         let local = service("printer", 9100, 2_000, 0, "router-b");
         let incoming = service("printer", 631, 1_000, 0, "router-a");
-        assert!(matches!(merge_service(Some(&local), &incoming), MergeResult::Unchanged));
+        assert!(matches!(
+            merge_service(Some(&local), &incoming),
+            MergeResult::Unchanged
+        ));
     }
 
     #[test]
     fn service_unchanged_on_duplicate() {
         let entry = service("printer", 631, 5_000, 2, "router-a");
-        assert!(matches!(merge_service(Some(&entry), &entry), MergeResult::Unchanged));
+        assert!(matches!(
+            merge_service(Some(&entry), &entry),
+            MergeResult::Unchanged
+        ));
     }
 
     #[test]
@@ -519,7 +568,10 @@ mod tests {
         // Equal wall_clock, higher counter → newer.
         let local = service("printer", 631, 1_000, 0, "router-a");
         let incoming = service("printer", 9100, 1_000, 1, "router-a");
-        assert!(matches!(merge_service(Some(&local), &incoming), MergeResult::Updated));
+        assert!(matches!(
+            merge_service(Some(&local), &incoming),
+            MergeResult::Updated
+        ));
     }
 
     #[test]
@@ -527,7 +579,10 @@ mod tests {
         // Equal wall_clock and counter, higher node_id → newer (deterministic).
         let local = service("printer", 631, 1_000, 0, "aaa");
         let incoming = service("printer", 9100, 1_000, 0, "zzz");
-        assert!(matches!(merge_service(Some(&local), &incoming), MergeResult::Updated));
+        assert!(matches!(
+            merge_service(Some(&local), &incoming),
+            MergeResult::Updated
+        ));
     }
 
     // --- merge_service_v2 tests (bead e21.2.1) ---
@@ -647,8 +702,16 @@ mod tests {
 
     #[test]
     fn v2_different_owner_equal_first_claimed_tiebreaks_on_owner_node_id() {
-        let a = service_v2("aaa-owner", (1_000, 0, "shared-node"), (1_000, 0, "shared-node"));
-        let b = service_v2("zzz-owner", (1_000, 0, "shared-node"), (1_000, 0, "shared-node"));
+        let a = service_v2(
+            "aaa-owner",
+            (1_000, 0, "shared-node"),
+            (1_000, 0, "shared-node"),
+        );
+        let b = service_v2(
+            "zzz-owner",
+            (1_000, 0, "shared-node"),
+            (1_000, 0, "shared-node"),
+        );
         match merge_service_v2("printer", Some(&a), &b) {
             Ok(MergeResult::Conflict { winner, loser }) => {
                 assert_eq!(winner.owner_node_id, "aaa-owner");
@@ -719,8 +782,16 @@ mod tests {
 
     #[test]
     fn v2_conflict_resolution_is_symmetric_equal_first_claimed() {
-        let a = service_v2("aaa-owner", (1_000, 0, "shared-node"), (1_000, 0, "shared-node"));
-        let b = service_v2("zzz-owner", (1_000, 0, "shared-node"), (9_000, 0, "shared-node"));
+        let a = service_v2(
+            "aaa-owner",
+            (1_000, 0, "shared-node"),
+            (1_000, 0, "shared-node"),
+        );
+        let b = service_v2(
+            "zzz-owner",
+            (1_000, 0, "shared-node"),
+            (9_000, 0, "shared-node"),
+        );
         assert_symmetric_conflict(&a, &b);
     }
 

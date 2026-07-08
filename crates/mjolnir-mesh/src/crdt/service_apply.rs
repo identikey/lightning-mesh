@@ -27,10 +27,10 @@
 //!   same owner (HLC-ordered, newer wins) or, if no tombstone exists yet,
 //!   records a fresh one.
 
-use crate::crdt::merge::{merge_service_v2, MergeResult, ReservedServiceName};
+use crate::crdt::merge::{MergeResult, ReservedServiceName, merge_service_v2};
 use crate::crdt::service::{
-    is_reserved_service_name, LostName, LostNameMap, ServiceBookV2, ServiceEntryV2,
-    ServiceTombstone, ServiceTombstoneBook,
+    LostName, LostNameMap, ServiceBookV2, ServiceEntryV2, ServiceTombstone, ServiceTombstoneBook,
+    is_reserved_service_name,
 };
 
 /// Outcome of applying a `ServicePublishV2` message.
@@ -155,7 +155,10 @@ fn track_conflict_loss(
     if loser.owner_node_id == self_id {
         lost_names.insert(
             name.to_string(),
-            LostName { winner_node_id: winner.owner_node_id.clone(), hlc: winner.first_claimed_at.clone() },
+            LostName {
+                winner_node_id: winner.owner_node_id.clone(),
+                hlc: winner.first_claimed_at.clone(),
+            },
         );
     }
 }
@@ -198,7 +201,9 @@ pub fn publish_service_v2(
         return Err(ServicePublishError::Reserved(name.to_string()));
     }
     if let Some(lost) = lost_names.get(name) {
-        return Err(ServicePublishError::LostToPeer { winner_node_id: lost.winner_node_id.clone() });
+        return Err(ServicePublishError::LostToPeer {
+            winner_node_id: lost.winner_node_id.clone(),
+        });
     }
     apply_service_publish_v2_tracking_loss(book, tombstones, lost_names, self_id, name, incoming)
         .map_err(|ReservedServiceName(n)| ServicePublishError::Reserved(n))
@@ -220,7 +225,10 @@ pub fn apply_service_unpublish_v2(
         book.remove(name);
         tombstones.insert(
             name.to_string(),
-            ServiceTombstone { owner_node_id: owner_node_id.to_string(), hlc },
+            ServiceTombstone {
+                owner_node_id: owner_node_id.to_string(),
+                hlc,
+            },
         );
         return UnpublishOutcome::Unpublished;
     }
@@ -229,7 +237,10 @@ pub fn apply_service_unpublish_v2(
         None => {
             tombstones.insert(
                 name.to_string(),
-                ServiceTombstone { owner_node_id: owner_node_id.to_string(), hlc },
+                ServiceTombstone {
+                    owner_node_id: owner_node_id.to_string(),
+                    hlc,
+                },
             );
             UnpublishOutcome::TombstoneRecorded
         }
@@ -240,7 +251,10 @@ pub fn apply_service_unpublish_v2(
             if hlc > existing.hlc {
                 tombstones.insert(
                     name.to_string(),
-                    ServiceTombstone { owner_node_id: owner_node_id.to_string(), hlc },
+                    ServiceTombstone {
+                        owner_node_id: owner_node_id.to_string(),
+                        hlc,
+                    },
                 );
                 UnpublishOutcome::TombstoneRecorded
             } else {
@@ -259,7 +273,11 @@ mod tests {
     use crate::crdt::hlc::HLC;
 
     fn hlc(wall_clock: u64, counter: u32, node_id: &str) -> HLC {
-        HLC { wall_clock, counter, node_id: node_id.to_string() }
+        HLC {
+            wall_clock,
+            counter,
+            node_id: node_id.to_string(),
+        }
     }
 
     fn entry(owner: &str, wall_clock: u64, counter: u32, node_id: &str) -> ServiceEntryV2 {
@@ -282,8 +300,12 @@ mod tests {
         let mut book = ServiceBookV2::new();
         let tombstones = ServiceTombstoneBook::new();
         let incoming = entry("router-a", 1_000, 0, "router-a");
-        let result = apply_service_publish_v2(&mut book, &tombstones, "printer", incoming.clone()).unwrap();
-        assert_eq!(result, PublishOutcome::Merged(Box::new(MergeResult::Inserted)));
+        let result =
+            apply_service_publish_v2(&mut book, &tombstones, "printer", incoming.clone()).unwrap();
+        assert_eq!(
+            result,
+            PublishOutcome::Merged(Box::new(MergeResult::Inserted))
+        );
         assert_eq!(book.get("printer"), Some(&incoming));
     }
 
@@ -297,8 +319,12 @@ mod tests {
         let tombstones = ServiceTombstoneBook::new();
 
         let incoming = entry("router-a", 2_000, 0, "router-a");
-        let result = apply_service_publish_v2(&mut book, &tombstones, "printer", incoming.clone()).unwrap();
-        assert_eq!(result, PublishOutcome::Merged(Box::new(MergeResult::Updated)));
+        let result =
+            apply_service_publish_v2(&mut book, &tombstones, "printer", incoming.clone()).unwrap();
+        assert_eq!(
+            result,
+            PublishOutcome::Merged(Box::new(MergeResult::Updated))
+        );
         assert_eq!(book.get("printer"), Some(&incoming));
     }
 
@@ -311,7 +337,10 @@ mod tests {
 
         let incoming = entry("router-a", 1_000, 0, "router-a");
         let result = apply_service_publish_v2(&mut book, &tombstones, "printer", incoming).unwrap();
-        assert_eq!(result, PublishOutcome::Merged(Box::new(MergeResult::Unchanged)));
+        assert_eq!(
+            result,
+            PublishOutcome::Merged(Box::new(MergeResult::Unchanged))
+        );
         assert_eq!(book.get("printer"), Some(&local));
     }
 
@@ -323,14 +352,17 @@ mod tests {
         let mut tombstones = ServiceTombstoneBook::new();
         tombstones.insert(
             "printer".to_string(),
-            ServiceTombstone { owner_node_id: "router-a".to_string(), hlc: hlc(2_000, 0, "router-a") },
+            ServiceTombstone {
+                owner_node_id: "router-a".to_string(),
+                hlc: hlc(2_000, 0, "router-a"),
+            },
         );
 
         // Same owner, but stale HLC (older than the tombstone) — replay, rejected.
         let incoming = entry("router-a", 1_000, 0, "router-a");
         let result = apply_service_publish_v2(&mut book, &tombstones, "printer", incoming).unwrap();
         assert_eq!(result, PublishOutcome::RejectedByTombstone);
-        assert!(book.get("printer").is_none());
+        assert!(!book.contains_key("printer"));
     }
 
     #[test]
@@ -339,7 +371,10 @@ mod tests {
         let mut tombstones = ServiceTombstoneBook::new();
         tombstones.insert(
             "printer".to_string(),
-            ServiceTombstone { owner_node_id: "router-a".to_string(), hlc: hlc(2_000, 0, "router-a") },
+            ServiceTombstone {
+                owner_node_id: "router-a".to_string(),
+                hlc: hlc(2_000, 0, "router-a"),
+            },
         );
 
         let incoming = entry("router-a", 2_000, 0, "router-a");
@@ -353,11 +388,15 @@ mod tests {
         let mut tombstones = ServiceTombstoneBook::new();
         tombstones.insert(
             "printer".to_string(),
-            ServiceTombstone { owner_node_id: "router-a".to_string(), hlc: hlc(2_000, 0, "router-a") },
+            ServiceTombstone {
+                owner_node_id: "router-a".to_string(),
+                hlc: hlc(2_000, 0, "router-a"),
+            },
         );
 
         let incoming = entry("router-a", 3_000, 0, "router-a");
-        let result = apply_service_publish_v2(&mut book, &tombstones, "printer", incoming.clone()).unwrap();
+        let result =
+            apply_service_publish_v2(&mut book, &tombstones, "printer", incoming.clone()).unwrap();
         assert_eq!(result, PublishOutcome::Revived);
         assert_eq!(book.get("printer"), Some(&incoming));
     }
@@ -371,13 +410,16 @@ mod tests {
         let mut tombstones = ServiceTombstoneBook::new();
         tombstones.insert(
             "printer".to_string(),
-            ServiceTombstone { owner_node_id: "router-a".to_string(), hlc: hlc(2_000, 0, "router-a") },
+            ServiceTombstone {
+                owner_node_id: "router-a".to_string(),
+                hlc: hlc(2_000, 0, "router-a"),
+            },
         );
 
         let incoming = entry("router-b", 9_000, 0, "router-b");
         let result = apply_service_publish_v2(&mut book, &tombstones, "printer", incoming).unwrap();
         assert_eq!(result, PublishOutcome::RejectedByTombstone);
-        assert!(book.get("printer").is_none());
+        assert!(!book.contains_key("printer"));
     }
 
     #[test]
@@ -400,10 +442,19 @@ mod tests {
         let tombstones = ServiceTombstoneBook::new();
 
         let incoming = entry("router-b", 2_000, 0, "router-b"); // later first_claimed_at, loses
-        let result = apply_service_publish_v2(&mut book, &tombstones, "printer", incoming.clone()).unwrap();
+        let result =
+            apply_service_publish_v2(&mut book, &tombstones, "printer", incoming.clone()).unwrap();
         match result {
-            PublishOutcome::Merged(ref boxed) if matches!(**boxed, MergeResult::Conflict { .. }) => {
-                let MergeResult::Conflict { ref winner, ref loser } = **boxed else { unreachable!() };
+            PublishOutcome::Merged(ref boxed)
+                if matches!(**boxed, MergeResult::Conflict { .. }) =>
+            {
+                let MergeResult::Conflict {
+                    ref winner,
+                    ref loser,
+                } = **boxed
+                else {
+                    unreachable!()
+                };
                 assert_eq!(winner.owner_node_id, "router-a");
                 assert_eq!(loser.owner_node_id, "router-b");
             }
@@ -418,29 +469,50 @@ mod tests {
     #[test]
     fn unpublish_by_owner_removes_entry_and_tombstones() {
         let mut book = ServiceBookV2::new();
-        book.insert("printer".to_string(), entry("router-a", 1_000, 0, "router-a"));
+        book.insert(
+            "printer".to_string(),
+            entry("router-a", 1_000, 0, "router-a"),
+        );
         let mut tombstones = ServiceTombstoneBook::new();
 
-        let result = apply_service_unpublish_v2(&mut book, &mut tombstones, "printer", "router-a", hlc(2_000, 0, "router-a"));
+        let result = apply_service_unpublish_v2(
+            &mut book,
+            &mut tombstones,
+            "printer",
+            "router-a",
+            hlc(2_000, 0, "router-a"),
+        );
         assert_eq!(result, UnpublishOutcome::Unpublished);
-        assert!(book.get("printer").is_none());
+        assert!(!book.contains_key("printer"));
         assert_eq!(
             tombstones.get("printer"),
-            Some(&ServiceTombstone { owner_node_id: "router-a".to_string(), hlc: hlc(2_000, 0, "router-a") })
+            Some(&ServiceTombstone {
+                owner_node_id: "router-a".to_string(),
+                hlc: hlc(2_000, 0, "router-a")
+            })
         );
     }
 
     #[test]
     fn unpublish_by_non_owner_of_live_entry_ignored() {
         let mut book = ServiceBookV2::new();
-        book.insert("printer".to_string(), entry("router-a", 1_000, 0, "router-a"));
+        book.insert(
+            "printer".to_string(),
+            entry("router-a", 1_000, 0, "router-a"),
+        );
         let mut tombstones = ServiceTombstoneBook::new();
 
-        let result = apply_service_unpublish_v2(&mut book, &mut tombstones, "printer", "router-b", hlc(2_000, 0, "router-b"));
+        let result = apply_service_unpublish_v2(
+            &mut book,
+            &mut tombstones,
+            "printer",
+            "router-b",
+            hlc(2_000, 0, "router-b"),
+        );
         assert_eq!(result, UnpublishOutcome::IgnoredNotOwner);
         // Neither the book nor the tombstone store is touched.
-        assert!(book.get("printer").is_some());
-        assert!(tombstones.get("printer").is_none());
+        assert!(book.contains_key("printer"));
+        assert!(!tombstones.contains_key("printer"));
     }
 
     // --- unpublish: no live entry ---
@@ -450,11 +522,20 @@ mod tests {
         let mut book = ServiceBookV2::new();
         let mut tombstones = ServiceTombstoneBook::new();
 
-        let result = apply_service_unpublish_v2(&mut book, &mut tombstones, "printer", "router-a", hlc(1_000, 0, "router-a"));
+        let result = apply_service_unpublish_v2(
+            &mut book,
+            &mut tombstones,
+            "printer",
+            "router-a",
+            hlc(1_000, 0, "router-a"),
+        );
         assert_eq!(result, UnpublishOutcome::TombstoneRecorded);
         assert_eq!(
             tombstones.get("printer"),
-            Some(&ServiceTombstone { owner_node_id: "router-a".to_string(), hlc: hlc(1_000, 0, "router-a") })
+            Some(&ServiceTombstone {
+                owner_node_id: "router-a".to_string(),
+                hlc: hlc(1_000, 0, "router-a")
+            })
         );
     }
 
@@ -464,12 +545,24 @@ mod tests {
         let mut tombstones = ServiceTombstoneBook::new();
         tombstones.insert(
             "printer".to_string(),
-            ServiceTombstone { owner_node_id: "router-a".to_string(), hlc: hlc(1_000, 0, "router-a") },
+            ServiceTombstone {
+                owner_node_id: "router-a".to_string(),
+                hlc: hlc(1_000, 0, "router-a"),
+            },
         );
 
-        let result = apply_service_unpublish_v2(&mut book, &mut tombstones, "printer", "router-a", hlc(2_000, 0, "router-a"));
+        let result = apply_service_unpublish_v2(
+            &mut book,
+            &mut tombstones,
+            "printer",
+            "router-a",
+            hlc(2_000, 0, "router-a"),
+        );
         assert_eq!(result, UnpublishOutcome::TombstoneRecorded);
-        assert_eq!(tombstones.get("printer").unwrap().hlc, hlc(2_000, 0, "router-a"));
+        assert_eq!(
+            tombstones.get("printer").unwrap().hlc,
+            hlc(2_000, 0, "router-a")
+        );
     }
 
     #[test]
@@ -478,12 +571,24 @@ mod tests {
         let mut tombstones = ServiceTombstoneBook::new();
         tombstones.insert(
             "printer".to_string(),
-            ServiceTombstone { owner_node_id: "router-a".to_string(), hlc: hlc(2_000, 0, "router-a") },
+            ServiceTombstone {
+                owner_node_id: "router-a".to_string(),
+                hlc: hlc(2_000, 0, "router-a"),
+            },
         );
 
-        let result = apply_service_unpublish_v2(&mut book, &mut tombstones, "printer", "router-a", hlc(1_000, 0, "router-a"));
+        let result = apply_service_unpublish_v2(
+            &mut book,
+            &mut tombstones,
+            "printer",
+            "router-a",
+            hlc(1_000, 0, "router-a"),
+        );
         assert_eq!(result, UnpublishOutcome::Unchanged);
-        assert_eq!(tombstones.get("printer").unwrap().hlc, hlc(2_000, 0, "router-a"));
+        assert_eq!(
+            tombstones.get("printer").unwrap().hlc,
+            hlc(2_000, 0, "router-a")
+        );
     }
 
     #[test]
@@ -492,10 +597,19 @@ mod tests {
         let mut tombstones = ServiceTombstoneBook::new();
         tombstones.insert(
             "printer".to_string(),
-            ServiceTombstone { owner_node_id: "router-a".to_string(), hlc: hlc(1_000, 0, "router-a") },
+            ServiceTombstone {
+                owner_node_id: "router-a".to_string(),
+                hlc: hlc(1_000, 0, "router-a"),
+            },
         );
 
-        let result = apply_service_unpublish_v2(&mut book, &mut tombstones, "printer", "router-b", hlc(9_000, 0, "router-b"));
+        let result = apply_service_unpublish_v2(
+            &mut book,
+            &mut tombstones,
+            "printer",
+            "router-b",
+            hlc(9_000, 0, "router-b"),
+        );
         assert_eq!(result, UnpublishOutcome::IgnoredNotOwner);
         assert_eq!(tombstones.get("printer").unwrap().owner_node_id, "router-a");
     }
@@ -513,25 +627,32 @@ mod tests {
         assert_eq!(r1, PublishOutcome::Merged(Box::new(MergeResult::Inserted)));
 
         // 2. Owner unpublishes.
-        let r2 = apply_service_unpublish_v2(&mut book, &mut tombstones, "printer", "router-a", hlc(2_000, 0, "router-a"));
+        let r2 = apply_service_unpublish_v2(
+            &mut book,
+            &mut tombstones,
+            "printer",
+            "router-a",
+            hlc(2_000, 0, "router-a"),
+        );
         assert_eq!(r2, UnpublishOutcome::Unpublished);
-        assert!(book.get("printer").is_none());
+        assert!(!book.contains_key("printer"));
 
         // 3. A stale, pre-unpublish republish (older HLC) must not resurrect it.
         let stale = entry("router-a", 1_500, 0, "router-a");
         let r3 = apply_service_publish_v2(&mut book, &tombstones, "printer", stale).unwrap();
         assert_eq!(r3, PublishOutcome::RejectedByTombstone);
-        assert!(book.get("printer").is_none());
+        assert!(!book.contains_key("printer"));
 
         // 4. A different owner cannot claim the vacated name.
         let intruder = entry("router-b", 5_000, 0, "router-b");
         let r4 = apply_service_publish_v2(&mut book, &tombstones, "printer", intruder).unwrap();
         assert_eq!(r4, PublishOutcome::RejectedByTombstone);
-        assert!(book.get("printer").is_none());
+        assert!(!book.contains_key("printer"));
 
         // 5. The original owner republishes with a newer HLC than the tombstone: revives.
         let revived = entry("router-a", 3_000, 0, "router-a");
-        let r5 = apply_service_publish_v2(&mut book, &tombstones, "printer", revived.clone()).unwrap();
+        let r5 =
+            apply_service_publish_v2(&mut book, &tombstones, "printer", revived.clone()).unwrap();
         assert_eq!(r5, PublishOutcome::Revived);
         assert_eq!(book.get("printer"), Some(&revived));
     }
@@ -548,11 +669,20 @@ mod tests {
 
         let incoming = entry("peer-node", 1_000, 0, "peer-node"); // earlier -> wins
         let outcome = apply_service_publish_v2_tracking_loss(
-            &mut book, &tombstones, &mut lost_names, "self-node", "printer", incoming,
+            &mut book,
+            &tombstones,
+            &mut lost_names,
+            "self-node",
+            "printer",
+            incoming,
         )
         .unwrap();
-        assert!(matches!(outcome, PublishOutcome::Merged(ref boxed) if matches!(**boxed, MergeResult::Conflict { .. })));
-        let lost = lost_names.get("printer").expect("self should be recorded as loser");
+        assert!(
+            matches!(outcome, PublishOutcome::Merged(ref boxed) if matches!(**boxed, MergeResult::Conflict { .. }))
+        );
+        let lost = lost_names
+            .get("printer")
+            .expect("self should be recorded as loser");
         assert_eq!(lost.winner_node_id, "peer-node");
         assert_eq!(lost.hlc, hlc(1_000, 0, "peer-node"));
     }
@@ -567,10 +697,15 @@ mod tests {
 
         let incoming = entry("peer-node", 2_000, 0, "peer-node"); // later -> loses
         apply_service_publish_v2_tracking_loss(
-            &mut book, &tombstones, &mut lost_names, "self-node", "printer", incoming,
+            &mut book,
+            &tombstones,
+            &mut lost_names,
+            "self-node",
+            "printer",
+            incoming,
         )
         .unwrap();
-        assert!(lost_names.get("printer").is_none());
+        assert!(!lost_names.contains_key("printer"));
     }
 
     #[test]
@@ -581,10 +716,15 @@ mod tests {
 
         let incoming = entry("self-node", 1_000, 0, "self-node");
         apply_service_publish_v2_tracking_loss(
-            &mut book, &tombstones, &mut lost_names, "self-node", "printer", incoming,
+            &mut book,
+            &tombstones,
+            &mut lost_names,
+            "self-node",
+            "printer",
+            incoming,
         )
         .unwrap();
-        assert!(lost_names.get("printer").is_none());
+        assert!(!lost_names.contains_key("printer"));
     }
 
     // --- publish_service_v2 (bead e21.2.3/e21.2.4 daemon-facing seam) ---
@@ -596,8 +736,15 @@ mod tests {
         let mut lost_names = LostNameMap::new();
         let incoming = entry("self-node", 1_000, 0, "self-node");
 
-        let err = publish_service_v2(&mut book, &tombstones, &mut lost_names, "self-node", "hello", incoming)
-            .unwrap_err();
+        let err = publish_service_v2(
+            &mut book,
+            &tombstones,
+            &mut lost_names,
+            "self-node",
+            "hello",
+            incoming,
+        )
+        .unwrap_err();
         assert_eq!(err, ServicePublishError::Reserved("hello".to_string()));
     }
 
@@ -608,15 +755,30 @@ mod tests {
         let mut lost_names = LostNameMap::new();
         lost_names.insert(
             "printer".to_string(),
-            LostName { winner_node_id: "peer-node".to_string(), hlc: hlc(1_000, 0, "peer-node") },
+            LostName {
+                winner_node_id: "peer-node".to_string(),
+                hlc: hlc(1_000, 0, "peer-node"),
+            },
         );
 
         let incoming = entry("self-node", 5_000, 0, "self-node");
-        let err = publish_service_v2(&mut book, &tombstones, &mut lost_names, "self-node", "printer", incoming)
-            .unwrap_err();
-        assert_eq!(err, ServicePublishError::LostToPeer { winner_node_id: "peer-node".to_string() });
+        let err = publish_service_v2(
+            &mut book,
+            &tombstones,
+            &mut lost_names,
+            "self-node",
+            "printer",
+            incoming,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ServicePublishError::LostToPeer {
+                winner_node_id: "peer-node".to_string()
+            }
+        );
         // The gated attempt never touched the book.
-        assert!(book.get("printer").is_none());
+        assert!(!book.contains_key("printer"));
     }
 
     #[test]
@@ -628,10 +790,22 @@ mod tests {
         let mut lost_names = LostNameMap::new();
 
         let incoming = entry("self-node", 2_000, 0, "self-node"); // later -> self loses
-        let outcome = publish_service_v2(&mut book, &tombstones, &mut lost_names, "self-node", "printer", incoming)
-            .unwrap();
-        assert!(matches!(outcome, PublishOutcome::Merged(ref boxed) if matches!(**boxed, MergeResult::Conflict { .. })));
-        assert_eq!(lost_names.get("printer").unwrap().winner_node_id, "peer-node");
+        let outcome = publish_service_v2(
+            &mut book,
+            &tombstones,
+            &mut lost_names,
+            "self-node",
+            "printer",
+            incoming,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, PublishOutcome::Merged(ref boxed) if matches!(**boxed, MergeResult::Conflict { .. }))
+        );
+        assert_eq!(
+            lost_names.get("printer").unwrap().winner_node_id,
+            "peer-node"
+        );
         // Book keeps the winner's entry, not self's losing claim.
         assert_eq!(book.get("printer"), Some(&local));
     }
@@ -643,9 +817,19 @@ mod tests {
         let mut lost_names = LostNameMap::new();
 
         let incoming = entry("self-node", 1_000, 0, "self-node");
-        let outcome = publish_service_v2(&mut book, &tombstones, &mut lost_names, "self-node", "printer", incoming.clone())
-            .unwrap();
-        assert_eq!(outcome, PublishOutcome::Merged(Box::new(MergeResult::Inserted)));
+        let outcome = publish_service_v2(
+            &mut book,
+            &tombstones,
+            &mut lost_names,
+            "self-node",
+            "printer",
+            incoming.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            PublishOutcome::Merged(Box::new(MergeResult::Inserted))
+        );
         assert_eq!(book.get("printer"), Some(&incoming));
         assert!(lost_names.is_empty());
     }

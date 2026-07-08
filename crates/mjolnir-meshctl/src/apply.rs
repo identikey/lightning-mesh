@@ -58,11 +58,7 @@ pub async fn plan_changes(
                 reason: "missing".into(),
             }),
             Status::Drifted(diffs) => {
-                let fields = diffs
-                    .iter()
-                    .map(|x| x.field)
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let fields = diffs.iter().map(|x| x.field).collect::<Vec<_>>().join(",");
                 changes.push(Change {
                     kind: d.kind,
                     id: d.id.clone(),

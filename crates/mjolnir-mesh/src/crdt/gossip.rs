@@ -126,7 +126,10 @@ mod tests {
         let bytes = postcard::to_allocvec(&msg).unwrap();
         let decoded: GossipMessage = postcard::from_bytes(&bytes).unwrap();
         // Compare via serialized bytes — LeaseEntry fields don't all impl Eq
-        assert_eq!(postcard::to_allocvec(&msg).unwrap(), postcard::to_allocvec(&decoded).unwrap());
+        assert_eq!(
+            postcard::to_allocvec(&msg).unwrap(),
+            postcard::to_allocvec(&decoded).unwrap()
+        );
     }
 
     #[test]
@@ -210,9 +213,10 @@ mod tests {
             node_id: node_id.clone(),
             entry: PeerAddrEntry {
                 node_id,
-                direct_addrs: vec![
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7000),
-                ],
+                direct_addrs: vec![SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                    7000,
+                )],
                 relay_url: Some("https://relay.example.com".to_string()),
                 announced_at: make_hlc(1_700_000_004_000, 0, "abcd1234abcd1234"),
             },
@@ -259,7 +263,12 @@ mod tests {
         assert_eq!(bytes, postcard::to_allocvec(&decoded).unwrap());
     }
 
-    fn v2_entry(owner: &str, wall_clock: u64, counter: u32, node_id: &str) -> crate::crdt::service::ServiceEntryV2 {
+    fn v2_entry(
+        owner: &str,
+        wall_clock: u64,
+        counter: u32,
+        node_id: &str,
+    ) -> crate::crdt::service::ServiceEntryV2 {
         let mut txt = BTreeMap::new();
         txt.insert("path".to_string(), "/ipp/print".to_string());
         crate::crdt::service::ServiceEntryV2 {
@@ -357,17 +366,42 @@ mod mixed_fleet {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     enum OldGossipMessage {
         LeaseUpdate(LeaseEntry),
-        LeaseRelease { mac: [u8; 6], hlc: HLC },
-        DnsUpdate { hostname: String, entry: DnsEntry },
-        ServiceUpdate { name: String, entry: ServiceEntry },
-        SubnetClaimUpdate { cidr: String, entry: SubnetClaim },
-        SubnetClaimRelease { cidr: String, hlc: HLC },
-        PeerAddrUpdate { node_id: String, entry: PeerAddrEntry },
-        UserUpdate { username: String, entry: UserEntry },
+        LeaseRelease {
+            mac: [u8; 6],
+            hlc: HLC,
+        },
+        DnsUpdate {
+            hostname: String,
+            entry: DnsEntry,
+        },
+        ServiceUpdate {
+            name: String,
+            entry: ServiceEntry,
+        },
+        SubnetClaimUpdate {
+            cidr: String,
+            entry: SubnetClaim,
+        },
+        SubnetClaimRelease {
+            cidr: String,
+            hlc: HLC,
+        },
+        PeerAddrUpdate {
+            node_id: String,
+            entry: PeerAddrEntry,
+        },
+        UserUpdate {
+            username: String,
+            entry: UserEntry,
+        },
     }
 
     fn hlc(wall_clock: u64, counter: u32, node_id: &str) -> HLC {
-        HLC { wall_clock, counter, node_id: node_id.to_string() }
+        HLC {
+            wall_clock,
+            counter,
+            node_id: node_id.to_string(),
+        }
     }
 
     fn service_publish_v2_bytes() -> Vec<u8> {
@@ -453,8 +487,14 @@ mod mixed_fleet {
             let (a_tx, b_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
             let (b_tx, a_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
             (
-                MockTransport { tx: std::sync::Arc::new(a_tx), rx: std::sync::Arc::new(tokio::sync::Mutex::new(a_rx)) },
-                MockTransport { tx: std::sync::Arc::new(b_tx), rx: std::sync::Arc::new(tokio::sync::Mutex::new(b_rx)) },
+                MockTransport {
+                    tx: std::sync::Arc::new(a_tx),
+                    rx: std::sync::Arc::new(tokio::sync::Mutex::new(a_rx)),
+                },
+                MockTransport {
+                    tx: std::sync::Arc::new(b_tx),
+                    rx: std::sync::Arc::new(tokio::sync::Mutex::new(b_rx)),
+                },
             )
         }
 
@@ -500,9 +540,12 @@ mod mixed_fleet {
             hlc: hlc(1_700_000_013_000, 0, "router-c"),
         };
         let old_good_1_bytes = postcard::to_allocvec(&old_good_1).unwrap();
-        a.broadcast(Bytes::from(old_good_1_bytes.clone())).await.unwrap();
+        a.broadcast(Bytes::from(old_good_1_bytes.clone()))
+            .await
+            .unwrap();
         a.inject_raw(Bytes::from(service_publish_v2_bytes())).await;
-        a.inject_raw(Bytes::from(service_unpublish_v2_bytes())).await;
+        a.inject_raw(Bytes::from(service_unpublish_v2_bytes()))
+            .await;
         let old_good_2 = OldGossipMessage::UserUpdate {
             username: "ada".to_string(),
             entry: UserEntry {
@@ -514,7 +557,9 @@ mod mixed_fleet {
             },
         };
         let old_good_2_bytes = postcard::to_allocvec(&old_good_2).unwrap();
-        a.broadcast(Bytes::from(old_good_2_bytes.clone())).await.unwrap();
+        a.broadcast(Bytes::from(old_good_2_bytes.clone()))
+            .await
+            .unwrap();
         drop(a);
 
         // Old node's recv loop: same shape as GossipSync::run, decoding

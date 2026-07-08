@@ -108,7 +108,10 @@ mod tests {
     #[test]
     fn prefix_normalizes_host_bits() {
         // Same /24 regardless of host bits -> same key.
-        assert_eq!(Prefix::new(ip("10.42.1.7"), 24), Prefix::new(ip("10.42.1.0"), 24));
+        assert_eq!(
+            Prefix::new(ip("10.42.1.7"), 24),
+            Prefix::new(ip("10.42.1.0"), 24)
+        );
         assert_eq!(Prefix::new(ip("10.42.1.7"), 24).net(), ip("10.42.1.0"));
     }
 

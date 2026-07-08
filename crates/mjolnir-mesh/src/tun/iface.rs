@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::tun::encap::DatagramConn;
 #[cfg(target_os = "linux")]
-use crate::tun::encap::{spawn_encap_pair, EncapHandles};
+use crate::tun::encap::{EncapHandles, spawn_encap_pair};
 
 /// MTU for tunnel TUN devices. Kept under the QUIC datagram limit so one IP
 /// packet fits in one iroh datagram (otherwise the encap drops it as
@@ -83,8 +83,7 @@ where
     // 1. Create the async TUN device (retained for the tunnel's lifetime), MTU set.
     let mut config = tun::Configuration::default();
     config.tun_name(&iface_name).mtu(TUNNEL_MTU).up();
-    let device = tun::create_as_async(&config)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let device = tun::create_as_async(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // 2. Assign self_addr/31 and bring the link up via rtnetlink.
     let (connection, handle, _) = new_connection()?;
@@ -186,13 +185,16 @@ pub async fn spawn_overlay_tun(
     // 1. Create the async TUN device (retained for the node's lifetime), MTU set.
     let mut config = tun::Configuration::default();
     config.tun_name(iface_name).mtu(TUNNEL_MTU).up();
-    let device = tun::create_as_async(&config)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let device = tun::create_as_async(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // 2. Resolve the interface index.
     let (connection, handle, _) = new_connection()?;
     tokio::spawn(connection);
-    let mut links = handle.link().get().match_name(iface_name.to_string()).execute();
+    let mut links = handle
+        .link()
+        .get()
+        .match_name(iface_name.to_string())
+        .execute();
     let link = links.try_next().await?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -287,8 +289,7 @@ impl PeerInterface {
         // We create the device but don't need the handle for this bead
         // (US-005 will use it for packet I/O). The device persists in the
         // kernel as long as we hold the tun::Device handle, so we keep it.
-        let _device = tun::create(&config)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let _device = tun::create(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // 2. Use rtnetlink to assign the /31 address.
         let (connection, handle, _) = new_connection()?;
@@ -296,10 +297,12 @@ impl PeerInterface {
 
         // Find the interface by name to get its index.
         let mut links = handle.link().get().match_name(name.clone()).execute();
-        let link = links
-            .try_next()
-            .await?
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("interface {name} not found after creation")))?;
+        let link = links.try_next().await?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("interface {name} not found after creation"),
+            )
+        })?;
         let index = link.header.index;
 
         // Add self_addr/31 to the interface.
@@ -353,11 +356,7 @@ impl PeerInterface {
         let (connection, handle, _) = new_connection()?;
         tokio::spawn(connection);
 
-        let mut links = handle
-            .link()
-            .get()
-            .match_name(self.name.clone())
-            .execute();
+        let mut links = handle.link().get().match_name(self.name.clone()).execute();
         if let Some(link) = links.try_next().await? {
             handle.link().del(link.header.index).execute().await?;
         }

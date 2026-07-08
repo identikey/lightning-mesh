@@ -85,7 +85,11 @@ pub struct LivenessTracker {
 
 impl LivenessTracker {
     pub fn new(stale_threshold_ms: u64, hard_expiry_ms: u64) -> Self {
-        Self { seen: BTreeMap::new(), stale_threshold_ms, hard_expiry_ms }
+        Self {
+            seen: BTreeMap::new(),
+            stale_threshold_ms,
+            hard_expiry_ms,
+        }
     }
 
     /// Ingest a beacon observed at receiver-local time `now_ms`. Returns `true`
@@ -95,13 +99,21 @@ impl LivenessTracker {
         match self.seen.get_mut(node_id) {
             Some(prev) if !prev.superseded_by(incarnation, counter) => false,
             Some(prev) => {
-                *prev = Seen { incarnation, counter, received_at_ms: now_ms };
+                *prev = Seen {
+                    incarnation,
+                    counter,
+                    received_at_ms: now_ms,
+                };
                 true
             }
             None => {
                 self.seen.insert(
                     node_id.to_string(),
-                    Seen { incarnation, counter, received_at_ms: now_ms },
+                    Seen {
+                        incarnation,
+                        counter,
+                        received_at_ms: now_ms,
+                    },
                 );
                 true
             }
@@ -119,7 +131,11 @@ impl LivenessTracker {
             None => {
                 self.seen.insert(
                     node_id.to_string(),
-                    Seen { incarnation: 0, counter: 0, received_at_ms: now_ms },
+                    Seen {
+                        incarnation: 0,
+                        counter: 0,
+                        received_at_ms: now_ms,
+                    },
                 );
             }
         }
@@ -128,7 +144,9 @@ impl LivenessTracker {
     /// Elapsed ms since the last accepted beacon from `node_id`, or `None` if we
     /// have never heard from it.
     fn age_ms(&self, node_id: &str, now_ms: u64) -> Option<u64> {
-        self.seen.get(node_id).map(|s| now_ms.saturating_sub(s.received_at_ms))
+        self.seen
+            .get(node_id)
+            .map(|s| now_ms.saturating_sub(s.received_at_ms))
     }
 
     /// The receiver-local time (ms, this process's monotonic domain) we last

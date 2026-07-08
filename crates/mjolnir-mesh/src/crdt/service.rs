@@ -52,7 +52,9 @@ pub const RESERVED_SERVICE_NAMES: &[&str] = &["hello", "id"];
 /// [`RESERVED_SERVICE_NAMES`].
 pub fn is_reserved_service_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    RESERVED_SERVICE_NAMES.iter().any(|reserved| *reserved == lower)
+    RESERVED_SERVICE_NAMES
+        .iter()
+        .any(|reserved| *reserved == lower)
 }
 
 /// Owner-bound service entry (v2, bead e21.2.1) — the upgrade over
@@ -383,7 +385,10 @@ mod tests {
     #[test]
     fn node_scope_label_differs_between_nodes() {
         // Different node ids overwhelmingly derive different scopes.
-        assert_ne!(node_scope_label("router-a-node-id"), node_scope_label("router-b-node-id"));
+        assert_ne!(
+            node_scope_label("router-a-node-id"),
+            node_scope_label("router-b-node-id")
+        );
     }
 
     #[test]
@@ -405,11 +410,26 @@ mod tests {
         assert_eq!(normalize_device_host(""), Err(DeviceHostError::Empty));
         assert_eq!(normalize_device_host("   "), Err(DeviceHostError::Empty));
         // A dotted name is a mistake — the daemon appends the scope, not the user.
-        assert_eq!(normalize_device_host("nas.n7x3"), Err(DeviceHostError::InvalidChar));
-        assert_eq!(normalize_device_host("a_b"), Err(DeviceHostError::InvalidChar));
-        assert_eq!(normalize_device_host("-nas"), Err(DeviceHostError::HyphenBoundary));
-        assert_eq!(normalize_device_host("nas-"), Err(DeviceHostError::HyphenBoundary));
-        assert_eq!(normalize_device_host(&"a".repeat(64)), Err(DeviceHostError::TooLong));
+        assert_eq!(
+            normalize_device_host("nas.n7x3"),
+            Err(DeviceHostError::InvalidChar)
+        );
+        assert_eq!(
+            normalize_device_host("a_b"),
+            Err(DeviceHostError::InvalidChar)
+        );
+        assert_eq!(
+            normalize_device_host("-nas"),
+            Err(DeviceHostError::HyphenBoundary)
+        );
+        assert_eq!(
+            normalize_device_host("nas-"),
+            Err(DeviceHostError::HyphenBoundary)
+        );
+        assert_eq!(
+            normalize_device_host(&"a".repeat(64)),
+            Err(DeviceHostError::TooLong)
+        );
     }
 
     #[test]
@@ -418,7 +438,10 @@ mod tests {
             parse_host_mac("de:ad:be:ef:00:01"),
             Some([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01])
         );
-        assert_eq!(parse_host_mac("DE:AD:BE:EF:00:01"), Some([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]));
+        assert_eq!(
+            parse_host_mac("DE:AD:BE:EF:00:01"),
+            Some([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01])
+        );
         assert_eq!(parse_host_mac("de:ad:be:ef:00"), None); // too few
         assert_eq!(parse_host_mac("de:ad:be:ef:00:01:02"), None); // too many
         assert_eq!(parse_host_mac("de-ad-be-ef-00-01"), None); // wrong separator

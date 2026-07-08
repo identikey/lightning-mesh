@@ -262,14 +262,14 @@ pub async fn observe_router(
             .await
             .with_context(|| format!("prune scan on {path}"))?;
         for rec in recs {
-            if let Some(c) = rec.get("comment") {
-                if !want.contains(c.as_str()) {
-                    prunes.push(PruneEntry {
-                        kind,
-                        path,
-                        comment: c.clone(),
-                    });
-                }
+            if let Some(c) = rec.get("comment")
+                && !want.contains(c.as_str())
+            {
+                prunes.push(PruneEntry {
+                    kind,
+                    path,
+                    comment: c.clone(),
+                });
             }
         }
     }
@@ -304,25 +304,27 @@ mod tests {
 
         let veth = d.iter().find(|x| x.kind == "veth").unwrap();
         assert_eq!(veth.identity, ("name", "veth-mesh".to_string()));
-        assert_eq!(veth.fields, vec![
-            ("address", "172.20.0.2/24".to_string()),
-            ("gateway", "172.20.0.1".to_string()),
-        ]);
+        assert_eq!(
+            veth.fields,
+            vec![
+                ("address", "172.20.0.2/24".to_string()),
+                ("gateway", "172.20.0.1".to_string()),
+            ]
+        );
         let ip = d.iter().find(|x| x.kind == "ip-address").unwrap();
         assert_eq!(ip.identity, ("address", "172.20.0.1/24".to_string()));
         let nat = d.iter().find(|x| x.kind == "nat").unwrap();
-        assert!(nat
-            .fields
-            .contains(&("src-address", "172.20.0.0/24".to_string())));
+        assert!(
+            nat.fields
+                .contains(&("src-address", "172.20.0.0/24".to_string()))
+        );
         assert!(nat.comment_owned);
     }
 
     #[test]
     fn add_and_set_args() {
-        let inv: Inventory = toml::from_str(
-            "[[router]]\nname='r1'\naddress='10.0.0.1'\nrole='listener'\n",
-        )
-        .unwrap();
+        let inv: Inventory =
+            toml::from_str("[[router]]\nname='r1'\naddress='10.0.0.1'\nrole='listener'\n").unwrap();
         let d = desired_resources(&inv, inv.get("r1").unwrap()).unwrap();
 
         let veth = d.iter().find(|x| x.kind == "veth").unwrap();
@@ -338,7 +340,10 @@ mod tests {
 
         // comment with spaces must round-trip quoted.
         let nat = d.iter().find(|x| x.kind == "nat").unwrap();
-        assert!(nat.add_args().contains(r#"comment="mjolnir container egress""#));
+        assert!(
+            nat.add_args()
+                .contains(r#"comment="mjolnir container egress""#)
+        );
 
         // bridge: existence-only → empty set args (no `set` ever needed).
         let bridge = d.iter().find(|x| x.kind == "bridge").unwrap();
@@ -364,7 +369,10 @@ mod tests {
             s => panic!("expected Drifted, got {s:?}"),
         }
         assert_eq!(
-            classify(&fields, &[rec(&[("bridge", "br-mesh")]), rec(&[("bridge", "br-mesh")])]),
+            classify(
+                &fields,
+                &[rec(&[("bridge", "br-mesh")]), rec(&[("bridge", "br-mesh")])]
+            ),
             Status::Conflict(2)
         );
     }

@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::process::Stdio;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
 /// An SSH connection to one router.
@@ -141,12 +141,7 @@ impl Ssh {
             .await
             .with_context(|| format!("spawning scp to {}", self.target))?;
         if !status.success() {
-            bail!(
-                "scp {} -> {} failed ({})",
-                local.display(),
-                dest,
-                status
-            );
+            bail!("scp {} -> {} failed ({})", local.display(), dest, status);
         }
         Ok(())
     }

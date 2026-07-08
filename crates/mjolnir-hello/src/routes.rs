@@ -16,7 +16,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-use crate::assets::{StaticAssets, INDEX_HTML};
+use crate::assets::{INDEX_HTML, StaticAssets};
 
 /// How long an issued challenge remains redeemable.
 const CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -57,7 +57,9 @@ impl DirectoryCache {
 
     /// Read (or serve cached) directory.json contents as a raw JSON string.
     fn read(&self, path: &Path) -> String {
-        let mtime = std::fs::metadata(path).and_then(|meta| meta.modified()).ok();
+        let mtime = std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok();
 
         let mut cached = self.inner.lock().expect("directory cache poisoned");
 
@@ -73,7 +75,10 @@ impl DirectoryCache {
             cached.body = Some(contents);
         }
 
-        cached.body.clone().unwrap_or_else(|| EMPTY_DIRECTORY.to_string())
+        cached
+            .body
+            .clone()
+            .unwrap_or_else(|| EMPTY_DIRECTORY.to_string())
     }
 }
 
@@ -103,18 +108,30 @@ pub struct RouteResponse {
 
 impl RouteResponse {
     fn json(status: u16, body: impl Into<String>) -> Self {
-        RouteResponse { status, content_type: "application/json", body: body.into().into_bytes() }
+        RouteResponse {
+            status,
+            content_type: "application/json",
+            body: body.into().into_bytes(),
+        }
     }
 
     fn html(status: u16, body: Vec<u8>) -> Self {
-        RouteResponse { status, content_type: "text/html; charset=utf-8", body }
+        RouteResponse {
+            status,
+            content_type: "text/html; charset=utf-8",
+            body,
+        }
     }
 
     /// Serve a static asset with a Content-Type derived from its path
     /// extension. Load-bearing for the SvelteKit bundle: a `.js` ES module
     /// served as `text/html` is refused by the browser, leaving a blank page.
     fn asset(status: u16, path: &str, body: Vec<u8>) -> Self {
-        RouteResponse { status, content_type: content_type_for(path), body }
+        RouteResponse {
+            status,
+            content_type: content_type_for(path),
+            body,
+        }
     }
 }
 
@@ -157,8 +174,15 @@ fn node(cache: &DirectoryCache, directory_file: &Path) -> RouteResponse {
         Ok(value) => value,
         Err(_) => return RouteResponse::json(200, "{}"),
     };
-    let node = value.get("node").cloned().unwrap_or(serde_json::Value::Null);
-    let node = if node.is_null() { serde_json::json!({}) } else { node };
+    let node = value
+        .get("node")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let node = if node.is_null() {
+        serde_json::json!({})
+    } else {
+        node
+    };
     RouteResponse::json(200, node.to_string())
 }
 
@@ -167,7 +191,11 @@ fn node(cache: &DirectoryCache, directory_file: &Path) -> RouteResponse {
 /// the SvelteKit app owns client-side routing.
 fn serve_static(path: &str, static_root: Option<&Path>) -> RouteResponse {
     let asset_path = path.trim_start_matches('/');
-    let asset_path = if asset_path.is_empty() { INDEX_HTML } else { asset_path };
+    let asset_path = if asset_path.is_empty() {
+        INDEX_HTML
+    } else {
+        asset_path
+    };
 
     if let Some(root) = static_root {
         if let Ok(bytes) = std::fs::read(root.join(asset_path)) {
@@ -313,7 +341,11 @@ pub fn route(
         ("POST", "/api/identity") => submit_identity(body, challenges, spool_dir),
 
         ("GET", _) => serve_static(path, static_root),
-        _ => RouteResponse { status: 404, content_type: "text/plain", body: b"not found".to_vec() },
+        _ => RouteResponse {
+            status: 404,
+            content_type: "text/plain",
+            body: b"not found".to_vec(),
+        },
     }
 }
 
@@ -343,7 +375,16 @@ mod tests {
     #[test]
     fn health_returns_ok_json() {
         let (challenges, spool) = no_state();
-        let resp = route("GET", "/api/health", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
+        let resp = route(
+            "GET",
+            "/api/health",
+            None,
+            b"",
+            &challenges,
+            spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
+        );
         assert_eq!(resp.status, 200);
         assert_eq!(resp.content_type, "application/json");
         assert_eq!(resp.body, br#"{"status":"ok"}"#.to_vec());
@@ -352,7 +393,16 @@ mod tests {
     #[test]
     fn root_serves_embedded_index() {
         let (challenges, spool) = no_state();
-        let resp = route("GET", "/", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
+        let resp = route(
+            "GET",
+            "/",
+            None,
+            b"",
+            &challenges,
+            spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
+        );
         assert_eq!(resp.status, 200);
         assert_eq!(resp.content_type, "text/html; charset=utf-8");
         // Assert the SPA shell, not specific copy — the embedded index is the
@@ -364,7 +414,16 @@ mod tests {
     #[test]
     fn unknown_path_falls_back_to_index_spa_style() {
         let (challenges, spool) = no_state();
-        let resp = route("GET", "/some/client/route", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
+        let resp = route(
+            "GET",
+            "/some/client/route",
+            None,
+            b"",
+            &challenges,
+            spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
+        );
         assert_eq!(resp.status, 200);
         assert_eq!(resp.content_type, "text/html; charset=utf-8");
         let body = String::from_utf8(resp.body).unwrap().to_lowercase();
@@ -375,8 +434,14 @@ mod tests {
     fn assets_get_correct_mime_not_html() {
         // Regression: a .js ES module served as text/html is refused by browsers
         // (blank page). serve_static must set Content-Type by extension.
-        assert_eq!(content_type_for("/_app/immutable/entry/start.abc.js"), "text/javascript; charset=utf-8");
-        assert_eq!(content_type_for("/_app/immutable/assets/0.abc.css"), "text/css; charset=utf-8");
+        assert_eq!(
+            content_type_for("/_app/immutable/entry/start.abc.js"),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            content_type_for("/_app/immutable/assets/0.abc.css"),
+            "text/css; charset=utf-8"
+        );
         assert_eq!(content_type_for("favicon.svg"), "image/svg+xml");
         assert_eq!(content_type_for("index.html"), "text/html; charset=utf-8");
         assert_eq!(content_type_for("robots.txt"), "text/plain; charset=utf-8");
@@ -385,7 +450,16 @@ mod tests {
     #[test]
     fn unknown_method_is_not_found() {
         let (challenges, spool) = no_state();
-        let resp = route("DELETE", "/api/health", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
+        let resp = route(
+            "DELETE",
+            "/api/health",
+            None,
+            b"",
+            &challenges,
+            spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
+        );
         assert_eq!(resp.status, 404);
     }
 
@@ -394,7 +468,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<html>dev override</html>").unwrap();
         let (challenges, spool) = no_state();
-        let resp = route("GET", "/", Some(dir.path()), b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
+        let resp = route(
+            "GET",
+            "/",
+            Some(dir.path()),
+            b"",
+            &challenges,
+            spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
+        );
         assert_eq!(resp.status, 200);
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("dev override"));
@@ -406,8 +489,16 @@ mod tests {
         let signing_key = test_keypair();
         let pubkey_hex = HEXLOWER.encode(signing_key.verifying_key().as_bytes());
 
-        let challenge_resp =
-            route("GET", "/api/challenge", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
+        let challenge_resp = route(
+            "GET",
+            "/api/challenge",
+            None,
+            b"",
+            &challenges,
+            spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
+        );
         assert_eq!(challenge_resp.status, 200);
         let challenge_json: serde_json::Value =
             serde_json::from_slice(&challenge_resp.body).unwrap();
@@ -433,7 +524,10 @@ mod tests {
         assert_eq!(resp.status, 200);
 
         let spooled_path = spool.path().join(format!("{pubkey_hex}.json"));
-        assert!(spooled_path.exists(), "expected spooled record at {spooled_path:?}");
+        assert!(
+            spooled_path.exists(),
+            "expected spooled record at {spooled_path:?}"
+        );
 
         // Single-use: the same challenge must now be rejected.
         let replay = route(
@@ -456,8 +550,16 @@ mod tests {
         let other_key = test_keypair();
         let pubkey_hex = HEXLOWER.encode(signing_key.verifying_key().as_bytes());
 
-        let challenge_resp =
-            route("GET", "/api/challenge", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
+        let challenge_resp = route(
+            "GET",
+            "/api/challenge",
+            None,
+            b"",
+            &challenges,
+            spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
+        );
         let challenge_json: serde_json::Value =
             serde_json::from_slice(&challenge_resp.body).unwrap();
         let challenge_hex = challenge_json["challenge"].as_str().unwrap().to_string();
@@ -481,7 +583,10 @@ mod tests {
             Path::new("/nonexistent"),
         );
         assert_eq!(resp.status, 400);
-        assert!(std::fs::read_dir(spool.path()).unwrap().next().is_none(), "spool should be empty");
+        assert!(
+            std::fs::read_dir(spool.path()).unwrap().next().is_none(),
+            "spool should be empty"
+        );
     }
 
     #[test]
@@ -490,8 +595,16 @@ mod tests {
         let signing_key = test_keypair();
         let pubkey_hex = HEXLOWER.encode(signing_key.verifying_key().as_bytes());
 
-        let challenge_resp =
-            route("GET", "/api/challenge", None, b"", &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
+        let challenge_resp = route(
+            "GET",
+            "/api/challenge",
+            None,
+            b"",
+            &challenges,
+            spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
+        );
         let challenge_json: serde_json::Value =
             serde_json::from_slice(&challenge_resp.body).unwrap();
         let challenge_hex = challenge_json["challenge"].as_str().unwrap().to_string();
@@ -503,10 +616,28 @@ mod tests {
             r#"{{"pubkey":"{pubkey_hex}","sig":"{sig_hex}","challenge":"{challenge_hex}"}}"#
         );
 
-        let first = route("POST", "/api/identity", None, body.as_bytes(), &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
+        let first = route(
+            "POST",
+            "/api/identity",
+            None,
+            body.as_bytes(),
+            &challenges,
+            spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
+        );
         assert_eq!(first.status, 200);
 
-        let second = route("POST", "/api/identity", None, body.as_bytes(), &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
+        let second = route(
+            "POST",
+            "/api/identity",
+            None,
+            body.as_bytes(),
+            &challenges,
+            spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
+        );
         assert_eq!(second.status, 400);
     }
 
@@ -524,7 +655,16 @@ mod tests {
             r#"{{"pubkey":"{pubkey_hex}","sig":"{sig_hex}","challenge":"{fake_challenge}"}}"#
         );
 
-        let resp = route("POST", "/api/identity", None, body.as_bytes(), &challenges, spool.path(), &DirectoryCache::new(), Path::new("/nonexistent"));
+        let resp = route(
+            "POST",
+            "/api/identity",
+            None,
+            body.as_bytes(),
+            &challenges,
+            spool.path(),
+            &DirectoryCache::new(),
+            Path::new("/nonexistent"),
+        );
         assert_eq!(resp.status, 400);
         assert!(std::fs::read_dir(spool.path()).unwrap().next().is_none());
     }

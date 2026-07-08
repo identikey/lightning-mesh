@@ -54,9 +54,5 @@ fn git_stamp() -> String {
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
 
-    if dirty {
-        format!("{sha}-dirty")
-    } else {
-        sha
-    }
+    if dirty { format!("{sha}-dirty") } else { sha }
 }

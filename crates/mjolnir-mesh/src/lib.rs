@@ -26,10 +26,10 @@ pub mod babel;
 pub mod bootstrap;
 pub mod claim_cooldown;
 pub mod crdt;
-#[cfg(feature = "daemon")]
-pub mod dns_responder;
 #[cfg(all(test, feature = "daemon"))]
 mod dns_conformance_tests;
+#[cfg(feature = "daemon")]
+pub mod dns_responder;
 pub mod roster;
 pub mod tun;
 
@@ -38,22 +38,20 @@ pub use crdt::{
     gossip::GossipMessage,
     hlc::HLC,
     lease::LeaseEntry,
-    liveness::{monotonic_now_ms, LivenessTracker},
+    liveness::{LivenessTracker, monotonic_now_ms},
     merge::{
-        merge_peer_addr, merge_service, merge_service_v2, merge_subnet_claim, merge_user,
-        resolve_subnet_conflict, MergeResult, ReservedServiceName,
+        MergeResult, ReservedServiceName, merge_peer_addr, merge_service, merge_service_v2,
+        merge_subnet_claim, merge_user, resolve_subnet_conflict,
     },
     peer_addr::{AddrBook, PeerAddrEntry},
     service::{
-        device_service_key, is_reserved_service_name, node_scope_label, normalize_device_host,
-        parse_host_mac, DeviceHostError, LostName, LostNameMap, ServiceBook, ServiceBookV2,
-        ServiceEntry, ServiceEntryV2, ServiceTombstone, ServiceTombstoneBook,
-        RESERVED_SERVICE_NAMES,
+        DeviceHostError, LostName, LostNameMap, RESERVED_SERVICE_NAMES, ServiceBook, ServiceBookV2,
+        ServiceEntry, ServiceEntryV2, ServiceTombstone, ServiceTombstoneBook, device_service_key,
+        is_reserved_service_name, node_scope_label, normalize_device_host, parse_host_mac,
     },
     service_apply::{
-        apply_service_publish_v2, apply_service_publish_v2_tracking_loss,
-        apply_service_unpublish_v2, publish_service_v2, PublishOutcome, ServicePublishError,
-        UnpublishOutcome,
+        PublishOutcome, ServicePublishError, UnpublishOutcome, apply_service_publish_v2,
+        apply_service_publish_v2_tracking_loss, apply_service_unpublish_v2, publish_service_v2,
     },
     subnet::SubnetClaim,
     sync::{GossipError, GossipSync, GossipTransport},

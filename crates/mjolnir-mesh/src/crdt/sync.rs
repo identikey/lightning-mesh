@@ -165,12 +165,7 @@ mod tests {
         }
 
         async fn recv(&self) -> Result<Bytes, GossipError> {
-            self.rx
-                .lock()
-                .await
-                .recv()
-                .await
-                .ok_or(GossipError::Closed)
+            self.rx.lock().await.recv().await.ok_or(GossipError::Closed)
         }
     }
 
@@ -218,9 +213,15 @@ mod tests {
             .await
             .unwrap();
 
-        let got = seen_rx.recv().await.expect("handler should have seen the message");
+        let got = seen_rx
+            .recv()
+            .await
+            .expect("handler should have seen the message");
         assert_eq!(got, expected);
-        assert!(seen_rx.recv().await.is_none(), "exactly one message expected");
+        assert!(
+            seen_rx.recv().await.is_none(),
+            "exactly one message expected"
+        );
     }
 
     #[tokio::test]
@@ -249,6 +250,9 @@ mod tests {
         // Only the valid message reaches the handler; the garbage was skipped.
         let got = seen_rx.recv().await.expect("valid message should arrive");
         assert_eq!(got, expected);
-        assert!(seen_rx.recv().await.is_none(), "malformed payload must not be delivered");
+        assert!(
+            seen_rx.recv().await.is_none(),
+            "malformed payload must not be delivered"
+        );
     }
 }

@@ -5,17 +5,17 @@ pub mod link;
 pub mod mcast;
 pub mod overlay;
 
-pub use encap::{spawn_encap_pair, DatagramConn, EncapError, EncapHandles};
-pub use iface::{
-    overlay_link_local, spawn_tunnel, IfaceError, OverlayLink, PeerInterface, Tunnel,
-    OVERLAY_IFACE, TUNNEL_MTU,
-};
+pub use encap::{DatagramConn, EncapError, EncapHandles, spawn_encap_pair};
+pub use fib::Fib;
 #[cfg(target_os = "linux")]
 pub use iface::spawn_overlay_tun;
-pub use link::{
-    backhaul_addr, backhaul_addr_salted, in_backhaul_block, pick_link_31, BACKHAUL_PREFIX_LEN,
-    LINK_BLOCK,
+pub use iface::{
+    IfaceError, OVERLAY_IFACE, OverlayLink, PeerInterface, TUNNEL_MTU, Tunnel, overlay_link_local,
+    spawn_tunnel,
 };
-pub use fib::Fib;
-pub use mcast::{classify, is_babel_multicast, OverlayDest, BABEL_MCAST, BABEL_PORT};
-pub use overlay::{spawn_overlay, spawn_overlay_routed, OverlayHandles, UnicastRouter};
+pub use link::{
+    BACKHAUL_PREFIX_LEN, LINK_BLOCK, backhaul_addr, backhaul_addr_salted, in_backhaul_block,
+    pick_link_31,
+};
+pub use mcast::{BABEL_MCAST, BABEL_PORT, OverlayDest, classify, is_babel_multicast};
+pub use overlay::{OverlayHandles, UnicastRouter, spawn_overlay, spawn_overlay_routed};

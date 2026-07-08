@@ -83,13 +83,19 @@ impl PeerRoster {
             // Split into token + optional label.
             let mut parts = trimmed.splitn(2, |c: char| c.is_ascii_whitespace());
             let token = parts.next().unwrap_or("").to_string();
-            let label = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let label = parts
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
 
             // A non-blank, non-comment line must have a non-empty token with
             // no internal whitespace. `splitn` already ensures the token
             // contains no whitespace; the only remaining bad case is empty.
             if token.is_empty() {
-                return Err(RosterError::InvalidToken { line: line_no, token });
+                return Err(RosterError::InvalidToken {
+                    line: line_no,
+                    token,
+                });
             }
 
             // First-occurrence wins: skip duplicate tokens.
@@ -148,9 +154,7 @@ mod tests {
 
     #[test]
     fn blank_lines_and_comments_ignored() {
-        let input = format!(
-            "\n# This is a comment\n\n   # indented comment\n{HEX64}  label\n\n"
-        );
+        let input = format!("\n# This is a comment\n\n   # indented comment\n{HEX64}  label\n\n");
         let roster = PeerRoster::load_from_str(&input).unwrap();
         assert_eq!(roster.len(), 1);
         assert_eq!(roster.peers()[0].token, HEX64);
@@ -163,7 +167,10 @@ mod tests {
         let roster = PeerRoster::load_from_str(&input).unwrap();
         assert_eq!(roster.len(), 2);
         assert_eq!(roster.peers()[0].token, HEX64);
-        assert!(roster.peers()[0].label.is_none(), "first-wins: no label kept");
+        assert!(
+            roster.peers()[0].label.is_none(),
+            "first-wins: no label kept"
+        );
         assert_eq!(roster.peers()[1].token, HEX64_2);
     }
 

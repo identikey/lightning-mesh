@@ -15,13 +15,13 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 
-use simple_dns::rdata::{RData, A, SOA, SRV, TXT};
-use simple_dns::{Name, Packet, PacketFlag, ResourceRecord, CLASS, QTYPE, RCODE, TYPE};
+use simple_dns::rdata::{A, RData, SOA, SRV, TXT};
+use simple_dns::{CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord, TYPE};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-use crate::crdt::liveness::{monotonic_now_ms, LivenessTracker};
-use crate::crdt::service::{is_reserved_service_name, ServiceBookV2};
+use crate::crdt::liveness::{LivenessTracker, monotonic_now_ms};
+use crate::crdt::service::{ServiceBookV2, is_reserved_service_name};
 
 /// Default bind port for the `.mesh` responder (loopback-only — dnsmasq is
 /// the only client). Configurable so tests can bind an ephemeral port
@@ -215,7 +215,10 @@ impl ServiceTable {
     /// daemon-side write path (gossip dispatch, local publish/unpublish); this
     /// table only ever reads.
     pub fn new(store: Arc<Mutex<ServiceBookV2>>) -> Self {
-        Self { store, liveness: None }
+        Self {
+            store,
+            liveness: None,
+        }
     }
 
     /// Build a table that filters out names whose owner has gone stale per the
@@ -226,7 +229,10 @@ impl ServiceTable {
         store: Arc<Mutex<ServiceBookV2>>,
         liveness: Arc<Mutex<LivenessTracker>>,
     ) -> Self {
-        Self { store, liveness: Some(liveness) }
+        Self {
+            store,
+            liveness: Some(liveness),
+        }
     }
 
     /// `name` is a wire-format qname (e.g. `"printer.mesh."`); the service
@@ -253,7 +259,11 @@ impl ServiceTable {
 
     /// Read `(value, owner)` for `key` under the book lock, releasing it before
     /// any liveness check. Returns `None` if the name is absent.
-    fn get_if_live<T>(&self, key: &str, extract: impl FnOnce(&crate::crdt::service::ServiceEntryV2) -> T) -> Option<T> {
+    fn get_if_live<T>(
+        &self,
+        key: &str,
+        extract: impl FnOnce(&crate::crdt::service::ServiceEntryV2) -> T,
+    ) -> Option<T> {
         let (value, owner) = {
             let book = self.store.lock().ok()?;
             let entry = book.get(key)?;
@@ -472,7 +482,10 @@ pub(crate) fn handle_query(query_bytes: &[u8], table: &dyn NameTable) -> Option<
         // Not reachable at this story's answer sizes; guarded anyway so a
         // future oversized answer can't silently violate the UDP/512B
         // contract.
-        warn!(len = bytes.len(), "mesh DNS responder: reply exceeds 512B, dropping");
+        warn!(
+            len = bytes.len(),
+            "mesh DNS responder: reply exceeds 512B, dropping"
+        );
         return None;
     }
 
@@ -596,9 +609,17 @@ mod tests {
         let bytes = build_query("hello.mesh.", TYPE::AAAA);
         let reply_bytes = handle_query(&bytes, &table).expect("should build a reply");
         let reply = Packet::parse(&reply_bytes).expect("reply should parse");
-        assert_eq!(reply.rcode(), RCODE::NoError, "NODATA must be NOERROR, not NXDOMAIN");
+        assert_eq!(
+            reply.rcode(),
+            RCODE::NoError,
+            "NODATA must be NOERROR, not NXDOMAIN"
+        );
         assert_eq!(reply.answers.len(), 0);
-        assert_eq!(reply.name_servers.len(), 0, "NODATA carries no SOA in this dispatch");
+        assert_eq!(
+            reply.name_servers.len(),
+            0,
+            "NODATA carries no SOA in this dispatch"
+        );
     }
 
     #[test]
@@ -633,16 +654,32 @@ mod tests {
 
     // --- ServiceTable (bead e21.1.3) ---
 
-    fn v2_entry(ip: Ipv4Addr, port: u16, protocol: &str, txt: &[(&str, &str)]) -> crate::crdt::service::ServiceEntryV2 {
+    fn v2_entry(
+        ip: Ipv4Addr,
+        port: u16,
+        protocol: &str,
+        txt: &[(&str, &str)],
+    ) -> crate::crdt::service::ServiceEntryV2 {
         use crate::crdt::hlc::HLC;
         crate::crdt::service::ServiceEntryV2 {
             owner_node_id: "router-a".to_string(),
-            first_claimed_at: HLC { wall_clock: 1, counter: 0, node_id: "router-a".to_string() },
-            updated_at: HLC { wall_clock: 1, counter: 0, node_id: "router-a".to_string() },
+            first_claimed_at: HLC {
+                wall_clock: 1,
+                counter: 0,
+                node_id: "router-a".to_string(),
+            },
+            updated_at: HLC {
+                wall_clock: 1,
+                counter: 0,
+                node_id: "router-a".to_string(),
+            },
             ip: IpAddr::V4(ip),
             port,
             protocol: protocol.to_string(),
-            txt: txt.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            txt: txt
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             host_mac: None,
         }
     }
@@ -652,7 +689,12 @@ mod tests {
         let store: Arc<Mutex<ServiceBookV2>> = Arc::new(Mutex::new(ServiceBookV2::new()));
         store.lock().unwrap().insert(
             "wiki".to_string(),
-            v2_entry("10.42.1.50".parse().unwrap(), 8080, "_http._tcp", &[("path", "/wiki")]),
+            v2_entry(
+                "10.42.1.50".parse().unwrap(),
+                8080,
+                "_http._tcp",
+                &[("path", "/wiki")],
+            ),
         );
         let table = ServiceTable::new(store);
 
@@ -660,7 +702,10 @@ mod tests {
         let reply = Packet::parse(&a_reply).unwrap();
         assert_eq!(reply.rcode(), RCODE::NoError);
         match &reply.answers[0].rdata {
-            RData::A(a) => assert_eq!(Ipv4Addr::from(a.address), "10.42.1.50".parse::<Ipv4Addr>().unwrap()),
+            RData::A(a) => assert_eq!(
+                Ipv4Addr::from(a.address),
+                "10.42.1.50".parse::<Ipv4Addr>().unwrap()
+            ),
             other => panic!("expected A, got {other:?}"),
         }
 
@@ -683,7 +728,10 @@ mod tests {
         match &reply.answers[0].rdata {
             RData::TXT(txt) => {
                 let attrs = txt.attributes();
-                assert_eq!(attrs.get("path").and_then(|v| v.clone()), Some("/wiki".to_string()));
+                assert_eq!(
+                    attrs.get("path").and_then(|v| v.clone()),
+                    Some("/wiki".to_string())
+                );
             }
             other => panic!("expected TXT, got {other:?}"),
         }
@@ -708,7 +756,10 @@ mod tests {
         let reply = Packet::parse(&a_reply).unwrap();
         assert_eq!(reply.rcode(), RCODE::NoError);
         match &reply.answers[0].rdata {
-            RData::A(a) => assert_eq!(Ipv4Addr::from(a.address), "192.168.7.20".parse::<Ipv4Addr>().unwrap()),
+            RData::A(a) => assert_eq!(
+                Ipv4Addr::from(a.address),
+                "192.168.7.20".parse::<Ipv4Addr>().unwrap()
+            ),
             other => panic!("expected A, got {other:?}"),
         }
 
@@ -716,7 +767,10 @@ mod tests {
         let srv_reply = handle_query(&build_query(&qname, TYPE::SRV), &table).unwrap();
         let reply = Packet::parse(&srv_reply).unwrap();
         assert_eq!(reply.rcode(), RCODE::NoError);
-        assert!(reply.answers.is_empty(), "port-0 device must not answer SRV");
+        assert!(
+            reply.answers.is_empty(),
+            "port-0 device must not answer SRV"
+        );
     }
 
     #[test]
@@ -763,14 +817,23 @@ mod tests {
         let store: Arc<Mutex<ServiceBookV2>> = Arc::new(Mutex::new(ServiceBookV2::new()));
         store.lock().unwrap().insert(
             "wiki".to_string(),
-            v2_entry("10.42.1.50".parse().unwrap(), 8080, "_http._tcp", &[("path", "/wiki")]),
+            v2_entry(
+                "10.42.1.50".parse().unwrap(),
+                8080,
+                "_http._tcp",
+                &[("path", "/wiki")],
+            ),
         );
         let table = ServiceTable::with_liveness(store, liveness_tracker());
 
         for qtype in [TYPE::A, TYPE::SRV, TYPE::TXT] {
             let bytes = handle_query(&build_query("wiki.mesh.", qtype), &table).unwrap();
             let reply = Packet::parse(&bytes).unwrap();
-            assert_eq!(reply.rcode(), RCODE::NameError, "stale owner should NXDOMAIN for {qtype:?}");
+            assert_eq!(
+                reply.rcode(),
+                RCODE::NameError,
+                "stale owner should NXDOMAIN for {qtype:?}"
+            );
         }
     }
 
@@ -783,7 +846,10 @@ mod tests {
         );
         let tracker = liveness_tracker();
         // Owner has beaconed just now -> fresh -> the name resolves normally.
-        tracker.lock().unwrap().touch("router-a", monotonic_now_ms());
+        tracker
+            .lock()
+            .unwrap()
+            .touch("router-a", monotonic_now_ms());
         let table = ServiceTable::with_liveness(store, tracker);
 
         let bytes = handle_query(&build_query("wiki.mesh.", TYPE::A), &table).unwrap();
@@ -808,7 +874,10 @@ mod tests {
         let before = handle_query(&build_query("wiki.mesh.", TYPE::A), &table).unwrap();
         assert_eq!(Packet::parse(&before).unwrap().rcode(), RCODE::NameError);
 
-        tracker.lock().unwrap().observe("router-a", 100, 1, monotonic_now_ms());
+        tracker
+            .lock()
+            .unwrap()
+            .observe("router-a", 100, 1, monotonic_now_ms());
 
         let after = handle_query(&build_query("wiki.mesh.", TYPE::A), &table).unwrap();
         assert_eq!(Packet::parse(&after).unwrap().rcode(), RCODE::NoError);
@@ -824,7 +893,11 @@ mod tests {
         let table = ServiceTable::new(store);
         let bytes = handle_query(&build_query("printer.mesh.", TYPE::TXT), &table).unwrap();
         let reply = Packet::parse(&bytes).unwrap();
-        assert_eq!(reply.rcode(), RCODE::NoError, "NODATA, not NXDOMAIN, for an existing name with no TXT data");
+        assert_eq!(
+            reply.rcode(),
+            RCODE::NoError,
+            "NODATA, not NXDOMAIN, for an existing name with no TXT data"
+        );
         assert_eq!(reply.answers.len(), 0);
     }
 
@@ -867,7 +940,8 @@ mod tests {
         });
         let bytes = query.build_bytes_vec().unwrap();
 
-        let reply_bytes = handle_query(&bytes, &NoAnswers).expect("OPT-bearing query should still get a reply");
+        let reply_bytes =
+            handle_query(&bytes, &NoAnswers).expect("OPT-bearing query should still get a reply");
         let reply = Packet::parse(&reply_bytes).expect("reply should parse");
         assert_eq!(reply.rcode(), RCODE::NameError);
         // We never echo an OPT back — tolerate and ignore, not negotiate.
