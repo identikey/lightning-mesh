@@ -163,6 +163,7 @@ Lightning Mesh is **dual-licensed**:
   source-disclosure obligations. Contact **duke@identikey.io**.
 
 Contributions are accepted under the **[Contributor License Agreement](CLA.md)**,
-which is what makes the dual-licensing model possible — please sign it before
-your first pull request. See also [`NOTICE`](NOTICE) for third-party components
-(notably `iroh`, MIT/Apache-2.0, and `babeld`, run as a separate process).
+which is what makes the dual-licensing model possible — the CLA bot will ask you
+to sign on your first pull request. See **[CONTRIBUTING.md](CONTRIBUTING.md)** to
+get started, and [`NOTICE`](NOTICE) for third-party components (notably `iroh`,
+MIT/Apache-2.0, and `babeld`, run as a separate process).
