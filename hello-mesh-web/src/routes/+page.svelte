@@ -6,6 +6,7 @@
 	import IdentityPanel from '$lib/components/IdentityPanel.svelte';
 	import DirectoryPanel from '$lib/components/DirectoryPanel.svelte';
 	import MdnsPanel from '$lib/components/MdnsPanel.svelte';
+	import TopologyPanel from '$lib/components/TopologyPanel.svelte';
 	import { directoryStore, startDirectoryPolling } from '$lib/directory/store.svelte';
 
 	$effect(startDirectoryPolling);
@@ -22,6 +23,8 @@
 	<IdentityPanel />
 
 	<DirectoryPanel />
+
+	<TopologyPanel />
 
 	<MdnsPanel {services} loaded={directoryStore.loaded} />
 </main>
