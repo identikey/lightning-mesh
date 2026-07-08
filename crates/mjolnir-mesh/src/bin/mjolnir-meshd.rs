@@ -3244,15 +3244,20 @@ fn gateway_probe_bypassed() -> bool {
 }
 
 /// One HTTP-204 captive-portal / reachability check (mjolnir-mesh-42j). Returns
-/// `Some(true)` if any well-known `generate_204` endpoint answers with a real
-/// `204` (proves genuine internet, not a captive portal that would answer `200`/
-/// a redirect); `Some(false)` if the check ran against at least one endpoint and
-/// none returned `204` (dead or captive upstream); `None` if the check could not
-/// run at all (no `wget`) — which the hysteresis treats as no evidence.
+/// `Some(true)` if any well-known `generate_204` endpoint answers like a real
+/// `204` (proves genuine internet, not a captive portal); `Some(false)` if the
+/// check ran against at least one endpoint and none did (dead or captive
+/// upstream); `None` if the check could not run at all (no `wget`) — which the
+/// hysteresis treats as no evidence.
 ///
-/// Uses busybox `wget -S` and greps the response status for `204`: a lease from a
-/// dead upstream gets no response, a captive portal answers non-204, and only a
-/// clean egress yields 204. Plain HTTP on purpose — captive portals intercept it.
+/// Detection is by EMPTY BODY, not status code: `wget -q -O -` streams the body
+/// to stdout, and a 204 "No Content" body is empty, so `exit 0 && empty stdout`
+/// means a clean egress. A captive portal answers 200/redirect with HTML
+/// (non-empty); a dead upstream errors. This deliberately avoids `-S`/`-T`: the
+/// fleet's minimal busybox `wget` rejects both (verified on the mt7981 gateway —
+/// it also has no `timeout` binary), so the per-request timeout is imposed here
+/// in Rust with `kill_on_drop` so a hung fetch can't orphan a wget. Plain HTTP on
+/// purpose — captive portals intercept it.
 #[cfg(target_os = "linux")]
 async fn probe_internet() -> Option<bool> {
     const URLS: &[&str] = &[
@@ -3260,25 +3265,28 @@ async fn probe_internet() -> Option<bool> {
         "http://www.gstatic.com/generate_204",
         "http://clients3.google.com/generate_204",
     ];
+    const PER_URL: Duration = Duration::from_secs(6);
     let mut any_ran = false;
     for url in URLS {
-        match tokio::process::Command::new("wget")
-            .args(["-q", "-S", "-O", "/dev/null", "-T", "5", url])
-            .output()
-            .await
-        {
-            Ok(out) => {
+        let fut = tokio::process::Command::new("wget")
+            .args(["-q", "-O", "-", url])
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(PER_URL, fut).await {
+            Ok(Ok(out)) => {
                 any_ran = true;
-                // busybox wget prints the server response headers to stderr even
-                // with -q; a 204 status line is the only healthy signal.
-                if String::from_utf8_lossy(&out.stderr).contains(" 204") {
+                // 204 No Content == exit 0 with an empty body.
+                if out.status.success() && out.stdout.is_empty() {
                     return Some(true);
                 }
             }
             // No wget on PATH -> can't probe; caller treats None as no evidence.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return None,
             // Transient spawn error for this URL -> try the next one.
-            Err(_) => {}
+            Ok(Err(_)) => {}
+            // Hung fetch (timeout) -> it ran but didn't succeed; the child is
+            // killed on drop. Count it as an attempt so all-hung => Some(false).
+            Err(_elapsed) => any_ran = true,
         }
     }
     if any_ran { Some(false) } else { None }
