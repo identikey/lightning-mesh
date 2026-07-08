@@ -23,10 +23,7 @@
 	}
 </script>
 
-<Collapsible.Root
-	bind:open
-	class="rounded-lg border border-border bg-card text-card-foreground"
->
+<Collapsible.Root bind:open class="rounded-lg border border-border bg-card text-card-foreground">
 	<Collapsible.Trigger
 		class="focus-visible:ring-ring flex w-full items-center gap-3 rounded-lg px-4 py-3 text-left transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:outline-none"
 	>
@@ -62,9 +59,7 @@
 								<Badge variant="outline" class="font-mono">{svc.protocol}</Badge>
 							</div>
 
-							<dl
-								class="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm"
-							>
+							<dl class="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm">
 								{#if svc.hostname}
 									<dt class="text-muted-foreground">Host</dt>
 									<dd class="break-all">{svc.hostname}</dd>

@@ -40,7 +40,8 @@
 					<ul class="flex flex-col gap-1">
 						{#each directory.neighbors as neighbor (neighbor.node_id)}
 							<li class="text-sm">
-								<code class="rounded bg-muted px-1 py-0.5 text-xs">{shortId(neighbor.node_id)}</code>
+								<code class="rounded bg-muted px-1 py-0.5 text-xs">{shortId(neighbor.node_id)}</code
+								>
 								{#if neighbor.subnet}
 									<span class="text-muted-foreground">· {neighbor.subnet}</span>
 								{/if}

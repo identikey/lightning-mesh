@@ -34,6 +34,15 @@ export default defineConfig(
 		}
 	},
 	{
+		// shadcn-svelte generated UI primitives forward href/navigation props by
+		// design; the SvelteKit resolve() rule applies at the app layer, not the
+		// vendored component library.
+		files: ['src/lib/components/ui/**'],
+		rules: {
+			'svelte/no-navigation-without-resolve': 'off'
+		}
+	},
+	{
 		// Override or add rule settings here, such as:
 		// 'svelte/button-has-type': 'error'
 		rules: {}
