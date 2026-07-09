@@ -38,12 +38,21 @@ state) hold because an island is still a bounded domain.
 
 1. **Global backhaul `mesh_id`; per-island channel** (not one global channel).
 2. **Client space = `10.0.0.0/8`** (allocator already supports it), **default island
-   subnet = `/22`** (~1021 hosts — a room can hold 1000 devices), auto-downgrade to
-   `/23`/`/24` on fragmentation (`alloc.rs` `pick_subnet_or_smaller`).
-3. **Growth = claim a second, discontiguous prefix — never renumber.** Renumbering breaks
-   the "IP survives" invariant we built islands to protect. dnsmasq serves multiple ranges;
-   babel advertises both. Over-claiming up front (given `/8` headroom) is also acceptable.
-   We do **not** guide fleets to tune subnet-size knobs; they claim, and grow by adding a
+   subnet = `/24`** (~254 hosts). Rationale: because an island grows by *accreting another
+   prefix onto the same VNI* (decision #3), the initial size need not fit the largest
+   possible room — so we optimize for the common case (most islands are small: a lone node
+   or a 2–3 AP room) and for block count. A `/8` holds 65 536 `/24`s vs 16 384 `/22`s — 4×
+   more islands, far less waste per small island. And a **1-node island is exactly today's
+   shipped `/24`-per-node** model, so the island design is a strict generalization of the
+   field-validated data plane, not a departure. Downgrade to smaller than `/24` only under
+   extreme fragmentation (`alloc.rs` `pick_subnet_or_smaller`).
+3. **Growth = accrete a second, discontiguous prefix onto the same VNI — never renumber.**
+   Renumbering breaks the "IP survives" invariant we built islands to protect. The new
+   prefix is a **secondary subnet on the island's existing L2/VNI**, so growth is
+   transparent to roaming (existing clients keep their IP; new clients draw from the newer
+   prefix) and does **not** change broadcast containment — the containment boundary is the
+   VNI/island, not the subnet. dnsmasq serves multiple ranges; babel advertises both. We do
+   **not** guide fleets to tune subnet-size knobs; they claim a `/24`, and grow by adding a
    prefix.
 4. **Island membership is an *authorized set*, not a physical RF fact** — see data plane
    and "Why not batman" below. (Leans hard on the identity pass;
@@ -88,6 +97,9 @@ means scoping an L2 to a subset of reachable nodes. Three candidates were consid
 - **EVPN-lite** = we already hold the MAC→IP bindings in the CRDT hostsfile, so we can do
   **ARP/ND suppression**: a member answers ARP locally from the CRDT instead of flooding
   BUM. This cuts the dominant broadcast cost.
+- **One VNI can carry several IP subnets.** Prefix accretion (decision #3) adds secondary
+  subnets to the *same* VNI; ARP/ND/BUM span the VNI regardless of subnet, which is why
+  subnet size is an allocation-granularity choice, not a containment choice.
 
 ### Edges to watch (the unfamiliar parts)
 
