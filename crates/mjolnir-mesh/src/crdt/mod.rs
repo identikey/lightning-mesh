@@ -3,6 +3,7 @@ pub mod egress;
 pub mod gossip;
 pub mod hlc;
 pub mod lease;
+pub mod leased_name;
 pub mod liveness;
 pub mod merge;
 pub mod peer_addr;
