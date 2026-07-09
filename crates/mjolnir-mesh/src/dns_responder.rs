@@ -310,6 +310,95 @@ impl NameTable for ServiceTable {
     }
 }
 
+/// Wall-clock ms since the Unix epoch. Leased-name freshness is compared
+/// against the HLC `wall_clock` stamped on each record, so this must be the
+/// wall clock — NOT the monotonic clock the liveness plane
+/// ([`monotonic_now_ms`]) uses for beacon staleness.
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How long after a leased name's last renewal it stops **resolving** — the
+/// fast UX fade. Deliberately far shorter than the ownership lease
+/// ([`LEASE_TTL_MS`](crate::crdt::leased_name::LEASE_TTL_MS), 1h): a client that
+/// stops heartbeating vanishes from DNS within this window, yet keeps *owning*
+/// the name for the full lease, so a brief outage or reboot (with a renewal)
+/// brings it straight back and no other key can grab it in the meantime. The
+/// claiming client must renew well inside this window (≤ ~30s).
+pub const LEASED_NAME_RESOLVE_STALE_MS: u64 = 90_000;
+
+/// Pure CRDT projection over the daemon's key-owned **leased** name store
+/// (bead mjolnir-mesh-71x), the client-claimed counterpart to [`ServiceTable`].
+/// A name resolves only while its lease has been renewed within
+/// [`LEASED_NAME_RESOLVE_STALE_MS`]; a lapsed-but-not-yet-reclaimed name reads
+/// as absent (NXDOMAIN) rather than black-holing traffic to an offline client.
+/// Ownership/reclaim across keys is the CRDT merge's job
+/// ([`merge_leased_name`](crate::crdt::leased_name::merge_leased_name)); this
+/// table only decides what currently answers.
+#[derive(Clone)]
+pub struct LeasedNameTable {
+    store: Arc<Mutex<crate::crdt::leased_name::LeasedNameBook>>,
+}
+
+impl LeasedNameTable {
+    pub fn new(store: Arc<Mutex<crate::crdt::leased_name::LeasedNameBook>>) -> Self {
+        Self { store }
+    }
+
+    /// Strip the `.mesh` apex from a wire qname; the book keys on the bare flat
+    /// name (e.g. `"walkie-talkie"`). Mirrors [`ServiceTable::book_key`].
+    fn book_key<'a>(&self, name: &'a str) -> Option<&'a str> {
+        name.trim_end_matches('.').strip_suffix(".mesh")
+    }
+
+    /// True iff `e`'s last renewal is within the resolve-freshness window of
+    /// `now_ms`. Pure (time injected) so the fade is unit-testable without a
+    /// real clock.
+    fn resolves(e: &crate::crdt::leased_name::LeasedName, now_ms: u64) -> bool {
+        now_ms.saturating_sub(e.renewed_at.wall_clock) <= LEASED_NAME_RESOLVE_STALE_MS
+    }
+
+    fn get_if_fresh<T>(
+        &self,
+        key: &str,
+        now_ms: u64,
+        extract: impl FnOnce(&crate::crdt::leased_name::LeasedName) -> T,
+    ) -> Option<T> {
+        let book = self.store.lock().ok()?;
+        let e = book.get(key)?;
+        if !Self::resolves(e, now_ms) {
+            return None;
+        }
+        Some(extract(e))
+    }
+}
+
+impl NameTable for LeasedNameTable {
+    fn lookup_a(&self, name: &str) -> Option<Vec<Ipv4Addr>> {
+        let key = self.book_key(name)?;
+        match self.get_if_fresh(key, wall_now_ms(), |e| e.ip)? {
+            IpAddr::V4(v4) => Some(vec![v4]),
+            IpAddr::V6(_) => None, // no AAAA in scope; NODATA, not NXDOMAIN
+        }
+    }
+
+    fn exists(&self, name: &str) -> bool {
+        match self.book_key(name) {
+            Some(key) => self.get_if_fresh(key, wall_now_ms(), |_| ()).is_some(),
+            None => false,
+        }
+    }
+
+    fn lookup_srv(&self, name: &str) -> Option<u16> {
+        let key = self.book_key(name)?;
+        // Port 0 → A-only claim, no SRV (NODATA, not NXDOMAIN).
+        self.get_if_fresh(key, wall_now_ms(), |e| e.port).filter(|p| *p != 0)
+    }
+}
+
 /// A bound, running responder. Dropping this does not stop the background
 /// task — call [`ResponderHandle::abort`] at shutdown, as `mjolnir-meshd` does.
 pub struct ResponderHandle {
@@ -992,5 +1081,93 @@ mod tests {
         assert_eq!(reply.rcode(), RCODE::NameError);
 
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod leased_name_table_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex};
+
+    use super::{wall_now_ms, LeasedNameTable, NameTable, LEASED_NAME_RESOLVE_STALE_MS};
+    use crate::crdt::hlc::HLC;
+    use crate::crdt::leased_name::{LeasedName, LeasedNameBook};
+
+    fn entry(renewed_ms: u64) -> LeasedName {
+        LeasedName {
+            owner_pubkey: "aa".repeat(32),
+            sig: "00".repeat(64),
+            challenge: "ab".repeat(32),
+            ip: IpAddr::V4(Ipv4Addr::new(10, 42, 5, 23)),
+            port: 3000,
+            first_claimed_at: HLC {
+                wall_clock: renewed_ms,
+                counter: 0,
+                node_id: "n".into(),
+            },
+            renewed_at: HLC {
+                wall_clock: renewed_ms,
+                counter: 0,
+                node_id: "n".into(),
+            },
+        }
+    }
+
+    fn table_with(name: &str, e: LeasedName) -> LeasedNameTable {
+        let mut book = LeasedNameBook::new();
+        book.insert(name.to_string(), e);
+        LeasedNameTable::new(Arc::new(Mutex::new(book)))
+    }
+
+    #[test]
+    fn freshly_renewed_name_resolves() {
+        let t = table_with("walkie-talkie", entry(wall_now_ms()));
+        assert_eq!(
+            t.lookup_a("walkie-talkie.mesh."),
+            Some(vec![Ipv4Addr::new(10, 42, 5, 23)])
+        );
+        assert!(t.exists("walkie-talkie.mesh."));
+        assert_eq!(t.lookup_srv("walkie-talkie.mesh."), Some(3000));
+    }
+
+    #[test]
+    fn name_stops_resolving_once_heartbeats_lapse() {
+        // Last renewal well past the resolve window → absent (NXDOMAIN), even
+        // though ownership would still hold for the full hour lease.
+        let stale = wall_now_ms().saturating_sub(LEASED_NAME_RESOLVE_STALE_MS + 60_000);
+        let t = table_with("walkie-talkie", entry(stale));
+        assert_eq!(t.lookup_a("walkie-talkie.mesh."), None);
+        assert!(!t.exists("walkie-talkie.mesh."));
+        assert_eq!(t.lookup_srv("walkie-talkie.mesh."), None);
+    }
+
+    #[test]
+    fn resolve_window_boundary_is_pure_and_injectable() {
+        let e = entry(1_000_000);
+        assert!(LeasedNameTable::resolves(&e, 1_000_000)); // same instant
+        assert!(LeasedNameTable::resolves(
+            &e,
+            1_000_000 + LEASED_NAME_RESOLVE_STALE_MS
+        )); // exactly at edge
+        assert!(!LeasedNameTable::resolves(
+            &e,
+            1_000_000 + LEASED_NAME_RESOLVE_STALE_MS + 1
+        )); // one ms past
+    }
+
+    #[test]
+    fn port_zero_is_a_only_no_srv() {
+        let mut e = entry(wall_now_ms());
+        e.port = 0;
+        let t = table_with("nas", e);
+        assert!(t.exists("nas.mesh.")); // A still answers
+        assert_eq!(t.lookup_srv("nas.mesh."), None); // NODATA for SRV
+    }
+
+    #[test]
+    fn name_outside_mesh_apex_is_absent() {
+        let t = table_with("walkie-talkie", entry(wall_now_ms()));
+        assert!(!t.exists("walkie-talkie.example.com."));
+        assert_eq!(t.lookup_a("walkie-talkie.example.com."), None);
     }
 }
