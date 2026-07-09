@@ -1430,6 +1430,7 @@ async fn run_mesh(
                     let services_v2_path = service_book_v2_file.clone();
                     let node_names = node_name_book.clone();
                     let node_names_path = node_name_book_file.clone();
+                    let leased = leased_names.clone();
                     let directory_path = directory_file.clone();
                     let spool_path = spool_dir.clone();
                     let liveness = liveness.clone();
@@ -1458,6 +1459,7 @@ async fn run_mesh(
                             services_v2_path,
                             node_names,
                             node_names_path,
+                            leased,
                             directory_path,
                             spool_path,
                             announce,
@@ -2882,10 +2884,9 @@ struct DirectoryIdentity {
     /// Wall-clock (ms since Unix epoch) of this identity's most recent CRDT
     /// write — i.e. `UserEntry.updated_at.wall_clock` (bead mjolnir-mesh-t7i).
     /// Lets the front desk show a recency / "last seen" indicator instead of
-    /// treating every identity as equally current. Additive
-    /// `skip_serializing_if` field — an older `mjolnir-hello` stays schema-safe.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_seen_unix: Option<u64>,
+    /// treating every identity as equally current. Always populated from
+    /// `UserEntry.updated_at.wall_clock` (bead mjolnir-mesh-bux).
+    last_seen_unix: u64,
 }
 
 /// One service-directory record, projected for the front desk. `name` is the
@@ -2979,7 +2980,7 @@ fn build_directory_snapshot(
         .map(|u| DirectoryIdentity {
             username: u.username.clone(),
             display_name: u.display_name.clone(),
-            last_seen_unix: Some(u.updated_at.wall_clock),
+            last_seen_unix: u.updated_at.wall_clock,
         })
         .collect();
 
@@ -3055,7 +3056,7 @@ fn build_directory_snapshot_v2(
         .map(|u| DirectoryIdentity {
             username: u.username.clone(),
             display_name: u.display_name.clone(),
-            last_seen_unix: Some(u.updated_at.wall_clock),
+            last_seen_unix: u.updated_at.wall_clock,
         })
         .collect();
 
@@ -3138,6 +3139,7 @@ fn write_directory_projection(
     user_book: &Arc<Mutex<UserBook>>,
     service_book: &Arc<Mutex<ServiceBook>>,
     node_name_book: &Arc<Mutex<NodeNameBook>>,
+    leased_names: &Arc<Mutex<LeasedNameBook>>,
     liveness: &Arc<Mutex<LivenessTracker>>,
     self_id: &str,
     backhaul_ip: Ipv4Addr,
@@ -3166,7 +3168,7 @@ fn write_directory_projection(
         ids = ?gateways.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
         "live internet gateways (5lw Lever 2)"
     );
-    let snapshot = build_directory_snapshot(
+    let mut snapshot = build_directory_snapshot(
         &claims_snapshot,
         &addr_snapshot,
         &user_snapshot,
@@ -3176,7 +3178,46 @@ fn write_directory_projection(
         backhaul_ip,
         &gateways,
     );
+    // Fold currently-resolving key-owned leased names (71x) into the same
+    // services list, so the front desk shows every reachable `.mesh` name in one
+    // place. Filtered by the same resolve-freshness window the DNS responder
+    // uses, so the list matches what actually resolves right now.
+    let leased_snapshot = leased_names.lock().expect("leased names poisoned").clone();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    snapshot
+        .services
+        .extend(leased_directory_services(&leased_snapshot, now_ms));
     persist_directory(&snapshot, directory_file);
+}
+
+/// Map the currently-resolving entries of a [`LeasedNameBook`] into
+/// [`DirectoryService`] rows for the front-desk projection (71x). A name is
+/// included only while its lease was renewed within the DNS resolve-freshness
+/// window, so the list never advertises a name that has already stopped
+/// resolving. The owning client's short pubkey rides in a `txt` `owner` field.
+fn leased_directory_services(book: &LeasedNameBook, now_ms: u64) -> Vec<DirectoryService> {
+    book.iter()
+        .filter(|(_, e)| {
+            now_ms.saturating_sub(e.renewed_at.wall_clock)
+                <= mjolnir_mesh::dns_responder::LEASED_NAME_RESOLVE_STALE_MS
+        })
+        .map(|(name, e)| {
+            let mut txt = BTreeMap::new();
+            txt.insert("owner".to_string(), short_pubkey(&e.owner_pubkey));
+            DirectoryService {
+                name: name.clone(),
+                ip: e.ip.to_string(),
+                port: e.port,
+                protocol: "_tcp".to_string(),
+                hostname: None,
+                txt,
+                host_mac: None,
+            }
+        })
+        .collect()
 }
 
 /// Persist a `radio.json` telemetry snapshot (bead ng9) next to
@@ -3562,6 +3603,7 @@ async fn anti_entropy_loop<T: GossipTransport>(
     service_book_v2_file: PathBuf,
     node_name_book: Arc<Mutex<NodeNameBook>>,
     node_name_book_file: PathBuf,
+    leased_names: Arc<Mutex<LeasedNameBook>>,
     directory_file: PathBuf,
     spool_dir: PathBuf,
     self_announce: SelfAnnounce,
@@ -3610,6 +3652,7 @@ async fn anti_entropy_loop<T: GossipTransport>(
         &user_book,
         &service_book,
         &node_name_book,
+        &leased_names,
         &liveness,
         &self_announce.self_id,
         self_announce.backhaul_ip,
@@ -3716,6 +3759,7 @@ async fn anti_entropy_loop<T: GossipTransport>(
             &user_book,
             &service_book,
             &node_name_book,
+            &leased_names,
             &liveness,
             &self_announce.self_id,
             self_announce.backhaul_ip,
@@ -8365,7 +8409,7 @@ config meshd 'meshd'
         assert_eq!(snapshot.neighbors[0].name.as_deref(), Some("garage"));
         // Identity recency comes from UserEntry.updated_at.wall_clock.
         assert_eq!(snapshot.identities.len(), 1);
-        assert_eq!(snapshot.identities[0].last_seen_unix, Some(4242));
+        assert_eq!(snapshot.identities[0].last_seen_unix, 4242);
     }
 
     #[test]
