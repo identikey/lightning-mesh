@@ -148,6 +148,33 @@ use it — as the island data plane or anywhere. The reasons, in priority order:
 Net: batman would cap islands at *trusted-only*; (c) supports *untrusted-peer* islands with
 per-identity authorization. Same roaming benefit, strictly more capability.
 
+## Near-term path (single trusted fleet)
+
+Most of this document is the *permissionless* design. For a **single-owner, trusted fleet**
+(the current reality), the hard machinery is unnecessary — every node is trusted, so there
+is nothing to scope out. The cheap wins, in effort order:
+
+1. **Verify the shipped 802.11r path on hardware** — the FT config already exists
+   (`setup-wireless.sh`, `FT_KEY`/`r0kh`/`r1kh`) but is untested. Lowest-effort roaming win.
+   (beads `2km`, `0pv`)
+2. **Trusted-simple island = `e21` Mode 1, no VXLAN, no identity.** Co-located trusted nodes
+   in one RF-island share **one `/24` over the existing `br-mesh` backhaul + the CRDT
+   hostsfile (MAC→IP uniqueness) + 802.11r**. This is option (a) RF-island-native bridging —
+   rejected *only* for the untrusted case, and correct here. Delivers seamless roaming with
+   machinery mostly already planned in `e21`. VXLAN/EVPN-lite (option (c)) waits until there
+   are untrusted peers to scope.
+3. **Channel hygiene by hand** — non-DFS 5 GHz backhaul (already in the `BACKHAUL_BAND=5g`
+   work); if more than one co-located cluster, manually assign different channels. No
+   graph-coloring automation needed at fleet scale.
+4. **Client-bounce as a diagnostic** — logging which client MACs bounce between which nodes
+   identifies roaming-adjacent node sets (where to form islands). A cheap manual precursor to
+   auto-formation.
+
+**Deferred until permissionless / untrusted peers exist:** VXLAN/EVPN-lite data plane,
+identity-gated membership authz, capability beacon, reputation layer, `/8` migration (a
+single fleet fits in `10.42.0.0/16` = 256 `/24`s), cross-fleet merge + collision guard,
+channel graph-coloring automation.
+
 ## Open questions
 
 - **Membership signals** — how an island's member set is proposed and agreed: RF proximity
