@@ -117,7 +117,7 @@ The affirmative frame: a private internet of our own. Services for each
 other, discoverable by name, on hardware we hold — private when we want,
 spanning the public internet when we want reach. Everything web3 promised —
 own your identity, own your data, permissionless, disintermediated — delivered
-by **keys, peering, and convergence. No token, no chain.** ("Peering" chosen
+by **keys, peering, and convergence. No speculative asset in the path.** ("Peering" chosen
 deliberately over "routing": it's the term of art for networks connecting as
 equals, settlement-free — vs. *transit*, where you're a customer.
 "Convergence" chosen over "merge": it's the actual guarantee — separate paths

@@ -62,7 +62,7 @@ problems that were never nails.
 
 We keep the promise and throw the mechanism away:
 
-| web3 promised | our mechanism (no token, no chain) |
+| web3 promised | our mechanism (no speculative asset in the path) |
 |---|---|
 | Own your identity | An Ed25519 keypair *is* your identity; verification is a signature check ([user-identity](../network-coordination/user-identity.md)) |
 | Permissionless participation | Anyone runs a node; it derives its address from its own key and routes — nothing to be granted ([philosophical-outcomes §3](../vision/philosophical-outcomes.md)) |
@@ -72,7 +72,7 @@ We keep the promise and throw the mechanism away:
 | Consensus without a boss | CRDT merge + HLC total order — agreement by mathematics, no miners, no stake, no vote ([decentralized-systems-design §3–4](../vision/decentralized-systems-design.md)) |
 
 The line to land it: **"This is what web3 said we'd get — a network we own, that
-no one can enclose — with no token, no chain, no speculative asset in the path.
+no one can enclose — with no speculative asset in the path.
 Just keys, routing, and merge."**
 
 ## What we can actually build (the four affirmatives)
@@ -162,7 +162,7 @@ the opposite:
 
 1. **Open here — the affirmative.** Here's the commons we can actually build: a
    private internet of our own, private communication, secure spanning, shared
-   ownership. The web3 promise, no token.
+   ownership. The web3 promise, no speculative asset in the path.
 2. **Then the stakes.** Why it must be un-ownable — Myanmar, no-CA, split-brain
    ([personal-narrative §9–§12](dweb-2026-personal-narrative.md)). The longing has
    an edge; disconnection is a weapon; the commons has to survive people trying to
@@ -179,7 +179,7 @@ must be un-ownable; the spine is how it works.
 - "We're not just defending a network. We're building one that's *ours* — and that
   changes what the whole fight is for."
 - "This is what web3 promised — a network we own, that no one can enclose — with no
-  token, no chain, no speculation in the path. Just keys, routing, and merge."
+  speculative asset in the path. Just keys, routing, and merge."
 - "Freedom *from* capture is the floor. Freedom *to* build the commons is the point."
 - "A private internet of your own: services for each other, discoverable by name,
   on hardware you hold. No cloud in the loop."

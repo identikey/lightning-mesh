@@ -151,7 +151,7 @@ The outline's open question — whether "the promise" (beat 2) folds into the
 cold open — is answered *mostly yes* by this draft: "a network that can't be
 owned, by anyone, including me" carries the promise register already. What
 remains of beat 2 is the **web3 line** ("everything web3 promised, delivered
-by keys, peering, and convergence — no token, no chain") — which now lands better
+by keys, peering, and convergence — no speculative asset in the path") — which now lands better
 as the *closer* of the problem section (end of beat 3), as the pivot from
 "here's what's wrong" to "here's the method."
 
