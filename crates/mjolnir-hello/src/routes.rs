@@ -7,6 +7,7 @@
 //! translates `RouteResponse` into wire responses.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
@@ -152,6 +153,14 @@ struct NameClaimRequest {
     /// `0` (an A-only claim, no SRV).
     #[serde(default)]
     port: Option<u16>,
+    /// Target address the name should resolve to. Self-reported by the claimant
+    /// (a server knows its own lease IP); NOT covered by the signature, so it is
+    /// node-vouched, not key-authenticated — meshd sanity-checks it at ingest.
+    /// Absent for a browser client that can't determine its own LAN IP; meshd
+    /// then falls back to the request's source address (bead 71x). Kept out of
+    /// the signed message so the shipped ceremony's preimage is unchanged.
+    #[serde(default)]
+    ip: Option<IpAddr>,
 }
 
 /// What meshd's name-claim sweep (bead 71x) ingests. Unlike [`IdentityRecord`],
@@ -166,6 +175,9 @@ struct NameClaimRecord<'a> {
     challenge: &'a str,
     name: &'a str,
     port: u16,
+    /// Self-reported target IP (see [`NameClaimRequest::ip`]); `null` when the
+    /// claimant didn't supply one and meshd should use the source address.
+    ip: Option<IpAddr>,
 }
 
 /// The exact bytes a name claim signs: the domain prefix, the hex challenge,
@@ -487,6 +499,7 @@ fn submit_name_claim(body: &[u8], challenges: &ChallengeStore, spool_dir: &Path)
         challenge: &req.challenge,
         name: &req.name,
         port,
+        ip: req.ip,
     };
     let record_json = serde_json::to_string(&record).expect("record serializes");
 
@@ -1159,7 +1172,7 @@ mod tests {
         let sig = key.sign(&name_claim_signing_message(&challenge_hex, "walkie-talkie", 3000));
         let sig_hex = HEXLOWER.encode(&sig.to_bytes());
         let body = format!(
-            r#"{{"pubkey":"{pubkey_hex}","sig":"{sig_hex}","challenge":"{challenge_hex}","name":"walkie-talkie","port":3000}}"#
+            r#"{{"pubkey":"{pubkey_hex}","sig":"{sig_hex}","challenge":"{challenge_hex}","name":"walkie-talkie","port":3000,"ip":"10.42.5.23"}}"#
         );
 
         let resp = post_name_claim(&challenges, spool.path(), &body);
@@ -1172,6 +1185,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&spooled).unwrap()).unwrap();
         assert_eq!(rec["name"], "walkie-talkie");
         assert_eq!(rec["port"], 3000);
+        assert_eq!(rec["ip"], "10.42.5.23", "self-reported target IP must be carried to meshd");
         assert_eq!(rec["sig"], sig_hex, "signature must be carried for mesh-wide verify");
 
         // Single-use nonce: replaying the exact same claim now fails.
