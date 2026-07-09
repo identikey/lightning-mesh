@@ -239,7 +239,8 @@ speculative asset to every single one of them and set the whole thing on fire wi
 
 So here's the claim of this talk. **Keep the original promise of web3. Throw away the
 mechanism.** Everything web3 said we'd get — a network we own, that no one can
-capture — is deliverable with three ingredients, none of which is a token.
+capture — is deliverable with three ingredients, none of which puts a
+speculative asset in the path.
 
 Self-generated **keys**: identity you mint yourself. Nobody issues it, so
 nobody can revoke it.
@@ -263,7 +264,7 @@ network in half, let both halves live separate lives for a week, rejoin them —
 they converge. No referee, no merge conflict.
 
 **Keys, peering, and convergence.** No blockchain, no
-token. A checklist — three questions
+speculative asset in the path. A checklist — three questions
 you can point at any system that stands between people, that intermediates: *Who mints your
 identity? Are you a peer, or a customer? And who decides whose version wins?*
 Every centralized service is an answer to those three questions. So is
