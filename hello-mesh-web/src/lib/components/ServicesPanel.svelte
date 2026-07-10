@@ -22,11 +22,20 @@
 		return svc.txt ? Object.entries(svc.txt) : [];
 	}
 
-	/** A real URL for web services; undefined for non-web protocols. */
+	/** A real URL for web services; undefined for non-web protocols. Prefer the
+	 *  `.mesh` name over the raw IP: it's what people should see and share, and it
+	 *  survives the host's IP changing (e.g. roaming between node subnets). A
+	 *  dotted mDNS-style name (`printer._ipp._tcp`) isn't a resolvable host, so
+	 *  those fall back to the IP. The port is dropped when it's the scheme default
+	 *  (or unspecified), so a name served on 443 links as bare `https://name.mesh`. */
 	function webUrl(svc: DirectoryService): string | undefined {
 		const p = svc.protocol.toLowerCase();
-		if (p === 'http' || p === 'https') return `${p}://${svc.ip}:${svc.port}`;
-		return undefined;
+		if (p !== 'http' && p !== 'https') return undefined;
+		const isMdns = /\._[a-z]+\._[a-z]+$/i.test(svc.name);
+		const host = isMdns ? svc.ip : `${svc.name}.mesh`;
+		const defaultPort = p === 'https' ? 443 : 80;
+		const port = svc.port && svc.port !== defaultPort ? `:${svc.port}` : '';
+		return `${p}://${host}${port}`;
 	}
 
 	/** Friendly service name — strip the trailing _proto._transport if present. */
