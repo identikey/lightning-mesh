@@ -43,7 +43,10 @@
 	}
 
 	const rows = $derived.by<Row[]>(() => {
-		if (!directory) return [];
+		// `directory.node` is null until the daemon writes its first projection
+		// (fresh boot / unclaimed subnet). Guard it so the panel shows the empty
+		// "No routers known yet." state instead of throwing (mjolnir-mesh-34z).
+		if (!directory || !directory.node) return [];
 		const self: Row = {
 			key: directory.node.node_id,
 			name: directory.node.name?.trim() ?? '',

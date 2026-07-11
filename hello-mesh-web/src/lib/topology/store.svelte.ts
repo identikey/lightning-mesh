@@ -34,7 +34,11 @@ class TopologyStore {
 
 	async poll() {
 		const directory = directoryStore.directory;
-		if (!directory) return;
+		// `node` is null until the daemon writes its first projection (fresh boot /
+		// unclaimed subnet). buildTopology dereferences directory.node, so bail here
+		// rather than throw — the panel keeps its last graph / "loading" state
+		// instead of going permanently blank (mjolnir-mesh-34z).
+		if (!directory || !directory.node) return;
 
 		const port = browser ? window.location.port : '';
 		const protocol = browser ? window.location.protocol : 'http:';

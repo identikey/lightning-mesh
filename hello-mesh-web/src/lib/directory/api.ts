@@ -42,7 +42,10 @@ export interface DirectoryService {
 
 export interface Directory {
 	version: number;
-	node: DirectoryNode;
+	/** `null` when the daemon hasn't written a projection yet (fresh boot,
+	    unclaimed subnet) — the server serves `{"node":null,...}` in that window.
+	    Consumers must treat null as "initializing", never dereference it. */
+	node: DirectoryNode | null;
 	neighbors: DirectoryNeighbor[];
 	identities: DirectoryIdentity[];
 	services: DirectoryService[];

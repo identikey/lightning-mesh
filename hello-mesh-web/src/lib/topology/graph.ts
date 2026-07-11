@@ -79,6 +79,10 @@ export function buildTopology(
 	radioByKey: Map<string, RadioSnapshot | undefined>
 ): TopoGraph {
 	const nodes: TopoNode[] = [];
+	// `node` is null until the daemon writes its first projection; callers guard
+	// this, but keep buildTopology total so a null node yields an empty graph
+	// rather than a throw (mjolnir-mesh-34z).
+	if (!directory.node) return { nodes, edges: [] };
 	const selfKey = directory.node.backhaul_addr;
 
 	nodes.push({
